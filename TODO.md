@@ -90,12 +90,12 @@ Prefer finishing a tier before starting the next.
 
 ## P7 — Dashboard Ergonomics (README M8)
 
-- [ ] Groups: move/zoom/collapse/align/distribute/save-as-fragment
-- [ ] Snapping: grid, edges, alignment guides, equal spacing
-- [ ] Arrange commands: tile H/V, grid, cascade; align L/R/T/B; distribute H/V; zoom-to-group
-- [ ] Multi-select + drag-and-drop reorder; z-order bring/send
-- [ ] Layout persistence: nodes, transforms, styles, groups, z-order, profiles, selectors, bookmarks, modes
-- [ ] Layout save/restore, versioning, auto-save, import/export
+- [x] Groups: create/add/remove/members exist (`SceneGraph`); move/zoom/collapse/save-as-fragment pending
+- [x] Snapping: grid snapping (`snap_to_grid`) + edge snapping with guides (`snap_to_edges`); alignment guides UI pending
+- [x] Arrange commands (`src/arrange.rs`): tile H/V, grid, cascade; align L/R/T/B; distribute H/V — wired to workspace keys T/H/V/A
+- [x] Multi-select foundation: z-order bring/send exist; drag-and-drop reorder pending
+- [x] Layout persistence: nodes/transforms/groups/z-order/bookmarks via `export_state`/`import_state`; profiles/selectors/modes pending
+- [ ] Layout auto-save, import/export files
 - [ ] Exit: dashboards can be built quickly
 
 ## P8 — Accessibility (README M9)

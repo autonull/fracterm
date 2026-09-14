@@ -1,6 +1,7 @@
 //! Core primitives for Fracterm: Workspace, Node, Surface, Projection, Lens, Command, Event, Theme, Permission
 
 pub mod app;
+pub mod arrange;
 pub mod camera;
 pub mod canvas;
 pub mod command;

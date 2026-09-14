@@ -164,6 +164,30 @@ impl CanvasState {
         None
     }
 
+    /// Apply an arrange function's placements to the workspace nodes.
+    fn apply_arrange(
+        &mut self,
+        f: impl Fn(&[&crate::Node], usize) -> Vec<(crate::NodeId, i32, i32)>,
+        arg: usize,
+    ) {
+        let owned: Vec<crate::Node> = self
+            .app
+            .state
+            .workspace
+            .all_nodes()
+            .iter()
+            .map(|n| (*n).clone())
+            .collect();
+        let refs: Vec<&crate::Node> = owned.iter().collect();
+        let placements = f(&refs, arg);
+        for (id, x, y) in placements {
+            if let Some(node) = self.app.state.workspace.get_node_mut(id) {
+                node.transform.x = x;
+                node.transform.y = y;
+            }
+        }
+    }
+
     /// Pin the current viewport as a snapshot projection node ("Pin as View").
     fn pin_current_view(&mut self) {
         let cam = self.app.state.workspace.camera().clone();
@@ -634,6 +658,43 @@ impl ApplicationHandler for CanvasState {
                     match &event.logical_key {
                         Key::Character(c) if c == "p" => {
                             self.pin_current_view();
+                            return;
+                        }
+                        Key::Character(c) if c == "t" => {
+                            self.apply_arrange(
+                                |ns, _| {
+                                    crate::arrange::tile_grid(ns, 3, crate::arrange::DEFAULT_GAP)
+                                },
+                                0,
+                            );
+                            return;
+                        }
+                        Key::Character(c) if c == "h" => {
+                            self.apply_arrange(
+                                |ns, _| {
+                                    crate::arrange::tile_horizontally(
+                                        ns,
+                                        crate::arrange::DEFAULT_GAP,
+                                    )
+                                },
+                                0,
+                            );
+                            return;
+                        }
+                        Key::Character(c) if c == "v" => {
+                            self.apply_arrange(
+                                |ns, _| {
+                                    crate::arrange::tile_vertically(ns, crate::arrange::DEFAULT_GAP)
+                                },
+                                0,
+                            );
+                            return;
+                        }
+                        Key::Character(c) if c == "a" => {
+                            self.apply_arrange(
+                                |ns, _| crate::arrange::align(ns, crate::arrange::Edge::Left),
+                                0,
+                            );
                             return;
                         }
                         Key::Character(c) if c == "b" => {

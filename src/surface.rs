@@ -51,7 +51,7 @@ pub struct SurfaceData {
 }
 
 /// A single cell in the terminal grid
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Cell {
     /// The character in this cell
     pub ch: char,
@@ -63,6 +63,27 @@ pub struct Cell {
     pub bold: bool,
     /// Whether this cell is italic
     pub italic: bool,
+    /// Whether this cell is underlined
+    pub underline: bool,
+    /// Whether this cell has reverse video
+    pub reverse: bool,
+    /// Character width (1 for narrow, 2 for wide)
+    pub width: u8,
+}
+
+impl Default for Cell {
+    fn default() -> Self {
+        Self {
+            ch: ' ',
+            fg: Color::from_hex("#dfe3ee"),
+            bg: Color::from_hex("#0b0d12"),
+            bold: false,
+            italic: false,
+            underline: false,
+            reverse: false,
+            width: 1,
+        }
+    }
 }
 
 /// RGBA color representation
@@ -129,8 +150,8 @@ impl Surface {
     }
 
     /// Get the title
-    pub fn title(&self) -> &str {
-        &self.data.borrow().title
+    pub fn title(&self) -> String {
+        self.data.borrow().title.clone()
     }
 
     /// Mark the surface as needing an update

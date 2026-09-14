@@ -1,6 +1,6 @@
 //! Rendering system - OpenGL renderer with render graph architecture.
 
-use super::*;
+use std::collections::HashMap;
 
 /// Render pass types
 #[derive(Debug, Clone)]

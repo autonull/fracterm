@@ -1,7 +1,5 @@
 //! Permission - capability-based security system for plugins.
 
-use super::*;
-
 /// Scope for a permission
 #[derive(Debug, Clone)]
 pub enum PermissionScope {
@@ -149,7 +147,7 @@ impl PermissionContext {
     }
 
     /// Check if scoped to paths
-    fn check_scoped(&self, perm_type: &str, patterns: &[String]) -> bool {
+    fn check_scoped(&self, _perm_type: &str, patterns: &[String]) -> bool {
         if self.path.is_none() {
             return false;
         }
@@ -167,7 +165,7 @@ impl PermissionContext {
     }
 
     /// Check if scoped to origins
-    fn check_origins(&self, perm_type: &str, origins: &[String]) -> bool {
+    fn check_origins(&self, _perm_type: &str, origins: &[String]) -> bool {
         if self.origin.is_none() {
             return false;
         }
@@ -180,7 +178,7 @@ impl PermissionContext {
     }
 
     /// Check if scoped to commands
-    fn check_commands(&self, perm_type: &str, commands: &[String]) -> bool {
+    fn check_commands(&self, _perm_type: &str, commands: &[String]) -> bool {
         if self.command.is_none() {
             return false;
         }

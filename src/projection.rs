@@ -1,7 +1,6 @@
 //! Projection - a selected presentation of part of a surface.
 
 use super::*;
-use std::collections::HashMap;
 
 /// Row range for projections
 #[derive(Debug, Clone)]
@@ -178,6 +177,7 @@ impl ProjectionPresentation {
 }
 
 /// A projection surface is a node whose surface is a projection.
+#[derive(Debug, Clone)]
 pub struct ProjectionSurface {
     /// Source surface ID
     pub source: SurfaceId,

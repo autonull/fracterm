@@ -1,6 +1,7 @@
 //! Application - winit window, main loop, and CLI.
 
 use super::*;
+use crate::config::ThemeConfig;
 
 /// Application state
 pub struct AppState {

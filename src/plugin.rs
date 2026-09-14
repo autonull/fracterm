@@ -1,6 +1,23 @@
 //! Plugin host - abstract interface for plugin systems.
 
 use super::*;
+use std::collections::HashMap;
+
+/// A widget for plugin UI
+#[derive(Debug, Clone)]
+pub struct Widget {
+    pub id: String,
+    pub title: String,
+}
+
+impl Widget {
+    pub fn new(id: &str, title: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            title: title.to_string(),
+        }
+    }
+}
 
 /// Base class for all plugins
 pub trait Plugin {
@@ -23,7 +40,7 @@ pub trait Plugin {
     fn register_widget(&self, widget_id: String, widget: Widget) -> Result<(), Box<dyn std::error::Error>>;
 
     /// Load a plugin by ID
-    fn load(&self, plugin_id: String) -> Result<Plugin, Box<dyn std::error::Error>>;
+    fn load(&self, plugin_id: String) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error>>;
 
     /// Unload a plugin by ID
     fn unload(&self, plugin_id: String) -> Result<(), Box<dyn std::error::Error>>;
@@ -31,7 +48,7 @@ pub trait Plugin {
 
 /// Host for managing plugins (V8-based)
 pub struct V8Host {
-    plugins: HashMap<String, Plugin>,
+    plugins: HashMap<String, Box<dyn Plugin>>,
     commands: HashMap<String, Command>,
 }
 
@@ -44,7 +61,7 @@ impl V8Host {
     }
 
     /// Register a plugin
-    pub fn register(&mut self, plugin: Plugin) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn register(&mut self, plugin: Box<dyn Plugin>) -> Result<(), Box<dyn std::error::Error>> {
         self.plugins.insert(plugin.name().to_string(), plugin);
         Ok(())
     }
@@ -56,18 +73,19 @@ impl V8Host {
     }
 
     /// Get a plugin by name
-    pub fn get(&self, name: &str) -> Option<&Plugin> {
-        self.plugins.get(name).map(|p| p)
+    pub fn get(&self, name: &str) -> Option<&Box<dyn Plugin>> {
+        self.plugins.get(name)
     }
 
     /// Execute a command
     pub fn execute_command(&self, command_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-        self.commands.get(command_id)?
+        self.commands.get(command_id).ok_or("Command not found")?;
+        Ok(())
     }
 
     /// List all registered plugins
-    pub fn list_plugins(&self) -> Vec<&String> {
-        self.plugins.keys().map(|s| s.as_str()).collect()
+    pub fn list_plugins(&self) -> Vec<String> {
+        self.plugins.keys().cloned().collect()
     }
 }
 

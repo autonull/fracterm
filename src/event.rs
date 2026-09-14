@@ -1,12 +1,10 @@
 //! Event - typed event bus for plugin communication.
 
-use super::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// Event types in Fracterm
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub enum EventType {
     /// An object was created
     ObjectCreated,
@@ -98,7 +96,7 @@ impl EventBus {
     }
 
     /// Emit an event to all subscribers
-    pub async fn emit(&self, event: &Event) {
+    pub fn emit(&self, event: &Event) {
         if let Some(handlers) = self.subscribers.get(&event.event_type) {
             for handler in handlers {
                 handler(event);

@@ -1,6 +1,97 @@
 //! Lens - a way of viewing a surface or projection.
 
 use super::*;
+use std::ops::{Deref, DerefMut};
+
+/// CameraLens is the camera's view of the workspace.
+/// It represents the current viewing lens and can be pinned or animated.
+#[derive(Debug, Clone)]
+pub struct CameraLens {
+    /// The camera position and zoom
+    pub camera: Camera,
+    /// Current zoom target
+    pub target: ZoomTarget,
+    /// Whether this lens is pinned
+    pub pinned: bool,
+    /// Whether this is a reading mode lens
+    pub reading_mode: bool,
+}
+
+impl CameraLens {
+    pub fn new(camera: Camera) -> Self {
+        Self {
+            camera,
+            target: ZoomTarget::WorkspaceFit,
+            pinned: false,
+            reading_mode: false,
+        }
+    }
+
+    pub fn zoom_to(&mut self, target: ZoomTarget, workspace: &Workspace) {
+        self.target = target;
+        self.apply_target(workspace);
+    }
+
+    fn apply_target(&mut self, workspace: &Workspace) {
+        match &self.target {
+            ZoomTarget::Object { node_id } => {
+                if let Some(transform) = workspace.node_transform(*node_id) {
+                    self.camera.target_x = transform.x as f64;
+                    self.camera.target_y = transform.y as f64;
+                    self.camera.target_zoom = 1.0;
+                    self.camera.animating = true;
+                }
+            }
+            _ => {
+                // TODO: implement other zoom targets
+            }
+        }
+    }
+
+    pub fn pin(&mut self) {
+        self.pinned = true;
+    }
+
+    pub fn unpin(&mut self) {
+        self.pinned = false;
+    }
+
+    pub fn enter_reading_mode(&mut self) {
+        self.reading_mode = true;
+    }
+
+    pub fn exit_reading_mode(&mut self) {
+        self.reading_mode = false;
+    }
+
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
+    pub fn is_reading_mode(&self) -> bool {
+        self.reading_mode
+    }
+}
+
+impl Default for CameraLens {
+    fn default() -> Self {
+        Self::new(Camera::new())
+    }
+}
+
+impl Deref for CameraLens {
+    type Target = Camera;
+
+    fn deref(&self) -> &Self::Target {
+        &self.camera
+    }
+}
+
+impl DerefMut for CameraLens {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.camera
+    }
+}
 
 /// Types of zoom targets
 #[derive(Debug, Clone)]
@@ -48,6 +139,7 @@ pub struct GridRange {
 /// Zooming into a terminal is a lens onto a terminal surface.
 /// Pinned subrange view is a node whose surface is a projection.
 /// Reading mode is a lens with accessibility presentation rules.
+#[allow(dead_code)]
 pub struct Lens {
     /// Current zoom target
     target: ZoomTarget,

@@ -1,6 +1,6 @@
 //! Configuration system - TypeScript-first configuration.
 
-use super::*;
+use std::collections::HashMap;
 
 /// Font configuration
 #[derive(Debug, Clone)]

@@ -1,26 +1,29 @@
 //! Terminal engine - PTY-based terminal with grid, parser, and input handling.
 
-use super::*;
+use crate::surface::Color;
+use crate::SurfaceId;
+
+/// TextSource abstraction - any source that produces text content.
+/// Terminal PTY, command output, file tail, and plugin-provided sources all
+/// implement this trait, making them interchangeable live text surfaces.
+pub trait TextSource {
+    fn read(&mut self) -> Option<String>;
+    fn write(&mut self, text: &str) -> Result<(), String>;
+    fn is_active(&self) -> bool;
+}
 
 /// Terminal configuration
 #[derive(Debug, Clone)]
 pub struct TerminalConfig {
-    /// Scrollback lines
     pub scrollback_lines: usize,
-    /// Copy on select
     pub copy_on_select: bool,
-    /// Ambiguous width
     pub ambiguous_width: u8,
-    /// Font family
     pub font_family: String,
-    /// Font size
     pub font_size: u32,
-    /// Profile name
     pub profile: String,
 }
 
 impl TerminalConfig {
-    /// Create default terminal configuration
     pub fn default() -> Self {
         Self {
             scrollback_lines: 10000,
@@ -32,7 +35,6 @@ impl TerminalConfig {
         }
     }
 
-    /// Create a profile configuration
     pub fn profile(name: &str, font_size: u32) -> Self {
         Self {
             profile: name.to_string(),
@@ -88,12 +90,10 @@ impl TerminalGrid {
         }
     }
 
-    /// Get a cell by row/col
     pub fn get(&self, row: u32, col: u32) -> Option<&TerminalCell> {
         self.cells.get(row as usize)?.get(col as usize)
     }
 
-    /// Set a cell
     pub fn set(&mut self, row: u32, col: u32, cell: TerminalCell) {
         if let Some(r) = self.cells.get_mut(row as usize) {
             if let Some(c) = r.get_mut(col as usize) {
@@ -102,7 +102,6 @@ impl TerminalGrid {
         }
     }
 
-    /// Resize the grid
     pub fn resize(&mut self, new_rows: u32, new_cols: u32) {
         self.rows = new_rows;
         self.cols = new_cols;
@@ -134,17 +133,14 @@ impl Terminal {
         }
     }
 
-    /// Scroll the terminal by N lines
     pub fn scroll(&mut self, lines: i32) {
         self.scroll_offset = (self.scroll_offset + lines).max(0);
     }
 
-    /// Get the scrollback content
     pub fn scrollback_content(&self) -> &[Vec<TerminalCell>] {
-        &self.scrollback
+        &self.grid.scrollback
     }
 
-    /// Write content to the terminal
     pub fn write(&mut self, text: &str) {
         for ch in text.chars() {
             if ch == '\n' {
@@ -170,15 +166,170 @@ impl Terminal {
                 self.cursor_row += 1;
             }
             if self.cursor_row >= self.grid.rows {
-                self.scrollback.push(
-                    std::mem::take(&mut self.cells),
-                );
-                if self.scrollback.len() > self.config.scrollback_lines {
-                    self.scrollback.remove(0);
+                if self.grid.rows > 0 {
+                    let first_row = self.grid.cells.remove(0);
+                    self.grid.scrollback.push(first_row);
+                    if self.grid.scrollback.len() > self.config.scrollback_lines {
+                        self.grid.scrollback.remove(0);
+                    }
+                    self.grid.cells.push(vec![TerminalCell::default(); self.grid.cols as usize]);
                 }
-                self.cursor_row = self.grid.rows - 1;
+                self.cursor_row = self.grid.rows.saturating_sub(1);
             }
         }
         self.dirty = true;
+    }
+}
+
+/// TerminalTextSource - implements TextSource for terminal PTY
+pub struct TerminalTextSource {
+    terminal: Terminal,
+}
+
+impl TerminalTextSource {
+    pub fn new(terminal: Terminal) -> Self {
+        Self { terminal }
+    }
+}
+
+impl TextSource for TerminalTextSource {
+    fn read(&mut self) -> Option<String> {
+        let mut result = String::new();
+        for row in 0..self.terminal.grid.rows {
+            let mut line = String::new();
+            for col in 0..self.terminal.grid.cols {
+                if let Some(cell) = self.terminal.grid.get(row, col) {
+                    line.push(cell.character);
+                }
+            }
+            result.push_str(&line.trim_end());
+            if row < self.terminal.grid.rows - 1 {
+                result.push('\n');
+            }
+        }
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
+        }
+    }
+
+    fn write(&mut self, text: &str) -> Result<(), String> {
+        self.terminal.write(text);
+        Ok(())
+    }
+
+    fn is_active(&self) -> bool {
+        true
+    }
+}
+
+/// CommandOutputSource - implements TextSource for command output
+pub struct CommandOutputSource {
+    output: String,
+    finished: bool,
+}
+
+impl CommandOutputSource {
+    pub fn new(output: String) -> Self {
+        Self {
+            output,
+            finished: false,
+        }
+    }
+}
+
+impl TextSource for CommandOutputSource {
+    fn read(&mut self) -> Option<String> {
+        if self.finished {
+            None
+        } else {
+            self.finished = true;
+            Some(self.output.clone())
+        }
+    }
+
+    fn write(&mut self, _text: &str) -> Result<(), String> {
+        Err("Cannot write to command output source".to_string())
+    }
+
+    fn is_active(&self) -> bool {
+        !self.finished
+    }
+}
+
+/// FileTailSource - implements TextSource for tailing a file
+pub struct FileTailSource {
+    path: std::path::PathBuf,
+    position: u64,
+}
+
+impl FileTailSource {
+    pub fn new(path: &str) -> Result<Self, std::io::Error> {
+        let path = std::path::PathBuf::from(path);
+        let position = std::fs::metadata(&path)?.len();
+        Ok(Self { path, position })
+    }
+}
+
+impl TextSource for FileTailSource {
+    fn read(&mut self) -> Option<String> {
+        use std::io::{BufRead, BufReader, Seek, SeekFrom};
+        let mut file = std::fs::File::open(&self.path).ok()?;
+        file.seek(SeekFrom::Start(self.position)).ok()?;
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let bytes_read = reader.read_line(&mut line).ok()?;
+        self.position += bytes_read as u64;
+        if line.is_empty() {
+            None
+        } else {
+            Some(line)
+        }
+    }
+
+    fn write(&mut self, _text: &str) -> Result<(), String> {
+        Err("Cannot write to file tail source".to_string())
+    }
+
+    fn is_active(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_terminal_text_source() {
+        let mut terminal = Terminal::new(SurfaceId(1), 10, 10);
+        terminal.write("Hello");
+        let mut source = TerminalTextSource::new(terminal);
+        let text = source.read();
+        assert!(text.is_some());
+        assert!(text.unwrap().contains("Hello"));
+    }
+
+    #[test]
+    fn test_command_output_source() {
+        let mut source = CommandOutputSource::new("test output".to_string());
+        assert!(source.is_active());
+        let text = source.read();
+        assert_eq!(text.unwrap(), "test output");
+        assert!(!source.is_active());
+        assert!(source.read().is_none());
+    }
+
+    #[test]
+    fn test_file_tail_source() {
+        let result = FileTailSource::new("Cargo.toml");
+        assert!(result.is_ok());
+        let mut source = result.unwrap();
+        // Reset to start for test
+        source.position = 0;
+        assert!(source.is_active());
+        let text = source.read();
+        assert!(text.is_some());
     }
 }

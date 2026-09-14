@@ -1,9 +1,9 @@
 //! Transform - position, scale, and rotation for nodes.
 
-use std::fmt::Display;
+use std::fmt;
 
 /// A transform representing position, scale, and rotation of a node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Transform {
     /// Position (x, y) in pixels
     pub x: i32,
@@ -17,17 +17,17 @@ pub struct Transform {
 
 impl Transform {
     /// Create a new transform at origin with unit scale and zero rotation
-    pub fn new() -> Self {
+    pub fn new(x: i32, y: i32) -> Self {
         Self {
-            x: 0,
-            y: 0,
+            x,
+            y,
             scale: 1.0,
             rotation: 0.0,
         }
     }
 
     /// Create a transform at given coordinates
-    pub fn at(&self, x: i32, y: i32) -> Self {
+    pub fn at(x: i32, y: i32) -> Self {
         Self {
             x,
             y,
@@ -49,12 +49,12 @@ impl Transform {
 
     /// Rotate by angle in radians
     pub fn rotate(&mut self, degrees: f64) {
-        self.rotation += degrees * std::f64::PI as f64 / 180.0;
+        self.rotation += degrees * std::f64::consts::PI / 180.0;
     }
 
     /// Convert rotation to degrees
     pub fn to_degrees(&self) -> f64 {
-        self.rotation * 180.0 / std::f64::PI as f64
+        self.rotation * 180.0 / std::f64::consts::PI
     }
 
     /// Get the bounds of the transformed area
@@ -63,7 +63,7 @@ impl Transform {
     }
 }
 
-impl Display for Transform {
+impl fmt::Display for Transform {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Transform({}, {}, {})", self.x, self.y, self.scale)
     }

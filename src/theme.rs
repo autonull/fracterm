@@ -1,6 +1,6 @@
 //! Theme - theming for the Fracterm workspace.
 
-use super::*;
+use crate::surface::Color;
 
 /// Color theme for the workspace
 #[derive(Debug, Clone)]

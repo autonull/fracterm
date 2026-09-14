@@ -1,6 +1,10 @@
 //! Camera - the lens onto the workspace, controlling pan and zoom.
+//!
+//! The camera is a lens onto the workspace. Zooming into a terminal rectangle
+//! is a lens onto a terminal surface. Camera bookmarks are lens targets.
 
 use super::*;
+use crate::lens::{GridRange, Rect};
 
 /// Camera state for the workspace
 #[derive(Debug, Clone)]
@@ -17,6 +21,17 @@ pub struct Camera {
     pub target_zoom: f64,
     pub target_x: f64,
     pub target_y: f64,
+    /// Saved camera positions
+    pub bookmarks: Vec<CameraBookmark>,
+}
+
+/// A saved camera position/bookmark
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CameraBookmark {
+    pub name: String,
+    pub x: f64,
+    pub y: f64,
+    pub zoom: f64,
 }
 
 impl Camera {
@@ -30,7 +45,68 @@ impl Camera {
             target_zoom: 1.0,
             target_x: 0.0,
             target_y: 0.0,
+            bookmarks: Vec::new(),
         }
+    }
+
+    /// Create a camera from layout data
+    pub fn from_layout(layout: &CameraLayout) -> Self {
+        Self {
+            x: layout.x,
+            y: layout.y,
+            zoom: layout.zoom,
+            animating: false,
+            target_zoom: layout.zoom,
+            target_x: layout.x,
+            target_y: layout.y,
+            bookmarks: layout.bookmarks.clone(),
+        }
+    }
+
+    /// Convert camera to layout data
+    pub fn to_layout(&self) -> CameraLayout {
+        CameraLayout {
+            x: self.x,
+            y: self.y,
+            zoom: self.zoom,
+            bookmarks: self.bookmarks.clone(),
+        }
+    }
+
+    /// Save a camera bookmark
+    pub fn save_bookmark(&mut self, name: &str) {
+        self.bookmarks.push(CameraBookmark {
+            name: name.to_string(),
+            x: self.x,
+            y: self.y,
+            zoom: self.zoom,
+        });
+    }
+
+    /// Get a bookmark by name
+    pub fn get_bookmark(&self, name: &str) -> Option<&CameraBookmark> {
+        self.bookmarks.iter().find(|b| b.name == name)
+    }
+
+    /// Restore camera to a bookmark position
+    pub fn restore_bookmark(&mut self, name: &str) -> bool {
+        if let Some(bookmark) = self.get_bookmark(name) {
+            let (x, y, zoom) = (bookmark.x, bookmark.y, bookmark.zoom);
+            self.x = x;
+            self.y = y;
+            self.zoom = zoom;
+            self.target_x = x;
+            self.target_y = y;
+            self.target_zoom = zoom;
+            self.animating = true;
+            return true;
+        }
+        false
+    }
+
+    /// List all bookmark names
+    pub fn bookmark_names(&self) -> Vec<String> {
+        self.bookmarks.iter().map(|b| b.name.clone()).collect()
     }
 
     /// Set the camera position
@@ -112,5 +188,29 @@ impl Camera {
                 self.animating = false;
             }
         }
+    }
+}
+
+/// Camera layout state for persistence
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CameraLayout {
+    pub x: f64,
+    pub y: f64,
+    pub zoom: f64,
+    pub bookmarks: Vec<CameraBookmark>,
+}
+
+/// Camera bookmark for persistence
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CameraBookmarkLayout {
+    pub name: String,
+    pub x: f64,
+    pub y: f64,
+    pub zoom: f64,
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Self::new()
     }
 }

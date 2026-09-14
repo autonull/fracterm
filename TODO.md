@@ -6,6 +6,45 @@ Prefer finishing a tier before starting the next.
 
 ---
 
+## Session Status (checkpoint)
+
+**State as of this commit: all gates green** — `cargo build`, 54 tests passing,
+`cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --check` clean.
+Binary runs (headless fallback works when no GL 3.3 context is available).
+
+**Tested & working without a display:** all 54 unit/integration tests
+(VT parser, PTY echo round-trip, TS transpile, QuickJS plugin lifecycle,
+permission gating, projections, arrange/snap math, camera fitting, atlas keys).
+**Needs on-display testing:** window rendering itself (rects, borders, glyph
+crispness across zoom, terminal grid live-view), pan/zoom feel, resize/HiDPI.
+
+To test interactively: `cargo run` (needs OpenGL 3.3 + freetype + fontconfig).
+In-window: bash PTY live, wheel zoom, drag pan, right-click autozoom,
+right-drag rect zoom, `P` pin view, `B`/`1–9` bookmarks, `T/H/V/A` arrange.
+
+**Next up (in order):**
+1. On-display verification pass of M1–M5 exit criteria
+2. P6 remainder: typed commands/events/widgets SDK, more web globals,
+   generated `.d.ts`, V8 host behind the trait
+3. P7 remainder: alignment-guide rendering, multi-select + drag reorder,
+   layout auto-save/import-export
+4. P8 accessibility: reading lens, high-contrast theme, reduce-motion,
+   `accessibility` config section
+5. P9: command system + palette, XDG dirs, packaging
+
+**Known gaps / tech debt:**
+- Per-frame `glow::Context` recreate risk: none (stored once) but text pass
+  queues per-cell (one queue call per terminal cell) — needs glyph batching
+  by color/style runs for 60fps on dense grids
+- Far-zoom cached layer textures + atlas damage tracking (P2) still pending
+- HarfBuzz shaping (P2) not wired
+- `projection` presentation options (wrap/reflow/line numbers) unimplemented
+- CI (`.github/workflows/ci.yml`) untested on a real runner
+  (needs libfreetype/fontconfig/clang — already in the apt line)
+- serde pinned `=1.0.203` for swc compatibility; revisit when swc updates
+
+---
+
 ## P0 — Unblock & Stabilize (do first)
 
 - [x] Fix current build errors (already resolved in working tree; verified `cargo build`/`test` clean)

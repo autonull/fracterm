@@ -12,6 +12,8 @@ pub struct AppState {
     pub plugin_host: V8Host,
     pub active_mode: InteractionMode,
     pub plugins_loaded: Vec<String>,
+    /// HiDPI scale factor from the windowing system
+    pub hidpi_scale: f64,
 }
 
 impl AppState {
@@ -24,6 +26,7 @@ impl AppState {
             plugin_host: V8Host::new(),
             active_mode: InteractionMode::Workspace,
             plugins_loaded: vec![],
+            hidpi_scale: 1.0,
         }
     }
 }
@@ -63,7 +66,7 @@ pub struct CliArgs {
 }
 
 impl CliArgs {
-    pub fn default() -> Self {
+    pub fn new() -> Self {
         Self {
             config_path: None,
             profile: None,
@@ -156,4 +159,9 @@ pub fn config_with_profile(profile_name: &str) -> Config {
         _ => {}
     }
     config
+}
+impl Default for CliArgs {
+    fn default() -> Self {
+        Self::new()
+    }
 }

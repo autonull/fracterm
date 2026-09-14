@@ -22,6 +22,12 @@ pub struct SceneGraph {
     z_order: Vec<NodeId>,
 }
 
+impl Default for SceneGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SceneGraph {
     pub fn new() -> Self {
         Self {
@@ -98,9 +104,7 @@ impl SceneGraph {
     pub fn add_to_group(&mut self, group_id: NodeId, node_id: NodeId) {
         if let Some(node) = self.nodes.get_mut(&node_id) {
             node.group_id = Some(group_id);
-            if !self.groups.contains_key(&group_id) {
-                self.groups.insert(group_id, Vec::new());
-            }
+            self.groups.entry(group_id).or_default();
             if let Some(members) = self.groups.get_mut(&group_id) {
                 if !members.contains(&node_id) {
                     members.push(node_id);
@@ -125,7 +129,10 @@ impl SceneGraph {
     }
 
     pub fn get_groups(&self) -> Vec<(NodeId, Vec<NodeId>)> {
-        self.groups.iter().map(|(id, members)| (*id, members.clone())).collect()
+        self.groups
+            .iter()
+            .map(|(id, members)| (*id, members.clone()))
+            .collect()
     }
 
     pub fn bring_to_front(&mut self, node_id: NodeId) {
@@ -259,7 +266,10 @@ impl Workspace {
     }
 
     /// Import workspace state from JSON
-    pub fn import_state(&mut self, state: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn import_state(
+        &mut self,
+        state: &serde_json::Value,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(camera_val) = state.get("camera") {
             if let (Some(x), Some(y), Some(zoom)) = (
                 camera_val.get("x").and_then(|v| v.as_f64()),
@@ -298,6 +308,11 @@ impl Workspace {
 impl Default for Workspace {
     fn default() -> Self {
         Self::new()
+    }
+}
+impl SceneGraph {
+    pub fn all_nodes_mut(&mut self) -> Vec<&mut Node> {
+        self.nodes.values_mut().collect()
     }
 }
 

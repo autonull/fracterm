@@ -126,6 +126,36 @@ impl Camera {
         self.animating
     }
 
+    /// Fit a world rectangle into the viewport, centered, with easing.
+    pub fn fit_rect(&mut self, rect: Rect, view_w: f64, view_h: f64) {
+        let rw = rect.width.max(1) as f64;
+        let rh = rect.height.max(1) as f64;
+        let zoom = (view_w / rw).min(view_h / rh).clamp(0.05, 64.0);
+        self.target_zoom = zoom;
+        self.target_x = rect.x as f64 - (view_w / zoom - rw) / 2.0;
+        self.target_y = rect.y as f64 - (view_h / zoom - rh) / 2.0;
+        self.animating = true;
+    }
+
+    /// Zoom directly to a node's bounds, centered in the viewport.
+    pub fn zoom_to_node(
+        &mut self,
+        node_id: NodeId,
+        transform: crate::Transform,
+        size: (i32, i32),
+        view_w: f64,
+        view_h: f64,
+    ) {
+        let rect = Rect {
+            x: transform.x,
+            y: transform.y,
+            width: size.0.max(1) as u32,
+            height: size.1.max(1) as u32,
+        };
+        let _ = node_id;
+        self.fit_rect(rect, view_w, view_h);
+    }
+
     /// Fit the camera to a rectangle
     pub fn fit_to(&mut self, rect: Rect) {
         self.target_zoom = 1.0;
@@ -212,5 +242,41 @@ pub struct CameraBookmarkLayout {
 impl Default for Camera {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lens::Rect;
+
+    #[test]
+    fn test_fit_rect_centers_and_scales() {
+        let mut cam = Camera::new();
+        // Viewport 1000x500, rect 100x100 at (200, 300).
+        cam.fit_rect(
+            Rect {
+                x: 200,
+                y: 300,
+                width: 100,
+                height: 100,
+            },
+            1000.0,
+            500.0,
+        );
+        // Zoom limited by the smaller axis: 500/100 = 5.
+        assert!((cam.target_zoom - 5.0).abs() < 1e-9);
+        // Visible world width = 200; rect centered => x = 200 - (200-100)/2 = 150.
+        assert!((cam.target_x - 150.0).abs() < 1e-9);
+        assert!(cam.animating);
+    }
+
+    #[test]
+    fn test_zoom_to_node_uses_size() {
+        let mut cam = Camera::new();
+        let t = crate::Transform::at(0, 0);
+        cam.zoom_to_node(NodeId(1), t, (640, 400), 800.0, 600.0);
+        assert!((cam.target_zoom - 1.25).abs() < 1e-9); // min(800/640, 600/400)
+        assert!(cam.animating);
     }
 }

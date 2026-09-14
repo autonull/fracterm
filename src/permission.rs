@@ -69,10 +69,18 @@ impl Permission {
         match &self.scope {
             PermissionScope::All => true,
             PermissionScope::Created => context.check_created(self.permission_type.as_str()),
-            PermissionScope::Granted(id) => context.check_granted(self.permission_type.as_str(), id),
-            PermissionScope::Scoped(patterns) => context.check_scoped(self.permission_type.as_str(), patterns),
-            PermissionScope::OriginScoped(origins) => context.check_origins(self.permission_type.as_str(), origins),
-            PermissionScope::CommandScoped(commands) => context.check_commands(self.permission_type.as_str(), commands),
+            PermissionScope::Granted(id) => {
+                context.check_granted(self.permission_type.as_str(), id)
+            }
+            PermissionScope::Scoped(patterns) => {
+                context.check_scoped(self.permission_type.as_str(), patterns)
+            }
+            PermissionScope::OriginScoped(origins) => {
+                context.check_origins(self.permission_type.as_str(), origins)
+            }
+            PermissionScope::CommandScoped(commands) => {
+                context.check_commands(self.permission_type.as_str(), commands)
+            }
         }
     }
 }

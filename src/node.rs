@@ -100,6 +100,8 @@ pub struct Node {
     pub id: NodeId,
     /// The transform component (position, scale, rotation)
     pub transform: Transform,
+    /// Node size in world pixels (width, height)
+    pub size: (i32, i32),
     /// The style component (colors, fonts)
     pub style: Theme,
     /// The input behavior component
@@ -122,6 +124,7 @@ impl Node {
         Self {
             id,
             transform: Transform::new(x, y),
+            size: (480, 320),
             style: Theme::default(),
             input: InputBehavior::default(),
             surface_id: None,

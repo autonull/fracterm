@@ -24,7 +24,7 @@ pub struct TerminalConfig {
 }
 
 impl TerminalConfig {
-    pub fn default() -> Self {
+    pub fn new() -> Self {
         Self {
             scrollback_lines: 10000,
             copy_on_select: false,
@@ -58,7 +58,7 @@ pub struct TerminalCell {
 }
 
 impl TerminalCell {
-    pub fn default() -> Self {
+    pub fn new() -> Self {
         Self {
             character: ' ',
             fg: Color::rgb(220, 220, 220),
@@ -172,7 +172,9 @@ impl Terminal {
                     if self.grid.scrollback.len() > self.config.scrollback_lines {
                         self.grid.scrollback.remove(0);
                     }
-                    self.grid.cells.push(vec![TerminalCell::default(); self.grid.cols as usize]);
+                    self.grid
+                        .cells
+                        .push(vec![TerminalCell::default(); self.grid.cols as usize]);
                 }
                 self.cursor_row = self.grid.rows.saturating_sub(1);
             }
@@ -202,7 +204,7 @@ impl TextSource for TerminalTextSource {
                     line.push(cell.character);
                 }
             }
-            result.push_str(&line.trim_end());
+            result.push_str(line.trim_end());
             if row < self.terminal.grid.rows - 1 {
                 result.push('\n');
             }
@@ -294,6 +296,17 @@ impl TextSource for FileTailSource {
 
     fn is_active(&self) -> bool {
         true
+    }
+}
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for TerminalCell {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

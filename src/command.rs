@@ -103,3 +103,8 @@ impl Command {
         self.enabled = enabled;
     }
 }
+impl Default for CommandInput {
+    fn default() -> Self {
+        Self::new()
+    }
+}

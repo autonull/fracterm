@@ -73,12 +73,6 @@ impl CameraLens {
     }
 }
 
-impl Default for CameraLens {
-    fn default() -> Self {
-        Self::new(Camera::new())
-    }
-}
-
 impl Deref for CameraLens {
     type Target = Camera;
 
@@ -156,7 +150,7 @@ pub struct Lens {
 
 impl Lens {
     /// Create a default lens at workspace fit
-    pub fn default() -> Self {
+    pub fn new() -> Self {
         Self {
             target: ZoomTarget::WorkspaceFit,
             zoom: 1.0,
@@ -206,5 +200,11 @@ impl Lens {
     /// Apply zoom animation
     fn apply_zoom_animation(&mut self, _duration_ms: u64) {
         // Animation would be implemented here
+    }
+}
+
+impl Default for Lens {
+    fn default() -> Self {
+        Self::new()
     }
 }

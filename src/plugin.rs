@@ -34,10 +34,18 @@ pub trait Plugin {
     fn shutdown(&self) -> Result<(), Box<dyn std::error::Error>>;
 
     /// Register a command
-    fn register_command(&self, command_id: CommandId, command: Command) -> Result<(), Box<dyn std::error::Error>>;
+    fn register_command(
+        &self,
+        command_id: CommandId,
+        command: Command,
+    ) -> Result<(), Box<dyn std::error::Error>>;
 
     /// Register a widget
-    fn register_widget(&self, widget_id: String, widget: Widget) -> Result<(), Box<dyn std::error::Error>>;
+    fn register_widget(
+        &self,
+        widget_id: String,
+        widget: Widget,
+    ) -> Result<(), Box<dyn std::error::Error>>;
 
     /// Load a plugin by ID
     fn load(&self, plugin_id: String) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error>>;
@@ -50,6 +58,12 @@ pub trait Plugin {
 pub struct V8Host {
     plugins: HashMap<String, Box<dyn Plugin>>,
     commands: HashMap<String, Command>,
+}
+
+impl Default for V8Host {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl V8Host {
@@ -73,8 +87,8 @@ impl V8Host {
     }
 
     /// Get a plugin by name
-    pub fn get(&self, name: &str) -> Option<&Box<dyn Plugin>> {
-        self.plugins.get(name)
+    pub fn get(&self, name: &str) -> Option<&dyn Plugin> {
+        self.plugins.get(name).map(|p| &**p)
     }
 
     /// Execute a command

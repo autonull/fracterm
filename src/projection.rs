@@ -30,9 +30,7 @@ pub enum FilterSpec {
         case_sensitive: bool,
     },
     /// Log level filter
-    Levels {
-        levels: Vec<String>,
-    },
+    Levels { levels: Vec<String> },
 }
 
 /// Filter mode: extract or highlight
@@ -150,7 +148,7 @@ pub struct ProjectionPresentation {
 
 impl ProjectionPresentation {
     /// Create a default presentation
-    pub fn default() -> Self {
+    pub fn new() -> Self {
         Self {
             wrap: true,
             reflow: false,
@@ -181,6 +179,8 @@ impl ProjectionPresentation {
 pub struct ProjectionSurface {
     /// Source surface ID
     pub source: SurfaceId,
+    /// Whether a snapshot has already been taken (Snapshot mode only).
+    pub snapshot_taken: bool,
     /// Selector for the projection
     pub selector: ProjectionSelector,
     /// Live or snapshot mode
@@ -209,10 +209,64 @@ impl ProjectionSurface {
             source,
             selector,
             mode,
+            snapshot_taken: false,
             presentation: ProjectionPresentation::default(),
             content: vec![],
             dirty: true,
         }
+    }
+
+    /// Materialize a snapshot immediately from source content.
+    pub fn snapshot(mut self, source_content: &[String]) -> Self {
+        self.mode = ProjectionMode::Snapshot;
+        self.content = self.apply_selector(source_content);
+        self.snapshot_taken = true;
+        self.dirty = false;
+        self
+    }
+
+    /// Build a projection over a terminal grid (lines of its visible cells).
+    pub fn from_terminal(
+        term: &crate::terminal::Terminal,
+        selector: ProjectionSelector,
+        mode: ProjectionMode,
+    ) -> Self {
+        let lines: Vec<String> = (0..term.grid.rows)
+            .map(|r| {
+                (0..term.grid.cols)
+                    .filter_map(|c| term.grid.get(r, c))
+                    .map(|cell| cell.character)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        let snapshot = matches!(mode, ProjectionMode::Snapshot);
+        let mut p = Self::new(term.id, selector, mode);
+        if snapshot {
+            p.content = p.apply_selector(&lines);
+            p.snapshot_taken = true;
+            p.dirty = false;
+        }
+        p
+    }
+
+    /// Re-sync a live projection from a terminal grid.
+    pub fn update_from_terminal(&mut self, term: &crate::terminal::Terminal) {
+        if self.snapshot_taken && matches!(self.mode, ProjectionMode::Snapshot) {
+            return;
+        }
+        let lines: Vec<String> = (0..term.grid.rows)
+            .map(|r| {
+                (0..term.grid.cols)
+                    .filter_map(|c| term.grid.get(r, c))
+                    .map(|cell| cell.character)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        self.update(&lines);
     }
 
     /// Get the source surface ID
@@ -228,8 +282,10 @@ impl ProjectionSurface {
                 self.dirty = false;
             }
             ProjectionMode::Snapshot => {
-                if self.dirty {
+                // A snapshot freezes on first capture and never re-syncs.
+                if !self.snapshot_taken {
                     self.content = self.apply_selector(source_content);
+                    self.snapshot_taken = true;
                     self.dirty = false;
                 }
             }
@@ -277,10 +333,7 @@ impl ProjectionSurface {
 
         // Apply search
         if let Some(search) = &self.selector.search {
-            result = result
-                .into_iter()
-                .filter(|line| line.contains(search))
-                .collect();
+            result.retain(|line| line.contains(search));
         }
 
         // Apply max lines
@@ -310,16 +363,30 @@ impl ProjectionSurface {
                 })
                 .cloned()
                 .collect(),
-            FilterSpec::Regex { .. } => {
-                // Regex support would be added here
-                content.to_vec()
+            FilterSpec::Regex {
+                pattern,
+                case_sensitive,
+            } => {
+                let pattern = if *case_sensitive {
+                    pattern.clone()
+                } else {
+                    format!("(?i){pattern}")
+                };
+                match regex::Regex::new(&pattern) {
+                    Ok(re) => content
+                        .iter()
+                        .filter(|line| re.is_match(line))
+                        .cloned()
+                        .collect(),
+                    Err(_) => content.to_vec(),
+                }
             }
             FilterSpec::Levels { levels } => content
                 .iter()
                 .filter(|line| {
                     levels.iter().any(|level| {
-                        line.contains(&format!("[{}]", level))
-                            || line.contains(&format!(" {}", level))
+                        line.contains(&format!("[{level}]"))
+                            || line.split_whitespace().any(|w| w == level.as_str())
                     })
                 })
                 .cloned()
@@ -356,5 +423,156 @@ impl ProjectionSurface {
     /// Set the presentation
     pub fn set_presentation(&mut self, presentation: ProjectionPresentation) {
         self.presentation = presentation;
+    }
+}
+impl Default for ProjectionPresentation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for ProjectionSelector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines() -> Vec<String> {
+        vec![
+            "INFO boot ok".into(),
+            "ERROR disk full".into(),
+            "DEBUG tick".into(),
+            "ERROR net timeout".into(),
+            "WARN slow".into(),
+        ]
+    }
+
+    #[test]
+    fn test_substring_filter_extract() {
+        let sel = ProjectionSelector {
+            rows: None,
+            columns: None,
+            filter: Some(FilterSpec::Substring {
+                pattern: "ERROR".into(),
+                case_sensitive: true,
+            }),
+            search: None,
+            max_lines: None,
+            follow: true,
+        };
+        let mut p = ProjectionSurface::new(SurfaceId(1), sel, ProjectionMode::Live);
+        p.update(&lines());
+        assert_eq!(p.content.len(), 2);
+        assert!(p.content[0].contains("disk full"));
+    }
+
+    #[test]
+    fn test_regex_filter() {
+        let sel = ProjectionSelector {
+            rows: None,
+            columns: None,
+            filter: Some(FilterSpec::Regex {
+                pattern: r"^error".into(),
+                case_sensitive: false,
+            }),
+            search: None,
+            max_lines: None,
+            follow: true,
+        };
+        let mut p = ProjectionSurface::new(SurfaceId(1), sel, ProjectionMode::Live);
+        p.update(&lines());
+        assert_eq!(p.content.len(), 2);
+    }
+
+    #[test]
+    fn test_levels_filter() {
+        let sel = ProjectionSelector {
+            rows: None,
+            columns: None,
+            filter: Some(FilterSpec::Levels {
+                levels: vec!["WARN".into()],
+            }),
+            search: None,
+            max_lines: None,
+            follow: true,
+        };
+        let mut p = ProjectionSurface::new(SurfaceId(1), sel, ProjectionMode::Live);
+        p.update(&lines());
+        assert_eq!(p.content.len(), 1);
+        assert!(p.content[0].contains("slow"));
+    }
+
+    #[test]
+    fn test_row_column_ranges() {
+        let sel = ProjectionSelector {
+            rows: Some(RowRange { start: 1, end: 2 }),
+            columns: Some(ColumnRange { start: 0, end: 5 }),
+            filter: None,
+            search: None,
+            max_lines: None,
+            follow: true,
+        };
+        let mut p = ProjectionSurface::new(SurfaceId(1), sel, ProjectionMode::Live);
+        p.update(&lines());
+        assert_eq!(p.content.len(), 2);
+        assert_eq!(p.content[0], "ERROR");
+    }
+
+    #[test]
+    fn test_max_lines_takes_tail() {
+        let sel = ProjectionSelector {
+            rows: None,
+            columns: None,
+            filter: None,
+            search: None,
+            max_lines: Some(2),
+            follow: true,
+        };
+        let mut p = ProjectionSurface::new(SurfaceId(1), sel, ProjectionMode::Live);
+        p.update(&lines());
+        assert_eq!(p.content, vec!["ERROR net timeout", "WARN slow"]);
+    }
+
+    #[test]
+    fn test_snapshot_freezes() {
+        let sel = ProjectionSelector {
+            rows: None,
+            columns: None,
+            filter: None,
+            search: None,
+            max_lines: None,
+            follow: true,
+        };
+        let mut p = ProjectionSurface::new(SurfaceId(1), sel, ProjectionMode::Snapshot);
+        p.update(&lines());
+        let frozen = p.content.clone();
+        p.update(&["CHANGED".to_string()]);
+        assert_eq!(p.content, frozen);
+    }
+
+    #[test]
+    fn test_from_terminal_extraction() {
+        use crate::terminal::{Terminal, TerminalConfig};
+        let mut term = Terminal::new(SurfaceId(7), 5, 40);
+        term.config = TerminalConfig::default();
+        term.write("INFO one\nERROR two\nDEBUG three");
+        let sel = ProjectionSelector {
+            rows: None,
+            columns: None,
+            filter: Some(FilterSpec::Substring {
+                pattern: "ERROR".into(),
+                case_sensitive: true,
+            }),
+            search: None,
+            max_lines: None,
+            follow: true,
+        };
+        let p = ProjectionSurface::from_terminal(&term, sel, ProjectionMode::Snapshot);
+        assert_eq!(p.content.len(), 1);
+        assert!(p.content[0].contains("two"));
     }
 }

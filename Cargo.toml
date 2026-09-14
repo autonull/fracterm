@@ -6,9 +6,27 @@ license = "MIT"
 description = "A spatial terminal emulator with live text surfaces, projections, lenses, and commands."
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "=1.0.203", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
+winit = "0.30"
+glutin = "0.32"
+glutin-winit = "0.5"
+glow = "0.16"
+raw-window-handle = "0.6"
+freetype-rs = "0.37"
+vte = "0.13"
+portable-pty = "0.8"
+unicode-width = "0.2"
+regex = "1"
+rquickjs = { version = "0.9", features = ["bindgen"] }
+swc_common = "3"
+swc_ecma_ast = "3"
+swc_ecma_codegen = "3"
+swc_ecma_parser = "4"
+swc_ecma_transforms_typescript = "4"
+swc_ecma_visit = "3"
+fontconfig = "0.9"
 
 [dev-dependencies]
 assert_cmd = "2"

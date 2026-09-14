@@ -27,7 +27,7 @@ pub struct Theme {
 
 impl Theme {
     /// Create a default dark theme
-    pub fn default() -> Self {
+    pub fn new() -> Self {
         Self {
             background: Color::from_hex("#0b0d12"),
             foreground: Color::from_hex("#dfe3ee"),
@@ -78,5 +78,10 @@ impl Theme {
             self.background = Color::from_hex("#000000");
             self.foreground = Color::from_hex("#ffffff");
         }
+    }
+}
+impl Default for Theme {
+    fn default() -> Self {
+        Self::new()
     }
 }

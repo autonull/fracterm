@@ -96,6 +96,28 @@ pub struct Color {
 }
 
 impl Color {
+    pub const fn hex_digit(c: u8) -> u8 {
+        if c.is_ascii_digit() {
+            c - b'0'
+        } else {
+            (c | 0x20) - b'a' + 10
+        }
+    }
+
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b, a: 255 }
+    }
+
+    pub const fn from_hex_const(hex: &'static str) -> Self {
+        let b = hex.as_bytes();
+        Self {
+            r: Self::hex_digit(b[0]) * 16 + Self::hex_digit(b[1]),
+            g: Self::hex_digit(b[2]) * 16 + Self::hex_digit(b[3]),
+            b: Self::hex_digit(b[4]) * 16 + Self::hex_digit(b[5]),
+            a: 255,
+        }
+    }
+
     pub fn from_hex(hex: &str) -> Self {
         let hex = hex.trim_start_matches('#');
         let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
@@ -107,10 +129,6 @@ impl Color {
             255
         };
         Self { r, g, b, a }
-    }
-
-    pub fn rgb(r: u8, g: u8, b: u8) -> Self {
-        Self { r, g, b, a: 255 }
     }
 }
 

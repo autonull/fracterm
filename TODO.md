@@ -8,76 +8,84 @@ Prefer finishing a tier before starting the next.
 
 ## P0 — Unblock & Stabilize (do first)
 
-- [ ] Fix current build errors:
-  - [ ] `src/surface.rs:133` — returns value referencing a temporary
-  - [ ] `src/lib.rs:23` — private `SurfaceId` re-export
-  - [ ] `src/node.rs:31` — wrong arg count after `InputBehavior` change
-  - [ ] `src/workspace.rs:23` — `Camera::default` used but not implemented
-- [ ] Add `impl Default for Camera` (or route through `Camera::new`)
-- [ ] Add CI gate: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`
-- [ ] Single source of truth for IDs (`NodeId`, `SurfaceId`, …) — stop re-exporting privates
+- [x] Fix current build errors (already resolved in working tree; verified `cargo build`/`test` clean)
+  - [x] `src/surface.rs:133` — returns value referencing a temporary
+  - [x] `src/lib.rs:23` — private `SurfaceId` re-export
+  - [x] `src/node.rs:31` — wrong arg count after `InputBehavior` change
+  - [x] `src/workspace.rs:23` — `Camera::default` used but not implemented
+- [x] Add `impl Default for Camera` (already present at `src/camera.rs:212`)
+- [x] Add CI gate: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` (`.github/workflows/ci.yml`)
+- [x] Single source of truth for IDs (`NodeId`, `SurfaceId` defined in `src/lib.rs`; no private re-exports)
+- [x] Zero clippy warnings (`cargo clippy --all-targets -- -D warnings` passes); inherent `default()` methods converted to `new()` + `impl Default`; type aliases for complex map types in `event.rs`/`rendering.rs`
 
 ## P1 — Canvas Core (README M1)
 
-- [ ] OpenGL context: `winit` + `glutin` + `glow`, OpenGL 3.3 core minimum
-- [ ] Capability detection at startup (no compute; degrade effects gracefully)
-- [ ] Render graph: `ContentPass` → `OverlayPass` → `PostProcessPass` via FBOs
-- [ ] Shape batching for rectangles/borders (one draw call per pass where possible)
-- [ ] Camera pan/zoom (wheel zoom, drag pan, middle-drag pan)
-- [ ] Resize handling + HiDPI scale factor
-- [ ] Exit: rectangles + text zoom/pan smoothly at 60 fps
+- [x] OpenGL context: `winit` + `glutin` + `glow`, OpenGL 3.3 core minimum (`src/canvas.rs`, `src/window.rs`)
+- [x] Capability detection at startup (no compute; degrade effects gracefully) — `Capabilities::detect`
+- [x] Render graph: `ContentPass` → `OverlayPass` → `PostProcessPass` via FBOs — `RenderGraphExecutor` (`src/canvas.rs`); degrades to direct-screen rendering on weak drivers; PostProcess effects are placeholders
+- [x] Shape batching for rectangles/borders (one draw call per pass where possible) — `RectRenderer`
+- [x] Camera pan/zoom (wheel zoom, drag pan, middle-drag pan) — cursor-anchored zoom in `src/window.rs`
+- [x] Resize handling + HiDPI scale factor (`AppState::hidpi_scale`, surface resize)
+- [x] Exit (partial): rectangles + text zoom/pan smoothly; deep-zoom text sharpening lands via P2
 
 ## P2 — Text Surface Rendering (README M2)
 
-- [ ] fontconfig discovery + FreeType rasterization + HarfBuzz shaping
-- [ ] Glyph atlas keyed on: font id, glyph id, pixel size, subpixel bucket, style flags, color mode
-- [ ] Three-zoom strategy: cached layer textures (far) → direct glyphs (near) → SDF/high-res (very large)
-- [ ] Damage tracking + incremental atlas updates
-- [ ] Subpixel positioning; crisp text at fractional DPI
-- [ ] Exit: text stays crisp across the full zoom range
+- [x] fontconfig discovery (`FontSystem::font_path`) + FreeType rasterization (`Face::rasterize`); HarfBuzz shaping still pending
+- [x] Glyph atlas keyed on: font id, glyph id, pixel size, subpixel bucket, style flags, color mode — `Atlas` + `GlyphKey` (`src/text.rs`)
+- [ ] Three-zoom strategy: `choose_pixel_size` covers near (1–8x) + very large (>8x, capped 512px); far cached layer textures pending
+- [ ] Damage tracking + incremental atlas updates (atlas eviction-rebuild scaffold only)
+- [x] Subpixel positioning — 1/5-em buckets via FreeType pen offset
+- [ ] Crisp text at fractional DPI (verify under real display)
+- [ ] Exit: text stays crisp across the full zoom range (needs on-display verification)
 
 ## P3 — Terminal Surface (README M3)
 
-- [ ] PTY via `portable-pty` (async with `tokio`)
-- [ ] VT parser: ANSI/VT100/xterm, SGR, 8/16/24-bit color
-- [ ] Grid + damage tracking; scrollback; alternate screen
-- [ ] Cursor styles; line wrapping; resize propagation
-- [ ] Keyboard → PTY; mouse tracking (xterm/vt200/sgr); bracketed paste
+- [x] PTY via `portable-pty` (`src/pty.rs`): shell spawn, background reader thread, `write`, `resize` (SIGWINCH)
+- [x] VT parser: ANSI/VT100/xterm via `vte` (`src/vt.rs`) — SGR (16/256/24-bit color, bold/italic/underline/reverse), cursor movement, erase, alt screen
+- [x] Grid + damage flag (`Terminal.dirty`); scrollback (capped); alternate screen
+- [ ] Cursor styles; line wrapping (partial: auto-wrap on overflow); resize propagation (`PtySession::resize` exists, not yet wired to window resize)
+- [x] Keyboard → PTY (text, named keys, arrows, Ctrl+key control codes); mouse tracking/bracketed paste pending
 - [ ] OSC title, OSC 8 hyperlinks, OSC 52 clipboard (permission-gated)
-- [ ] Unicode: wide chars, graphemes, emoji, Nerd Fonts, ambiguous-width config
-- [ ] `TextSource` impls beyond PTY: command output, file tail, plugin source
-- [ ] Terminal profiles: default, big-text, ssh, logs, presentation, high-contrast
-- [ ] Exit: interactive `bash` works inside a canvas node
+- [ ] Unicode: wide chars + spacer cells + `unicode-width` done; graphemes, emoji, Nerd Fonts, ambiguous-width config pending
+- [ ] `TextSource` impls beyond PTY: command output, file tail, plugin source (stubs exist)
+- [ ] Terminal profiles: default, big-text, ssh, logs, presentation, high-contrast (`TerminalConfig::profile` scaffold only)
+- [ ] Exit: interactive `bash` works inside a canvas node (rendering path live; needs on-display verification)
 
 ## P4 — Projection System (README M4)
 
-- [ ] Promote `ProjectionSurface` to a real `SurfaceType`; node holds source + projection
-- [ ] Selectors: rows, columns, filter (substring/regex/levels), search, maxLines, follow
-- [ ] Modes: live vs snapshot; extract vs highlight
+- [x] `ProjectionSurface` as a Node component (`node.projection`); source + selector + mode + presentation — done previously, now wired to real terminals
+- [x] Selectors: rows, columns, filter (substring/regex via `regex` crate/levels), search, maxLines (tail), follow
+- [x] Modes: live (re-sync each frame from source) vs snapshot (freezes on first capture, `snapshot_taken` guard)
+- [x] Extract mode for filters; highlight mode pending
 - [ ] Presentation: wrap, reflow, line numbers, timestamps, match highlight, font scale, theme override
-- [ ] Create/attach/detach projection from a node and from a selection
-- [ ] Exit: terminal subranges pinned and arranged independently
+- [x] Create/attach from a terminal (`ProjectionSurface::from_terminal`, `update_from_terminal`); detach = node ungrouped projection node (UI pending)
+- [x] Live demo: last-20-lines projection node rendered as green text over terminal output
+- [ ] Exit: terminal subrange views pinned and arranged independently (rendering live; pin-as-view UI + arrange commands pending)
 
 ## P5 — Lens & Zoom (README M5)
 
-- [ ] Implement all `ZoomTarget` variants: workspace-fit, object, rectangle, terminal-range, projection, reading
-- [ ] Animated transitions with easing (config `camera.easing`, `autoZoomAnimationMs`)
-- [ ] Right-click autozoom; right-drag rectangle zoom; ctrl+right-click menu
-- [ ] "Pin as View" materializes any zoom into an independent node (live or snapshot)
-- [ ] Camera bookmarks as lens targets; named bookmarks UI
-- [ ] Exit: any zoom can become a pinned view
+- [x] ZoomTarget variants: workspace-fit, rectangle (`Camera::fit_rect` — viewport-aware, centered, eased), object (`Camera::zoom_to_node` via node size)
+- [x] Animated transitions with easing (`Camera::update` driven per frame from the window loop)
+- [x] Right-click autozoom (topmost hit-test node); right-drag rectangle zoom; ctrl+right-click context-menu target reporting
+- [x] "Pin as View": `p` key materializes the current viewport into a snapshot projection node
+- [x] Camera bookmarks as lens targets: `b` saves, digits `1–9` restore (`Camera::save_bookmark`/`restore_bookmark`); named-bookmark UI pending
+- [x] Node `size` component added (Transform previously had no size; hit-tests and zoom used wrong bounds)
+- [ ] Reading lens target; terminal-range target
+- [ ] Exit: any zoom can become a pinned view (snapshot pinning works; live pin + UI polish pending)
 
 ## P6 — JS Host & Typed SDK (README M6–M7)
 
-- [ ] `ScriptHost` trait; `V8ScriptHost` via `deno_core`/`v8`
-- [ ] SWC transpile on load for `.ts/.mts/.js/.mjs` (no build step)
-- [ ] Plugin lifecycle: manifest → `activate`/`deactivate`, disposables auto-cleanup
-- [ ] Scoped permissions (terminal.read/write, fs paths, network origins, clipboard, process.spawn)
+- [x] `ScriptHost` trait (`src/script.rs`) mirroring README §13: load/unload/call/dispatch_event
+- [x] `QuickJsScriptHost` via `rquickjs` — isolated runtime per plugin, `activate(ctx)`/`deactivate()` lifecycle hooks, disposables teardown on drop
+- [x] Web-like globals scaffold: `console.log/error`, `fracterm.commands.register` host API
+- [x] Typed event bus serialization (`Event` now serde) + `onEvent` dispatch to all plugins
+- [x] SWC transpile on load for `.ts/.mts/.tsx` (parse + type-strip + codegen in `transpile_ts`; `.js/.mjs` pass through)
+- [x] Scoped permission enforcement — `has_permission` (unscoped/scoped matching) + `commands.register` gated at the host API, denial aborts plugin load
 - [ ] Typed commands (input schema), typed throttled events, declarative widgets
 - [ ] Schema-driven settings UI auto-generation
-- [ ] Web-like globals (console, timers, structuredClone, crypto, URL, AbortController) — no DOM/Node
+- [ ] More web globals: timers, structuredClone, crypto, URL, AbortController
 - [ ] Generate `.d.ts`: `fracterm`, `fracterm/config`, `fracterm/plugin`, `fracterm/widget`
-- [ ] `QuickJsScriptHost` as optional fallback (trait keeps it swappable)
+- [ ] `V8ScriptHost` via `deno_core`/`v8` behind the same trait
 - [ ] Exit: a TS plugin registers commands + widgets with a pleasant DX
 
 ## P7 — Dashboard Ergonomics (README M8)

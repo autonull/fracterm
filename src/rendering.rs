@@ -27,6 +27,12 @@ pub struct RenderPassConfig {
     pub background_blur: bool,
 }
 
+impl Default for RenderPassConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RenderPassConfig {
     pub fn new() -> Self {
         Self {
@@ -50,6 +56,12 @@ pub struct RenderGraphNode {
 pub struct RenderGraph {
     pub nodes: Vec<RenderGraphNode>,
     pub connections: Vec<(String, String)>,
+}
+
+impl Default for RenderGraph {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RenderGraph {
@@ -112,7 +124,7 @@ pub struct GlyphAtlas {
     /// Texture size
     pub size: u32,
     /// Glyph entries: font_id, glyph_id, pixel_size -> texture coords
-    pub entries: HashMap<(String, u32, u32), (f32, f32, f32, f32)>,
+    pub entries: HashMap<AtlasKey, AtlasCoords>,
 }
 
 impl GlyphAtlas {
@@ -125,8 +137,15 @@ impl GlyphAtlas {
     }
 
     /// Get glyph texture coordinates
-    pub fn get(&self, _font_id: &str, _glyph_id: u32, _pixel_size: u32) -> Option<(f32, f32, f32, f32)> {
-        self.entries.get(&(_font_id.to_string(), _glyph_id, _pixel_size)).copied()
+    pub fn get(
+        &self,
+        _font_id: &str,
+        _glyph_id: u32,
+        _pixel_size: u32,
+    ) -> Option<(f32, f32, f32, f32)> {
+        self.entries
+            .get(&(_font_id.to_string(), _glyph_id, _pixel_size))
+            .copied()
     }
 
     /// Insert a glyph into the atlas
@@ -137,6 +156,9 @@ impl GlyphAtlas {
         pixel_size: u32,
         coords: (f32, f32, f32, f32),
     ) {
-        self.entries.insert((font_id.to_string(), glyph_id, pixel_size), coords);
+        self.entries
+            .insert((font_id.to_string(), glyph_id, pixel_size), coords);
     }
 }
+type AtlasKey = (String, u32, u32);
+type AtlasCoords = (f32, f32, f32, f32);

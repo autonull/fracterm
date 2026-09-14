@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Event types in Fracterm
-#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum EventType {
     /// An object was created
     ObjectCreated,
@@ -25,7 +25,7 @@ pub enum EventType {
 }
 
 /// An event in the event bus
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Event {
     /// Event type
     pub event_type: EventType,
@@ -70,7 +70,7 @@ impl Event {
 /// Typed event bus for plugin communication.
 pub struct EventBus {
     /// Subscribers for each event type
-    subscribers: HashMap<EventType, Vec<Arc<dyn Fn(&Event) + Send + Sync>>>,
+    subscribers: HashMap<EventType, SubscriberList>,
     /// Whether events are throttled
     throttled: bool,
 }
@@ -112,5 +112,12 @@ impl EventBus {
     /// Check if events are throttled
     pub fn is_throttled(&self) -> bool {
         self.throttled
+    }
+}
+type SubscriberList = Vec<Arc<dyn Fn(&Event) + Send + Sync>>;
+
+impl Default for EventBus {
+    fn default() -> Self {
+        Self::new()
     }
 }

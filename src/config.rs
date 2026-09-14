@@ -12,7 +12,7 @@ pub struct FontConfig {
 }
 
 impl FontConfig {
-    pub fn default() -> Self {
+    pub fn new() -> Self {
         Self {
             family: "JetBrains Mono".to_string(),
             size: 14,
@@ -32,7 +32,7 @@ pub struct ThemeConfig {
 }
 
 impl ThemeConfig {
-    pub fn default() -> Self {
+    pub fn new() -> Self {
         Self {
             background: "#0b0d12".to_string(),
             foreground: "#dfe3ee".to_string(),
@@ -51,7 +51,7 @@ pub struct CameraConfig {
 }
 
 impl CameraConfig {
-    pub fn default() -> Self {
+    pub fn new() -> Self {
         Self {
             wheel_zoom_speed: 1.0,
             auto_zoom_animation_ms: 250,
@@ -68,7 +68,7 @@ pub struct EffectsConfig {
 }
 
 impl EffectsConfig {
-    pub fn default() -> Self {
+    pub fn new() -> Self {
         Self {
             motion_blur: false,
             background_blur: false,
@@ -87,7 +87,7 @@ pub struct InputConfig {
 }
 
 impl InputConfig {
-    pub fn default() -> Self {
+    pub fn new() -> Self {
         Self {
             wheel: "zoom".to_string(),
             right_click: "autozoom".to_string(),
@@ -107,7 +107,7 @@ pub struct TerminalConfig {
 }
 
 impl TerminalConfig {
-    pub fn default() -> Self {
+    pub fn new() -> Self {
         Self {
             scrollback_lines: 10000,
             copy_on_select: false,
@@ -125,7 +125,7 @@ pub struct HudConfig {
 }
 
 impl HudConfig {
-    pub fn default() -> Self {
+    pub fn new() -> Self {
         Self {
             auto_hide: true,
             edge: "top-left".to_string(),
@@ -144,7 +144,7 @@ pub struct AccessibilityConfig {
 }
 
 impl AccessibilityConfig {
-    pub fn default() -> Self {
+    pub fn new() -> Self {
         Self {
             font_size: 28,
             line_height: 1.6,
@@ -169,7 +169,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn default() -> Self {
+    pub fn new() -> Self {
         Self {
             font: FontConfig::default(),
             theme: ThemeConfig::default(),
@@ -181,5 +181,58 @@ impl Config {
             accessibility: AccessibilityConfig::default(),
             profiles: HashMap::new(),
         }
+    }
+}
+impl Default for FontConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for CameraConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for EffectsConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for HudConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for AccessibilityConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::new()
     }
 }

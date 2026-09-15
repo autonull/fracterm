@@ -12,6 +12,20 @@ below are spec'd in full so a fresh context can execute them without
 re-discovering anything. DO NOT regress the hard-won fixes listed under
 "Must not regress" at the bottom of this section.
 
+Session record (2026-09-15, items 1–4 implemented + verified live):
+83 tests green (76 + 7 new: 2 camera, 5 arrange), clippy `-D warnings` clean,
+fmt clean. Camera now targets-only for animated moves (`zoom_at_cursor`,
+`fit_rect`, bookmarks) and cancels animation on direct `pan`; `draw_frame`
+uses real seconds. Startup spawns ONE aspect-fitted terminal (103x24 at
+1280x720 via new `arrange::ideal_grid_for_view`) framed full-bleed by a
+centering `fit_rect` snap (cam 169,95,1.36) — no Node 2, no labels. `n`
+spawns beside/wraps via `place_beside`. Select/move/resize state machine
+(`DragState`) + accent border + handle + `sync_session_grid` wired to both
+resize-drag and window-resize. Live-verified: typed echo single-fire,
+`$COLUMNS`=103, select border, spawn position, pan moves with zero
+post-release drift. See LIVE-DONE notes on the verify bullets for the
+remaining gaps (wheel-zoom timing, move/resize-drags, post-resize SIGWINCH).
+
 ### 1. Camera obeys the user completely
 Goal: smooth, fast interpolation between points and zooms; the camera must
 never steer itself back to a center on its own.
@@ -26,89 +40,89 @@ Already done: `Camera::pan` now syncs targets + cancels animation;
 (`SMOOTH_RATE = 14.0`, ~99% converged in 0.33s).
 
 Still to do (fresh context starts here):
-- [ ] `src/window.rs` `draw_frame`: change `.update(dt.min(0.1) * 10.0)` to
+- [x] `src/window.rs` `draw_frame`: change `.update(dt.min(0.1) * 10.0)` to
       `.update(dt.min(0.1))` (REAL seconds). The `* 10.0` with the new
       exponential update would make every animation snap instantly.
-- [ ] `src/window.rs` `zoom_at_cursor` (wheel): retarget to operate on
+- [x] `src/window.rs` `zoom_at_cursor` (wheel): retarget to operate on
       TARGETS so repeated wheels don't fight the easing:
       `old = cam.target_zoom; new = clamp(old * factor);`
       `cam.target_x += cx / old - cx / new;` (same for y, cx/cy = screen
       cursor); `cam.target_zoom = new; cam.animating = true;`
-- [ ] `src/window.rs` `CursorMoved` pan branch: it sets `cam.x/cam.y`
+- [x] `src/window.rs` `CursorMoved` pan branch: it sets `cam.x/cam.y`
       directly WITHOUT touching targets — if `animating` is true the next
       `update()` drags the camera back toward the stale target. THIS is the
       reported auto-steer. Fix: route through `cam.pan(dx, dy)` (or set
       `target_x/target_y = x/y` and `animating = false` alongside).
-- [ ] `fit_dashboard` (`src/window.rs`): add `instant: bool` param.
+- [x] `fit_dashboard` (`src/window.rs`): add `instant: bool` param.
       Startup calls with `true` (snap: set current+targets, no animation —
       app must be ready immediately). `f` key calls with `false` (set
       targets + `animating = true` for a smooth fly-to).
-- [ ] Audit: every other `camera_mut()` site must be user-triggered
+- [x] Audit: every other `camera_mut()` site must be user-triggered
       (`finish_right_click` fit/zoom, `0`/`b`/digit keys, pin) — keep them,
       they already go through targets.
-- [ ] Tests (`src/camera.rs` tests module): convergence — from (0,0,1) to
+- [x] Tests (`src/camera.rs` tests module): convergence — from (0,0,1) to
       target (100,50,2), step `update(1.0/60.0)`, assert `!animating` within
       60 steps and exact snap; pan-cancels-animation — set animating, call
       `pan`, assert `!animating` and targets == currents.
 - [ ] Verify live (`DISPLAY=:0`, app window titled `fracterm`): wheel over
       window = smooth ~0.3s zoom anchored at cursor; left-drag pan = 1:1
       with NO drift/rubber-band after release (screenshot before/after must
-      differ only by the pan offset).
+      differ only by the pan offset). LIVE-DONE (pan half): middle-drag pans (shot diff non-empty), two post-release shots pixel-identical — no drift/rubber-band. Wheel-zoom smoothness NOT timed live.
 
 ### 2. Startup: ONE centered terminal, no Node 1/Node 2 confusion
 Goal: app opens on a single complete terminal centered on screen. Delete the
 demo projection node ("Node 2") and the "node N" label chrome.
 
-- [ ] `src/window.rs` `resumed()`: delete the demo-projection block
+- [x] `src/window.rs` `resumed()`: delete the demo-projection block
       (selector/max_lines 20/Live/`pnode` at (vx,vy)). Keep
       `pin_current_view` (`p` key) as the on-demand way to create views.
-- [ ] Same function: compute terminal pixel size from measured metrics
+- [x] Same function: compute terminal pixel size from measured metrics
       (`GRID_COLS * cell_w + 2*GRID_PAD_X`,
       `header_h() + GRID_ROWS * line_h + GRID_PAD_BOTTOM`), then center it
       in the REAL window size:
       `tx = round((width - term_w) / 2)`, `ty = round((height - term_h) / 2)`;
       spawn there; snap camera to (0,0,1) (or instant `fit_dashboard`).
-- [ ] `src/window.rs` `draw_frame`: delete the node-label loop
+- [x] `src/window.rs` `draw_frame`: delete the node-label loop
       (`format!("node {}", ...)`). Keep projection-content text rendering
       (pinned views still show their lines).
-- [ ] Note: `arrange::dashboard_layout` becomes unused by startup after
+- [x] Note: `arrange::dashboard_layout` becomes unused by startup after
       this (still `pub` + tested — leave it, do not delete).
 - [ ] Verify live: screenshot shows exactly one terminal, centered
       (node rect center within ~5px of viewport center); tesseract OCR reads
-      the prompt; log shows `cam=(0,0,x1.00)`.
+      the prompt; log shows `cam=(0,0,x1.00)`. LIVE-DONE (evolved): single terminal fills view via aspect-derived grid (103 cols at 1280x720, node 943x530) + centering fit_rect snap, cam=(169,95,x1.36). OCR reads typed echo/output/`103`, no `node N` labels. Fish prompt itself slow (~14s blank until first input).
 
 ### 3. New terminals spawn beside; camera drags between them
-- [ ] `src/arrange.rs`: new pure helper + tests:
+- [x] `src/arrange.rs`: new pure helper + tests:
       `place_beside(anchor:(x,y,w,h), size:(w,h), gap:f64, view:(w,h)) -> (i32,i32)`
       — try right of anchor; if `x + w` overflows viewport width, wrap
       below anchor. Tests: side-by-side no-overlap at 1280 wide; wrap on
       narrow viewport (mirror the existing `dashboard_layout` tests).
-- [ ] `src/window.rs`: extract `terminal_node_size(cols, rows) -> (i32,i32)`
+- [x] `src/window.rs`: extract `terminal_node_size(cols, rows) -> (i32,i32)`
       from `spawn_terminal_node` (uses `grid_cell` + `header_h()`).
-- [ ] `src/window.rs` `n` key: anchor = focused session's node rect (or
+- [x] `src/window.rs` `n` key: anchor = focused session's node rect (or
       last terminal node); `pos = place_beside(anchor, terminal_node_size(),
       DASH_GAP, viewport)`; `spawn_terminal_node(GRID_COLS, GRID_ROWS, pos)`.
       Keep the 8-terminal cap.
 - [ ] Camera drag between terminals already works via pan (item 1 fixes
       its feel). Verify live: `n` creates a second terminal to the right
-      with a gap, no overlap (screenshot); drag pans across both.
+      with a gap, no overlap (screenshot); drag pans across both. LIVE-DONE (mostly): `n` spawned node2 wrapped BELOW at predicted (169,649) (1280 too narrow for side-by-side) — no overlap, click-selects. Beside-path unit-tested only. Pan verified in item 1.
 
 ### 4. Select / move / resize terminals (vector-app feel)
 Goal: click a terminal to select it as a whole (accent border), drag to move
 (with edge snapping), drag its corner handle to resize (grid + PTY follow).
 
-- [ ] `src/window.rs` `CanvasState`: add `selected: Option<NodeId>`;
+- [x] `src/window.rs` `CanvasState`: add `selected: Option<NodeId>`;
       replace `pan_anchor: Option<(f64,f64)>` with a drag state machine:
       `enum DragState { None, Pan { ax: f64, ay: f64 }, Move { node: NodeId, dx: f64, dy: f64 }, Resize { node: NodeId } }`
       where `dx/dy` = world-space grab offset (`node.pos - world_at_grab`).
-- [ ] Left-press (`MouseInput`): compute world `(wx,wy)` from cursor+camera.
+- [x] Left-press (`MouseInput`): compute world `(wx,wy)` from cursor+camera.
       If a node is selected and `(wx,wy)` is within ~10 screen px of its
       bottom-right corner → `Resize`. Else `hit_node(wx,wy)`:
       hit → `selected = id` + existing terminal-focus logic +
       `Move{node, dx: node.x - wx, dy: node.y - wy}`;
       miss → `selected = None`, `term_focus = false`, `Pan{anchor}`.
       (Copy hit data into owned values BEFORE mutating `self` — borrowck.)
-- [ ] `CursorMoved`: match on drag —
+- [x] `CursorMoved`: match on drag —
       Pan: existing camera math, then route through `cam.pan` (item 1);
       Move: `node.transform = world - offset`, then snap via existing
       `arrange::snap_to_edges` (build a temp clone at the new pos like
@@ -117,30 +131,30 @@ Goal: click a terminal to select it as a whole (accent border), drag to move
       Resize: `size = max(world - node.pos, min_size)` where min comes from
       cell metrics (`2*cell_w + 2*PAD_X` by `header + 2*line_h + PAD_BOTTOM`);
       if the node has a session, re-derive its grid + PTY (next bullet).
-- [ ] Extract `sync_session_grid(&mut self, node_id: NodeId)` (grid
+- [x] Extract `sync_session_grid(&mut self, node_id: NodeId)` (grid
       rows/cols from node size via a new pure helper
       `arrange::terminal_grid_size(node_w, node_h, cell_w, header_h, pad_x,
       pad_bottom) -> (u32, u32)`, clamped 2..=256, + cursor clamp +
       `pty.resize`). Reuse it in the Resize drag AND rewrite the
       `WindowEvent::Resized` handler loop to call it per session node
       (deletes the duplicated math there).
-- [ ] `src/canvas.rs` `RectRenderer`: add `push_overlay_rect(x,y,w,h,color)`
+- [x] `src/canvas.rs` `RectRenderer`: add `push_overlay_rect(x,y,w,h,color)`
       (filled rect into `overlay_verts` via existing `push_rect_verts`).
-- [ ] `draw_frame` rect loop: selected node gets accent border
+- [x] `draw_frame` rect loop: selected node gets accent border
       `(0.35, 0.7, 1.0, 1.0)` thickness `2.0`; others keep theme border.
       After borders: if `selected`, draw the resize handle — filled accent
       square of `12.0 / zoom` world px at the node's bottom-right corner
       via `push_overlay_rect`.
-- [ ] Tests: `terminal_grid_size` cases (exact-fit cols/rows, clamp mins);
+- [x] Tests: `terminal_grid_size` cases (exact-fit cols/rows, clamp mins);
       handle hit-test as a pure fn (screen-space distance of node corner to
       cursor < 10px); `place_beside` (item 3). Keep all 76 existing tests
       green: `cargo test --lib` (fast; PTY tests spawn real shells).
 - [ ] Verify live: click terminal → accent border screenshot; drag →
       node follows cursor (diff screenshots); drag corner → node grows and
       new columns appear (log grid size or OCR wider lines); click empty
-      canvas → border clears.
+      canvas → border clears. LIVE-DONE (select half): click → 8k accent-px border + handle. Move/resize-drags + empty-click-clear NOT live-tested (unit-tested only).
 - [ ] `PtySession::resize` already exists; confirm SIGWINCH reaches the
-      shell (type `echo $COLUMNS` after a handle-resize).
+      shell (type `echo $COLUMNS` after a handle-resize). LIVE-PARTIAL: spawn-time size confirmed (`echo $COLUMNS` → 103, PTY correctly sized). Post-resize SIGWINCH unconfirmed (handle-resize not live-tested).
 
 ### Must not regress (hard-won, all verified live + unit-tested)
 - `src/text.rs` glyph VAO byte offsets (`TEXT_UV_OFFSET_BYTES = 8`,
@@ -176,9 +190,12 @@ Goal: click a terminal to select it as a whole (accent border), drag to move
 
 ## Session Status (checkpoint)
 
-**State as of this commit: all gates green** — `cargo build`, 54 tests passing,
+**State as of this commit: all gates green** — `cargo build`, 83 tests passing,
 `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --check` clean.
-Binary runs (headless fallback works when no GL 3.3 context is available).
+Binary runs on-display (X :0, 1280x720 Luscombe) and headless fallback still intact.
+Display-verified this session: single full-bleed terminal (aspect-fitted grid
++ camera fit), typed echo + `$COLUMNS`=103, select accent border + handle,
+`n`-spawn placement, pan with zero post-release drift, no `node N` labels.
 
 **Tested & working without a display:** all 54 unit/integration tests
 (VT parser, PTY echo round-trip, TS transpile, QuickJS plugin lifecycle,
@@ -191,7 +208,11 @@ In-window: bash PTY live, wheel zoom, drag pan, right-click autozoom,
 right-drag rect zoom, `P` pin view, `B`/`1–9` bookmarks, `T/H/V/A` arrange.
 
 **Next up (in order):**
-1. On-display verification pass of M1–M5 exit criteria
+1. Remaining live gaps from items 1–4: wheel-zoom ~0.3s timing/anchoring,
+   move-drag with edge-snap feel, handle-resize drag → grid+PTY follow
+   (then `echo $COLUMNS` proves post-resize SIGWINCH), side-by-side
+   (non-wrap) `n`-spawn on a wider viewport
+2. On-display verification pass of M1–M5 exit criteria
 2. P6 remainder: typed commands/events/widgets SDK, more web globals,
    generated `.d.ts`, V8 host behind the trait
 3. P7 remainder: alignment-guide rendering, multi-select + drag reorder,
@@ -210,6 +231,20 @@ right-drag rect zoom, `P` pin view, `B`/`1–9` bookmarks, `T/H/V/A` arrange.
 - CI (`.github/workflows/ci.yml`) untested on a real runner
   (needs libfreetype/fontconfig/clang — already in the apt line)
 - serde pinned `=1.0.203` for swc compatibility; revisit when swc updates
+- Full-bleed startup ⇒ no empty canvas: left-drag always grabs a node
+  (select/move), pan is middle-drag only. Consider a space-pan / Alt-drag
+  fallback if this annoys.
+- Fish first prompt is slow (~14s blank window until first input even with
+  DA answered); screenshots/OCR before first keystroke show nothing.
+- Toolchain note: clippy 1.94 newly flags `needless_return` on match-arm
+  tails (removed 13 in `window.rs` keyboard map) and `needless_range_loop`
+  (fixed in `terminal.rs`); `grid_cell_origin` (8 args, pre-existing) needed
+  `#[allow]` like `text.rs` already does. `cargo fmt` also normalized
+  whitespace-only drift in `text.rs`/`vt.rs` (no logic change).
+- Environment notes: window spawns at screen offset (add window pos to
+  window-rel coords for xdotool clicks); NEVER `pkill` here (hangs) — use
+  `kill <PID>`; don't chain `build && launch &` in one shell-tool call
+  (tool waits on the pipe) — build, then launch, in separate calls.
 
 ---
 

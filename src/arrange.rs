@@ -209,6 +209,7 @@ pub fn world_to_ndc(
 }
 
 /// Grid cell baseline origin in world pixels for terminal dashboards.
+#[allow(clippy::too_many_arguments)]
 pub fn grid_cell_origin(
     node_x: f64,
     node_y: f64,
@@ -244,6 +245,87 @@ pub fn dashboard_layout(
         vy = ty + term_h + gap;
     }
     ((tx as i32, ty as i32), (vx as i32, vy as i32))
+}
+
+/// Place a new node beside an anchor: try the right side first; if the
+/// new node would overflow the viewport width, wrap below the anchor.
+/// `anchor` is (x, y, w, h), `size` is (w, h), `view` is (w, h).
+pub fn place_beside(
+    anchor: (i32, i32, i32, i32),
+    size: (i32, i32),
+    gap: f64,
+    view: (f64, f64),
+) -> (i32, i32) {
+    let (ax, ay, aw, ah) = anchor;
+    let (sw, _sh) = size;
+    let gap = gap as i32;
+    let rx = ax + aw + gap;
+    if (rx + sw) as f64 <= view.0 {
+        (rx, ay)
+    } else {
+        (ax, ay + ah + gap)
+    }
+}
+
+/// Derive a terminal grid (cols, rows) from a node size and cell metrics.
+/// Clamped to 2..=256 so tiny drags never kill the PTY.
+pub fn terminal_grid_size(
+    node_w: f64,
+    node_h: f64,
+    cell_w: f64,
+    line_h: f64,
+    header_h: f64,
+    pad_x: f64,
+    pad_bottom: f64,
+) -> (u32, u32) {
+    let cols = ((node_w - 2.0 * pad_x) / cell_w).floor().clamp(2.0, 256.0) as u32;
+    let rows = ((node_h - header_h - pad_bottom) / line_h)
+        .floor()
+        .clamp(2.0, 256.0) as u32;
+    (cols, rows)
+}
+
+/// Ideal startup grid: keep `rows` rows and choose columns so the node
+/// aspect matches the viewport aspect — the camera fit then fills the
+/// view with (almost) no letterbox waste on any side.
+#[allow(clippy::too_many_arguments)]
+pub fn ideal_grid_for_view(
+    view_w: f64,
+    view_h: f64,
+    cell_w: f64,
+    line_h: f64,
+    header_h: f64,
+    pad_x: f64,
+    pad_bottom: f64,
+    rows: u32,
+) -> (u32, u32) {
+    let rows = rows.clamp(2, 256);
+    let node_h = header_h + rows as f64 * line_h + pad_bottom;
+    let target_w = node_h * view_w / view_h.max(1.0);
+    let cols = ((target_w - 2.0 * pad_x) / cell_w)
+        .round()
+        .clamp(2.0, 256.0) as u32;
+    (cols, rows)
+}
+
+/// Pure resize-handle hit test: is the screen cursor within `threshold`
+/// px of the node's bottom-right corner (world -> screen via camera)?
+#[allow(clippy::too_many_arguments)]
+pub fn resize_handle_hit(
+    node_x: f64,
+    node_y: f64,
+    node_w: f64,
+    node_h: f64,
+    cam_x: f64,
+    cam_y: f64,
+    zoom: f64,
+    cursor_sx: f64,
+    cursor_sy: f64,
+    threshold: f64,
+) -> bool {
+    let hx = (node_x + node_w - cam_x) * zoom;
+    let hy = (node_y + node_h - cam_y) * zoom;
+    (hx - cursor_sx).abs() <= threshold && (hy - cursor_sy).abs() <= threshold
 }
 
 /// A suggested snap: the node edge aligns with a nearby other edge.
@@ -443,5 +525,60 @@ mod tests {
         let (t2, v2) = dashboard_layout(700.0, 736.0, 472.0, 360.0, 24.0, 24.0);
         assert_eq!(t2, (24, 24));
         assert_eq!(v2, (24, 24 + 472 + 24));
+    }
+
+    #[test]
+    fn test_place_beside_side_by_side() {
+        // Anchor 736 wide at x=24; new 736 wide + 24 gap fits in 1280? No:
+        // 24+736+24=784, 784+736=1520 > 1280, so wraps below. Use a
+        // smaller anchor to test the beside path.
+        let pos = place_beside((24, 24, 200, 100), (200, 100), 24.0, (1280.0, 720.0));
+        assert_eq!(pos, (24 + 200 + 24, 24));
+        // No overlap: right edge of anchor + gap == left of new.
+        assert!(pos.0 >= 24 + 200 + 24);
+    }
+
+    #[test]
+    fn test_ideal_grid_for_view_matches_aspect() {
+        // 1280x720 view, 9x20 cells, header 40, pads 8/10, 24 rows:
+        // node_h = 530, target_w = 942.2, cols = round(926.2/9) = 103.
+        let (cols, rows) = ideal_grid_for_view(1280.0, 720.0, 9.0, 20.0, 40.0, 8.0, 10.0, 24);
+        assert_eq!((cols, rows), (103, 24));
+        // Resulting node aspect ≈ view aspect (within half a cell).
+        let (nw, nh) = (cols as f64 * 9.0 + 16.0, 40.0 + 24.0 * 20.0 + 10.0);
+        assert!((nw / nh - 1280.0 / 720.0).abs() < 0.02);
+        // Rows clamp, degenerate view safe.
+        assert_eq!(
+            ideal_grid_for_view(1280.0, 720.0, 9.0, 20.0, 40.0, 8.0, 10.0, 0).1,
+            2
+        );
+    }
+
+    #[test]
+    fn test_place_beside_wraps_on_narrow_viewport() {
+        let pos = place_beside((24, 24, 736, 472), (736, 472), 24.0, (700.0, 720.0));
+        assert_eq!(pos, (24, 24 + 472 + 24));
+    }
+
+    #[test]
+    fn test_terminal_grid_size() {
+        // Exact fit: node 736x482, cell 9x18, header 38, pads 8/10.
+        // cols = (736-16)/9 = 80, rows = (482-38-10)/18 = 24 (floor).
+        let (cols, rows) = terminal_grid_size(736.0, 482.0, 9.0, 18.0, 38.0, 8.0, 10.0);
+        assert_eq!((cols, rows), (80, 24));
+        // Tiny node clamps to minimum 2x2.
+        let (cols, rows) = terminal_grid_size(10.0, 10.0, 9.0, 18.0, 38.0, 8.0, 10.0);
+        assert_eq!((cols, rows), (2, 2));
+    }
+
+    #[test]
+    fn test_resize_handle_hit() {
+        // Node 100x100 at origin, cam at origin, zoom 1: corner at (100,100).
+        assert!(resize_handle_hit(
+            0.0, 0.0, 100.0, 100.0, 0.0, 0.0, 1.0, 105.0, 105.0, 10.0
+        ));
+        assert!(!resize_handle_hit(
+            0.0, 0.0, 100.0, 100.0, 0.0, 0.0, 1.0, 50.0, 50.0, 10.0
+        ));
     }
 }

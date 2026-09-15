@@ -522,11 +522,7 @@ pub fn normalize_bitmap(
                 for x in 0..w {
                     let mut acc = 0u32;
                     for k in 0..3 {
-                        let phys = if flip {
-                            h - 1 - (y * 3 + k)
-                        } else {
-                            y * 3 + k
-                        };
+                        let phys = if flip { h - 1 - (y * 3 + k) } else { y * 3 + k };
                         acc += src.get(phys * stride + x).copied().unwrap_or(0) as u32;
                     }
                     out.push((acc / 3) as u8);
@@ -592,7 +588,8 @@ const TEXT_COLOR_OFFSET_BYTES: i32 = 4 * std::mem::size_of::<f32>() as i32;
 /// Screen-space glyph renderer sampling the shared glyph atlas.
 /// Glyphs are rasterized at their on-screen pixel size, so text stays crisp
 /// through the whole zoom range (three-zoom strategy, README §4.3).
-pub struct TextRenderer {    program: glow::Program,
+pub struct TextRenderer {
+    program: glow::Program,
     vao: glow::VertexArray,
     vbo: glow::Buffer,
     verts: Vec<f32>,
@@ -630,14 +627,7 @@ impl TextRenderer {
         gl.enable_vertex_attrib_array(1);
         gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, TEXT_UV_OFFSET_BYTES);
         gl.enable_vertex_attrib_array(2);
-        gl.vertex_attrib_pointer_f32(
-            2,
-            4,
-            glow::FLOAT,
-            false,
-            stride,
-            TEXT_COLOR_OFFSET_BYTES,
-        );
+        gl.vertex_attrib_pointer_f32(2, 4, glow::FLOAT, false, stride, TEXT_COLOR_OFFSET_BYTES);
         gl.bind_vertex_array(None);
         gl.bind_buffer(glow::ARRAY_BUFFER, None);
 
@@ -678,8 +668,7 @@ impl TextRenderer {
                 continue;
             }
             let subpixel = SubpixelBucket::from_fraction(pen_x.fract());
-            let Some((supply_id, glyph_id, bm)) =
-                fonts.rasterize(font_id, ch, screen_px, subpixel)
+            let Some((supply_id, glyph_id, bm)) = fonts.rasterize(font_id, ch, screen_px, subpixel)
             else {
                 continue;
             };

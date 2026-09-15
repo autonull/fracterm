@@ -161,6 +161,18 @@ impl RectRenderer {
         push_rect_verts(v, x + w - thickness, y, thickness, h, color);
     }
 
+    /// Queue a filled world-space rectangle into the OverlayPass.
+    pub fn push_overlay_rect(
+        &mut self,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        color: (f32, f32, f32, f32),
+    ) {
+        push_rect_verts(&mut self.overlay_verts, x, y, w, h, color);
+    }
+
     /// Queue an axis-aligned world-space rectangle (6 vertices, 2 triangles).
     pub fn push_rect(&mut self, x: f64, y: f64, w: f64, h: f64, color: (f32, f32, f32, f32)) {
         push_rect_verts(&mut self.verts, x, y, w, h, color);

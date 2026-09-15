@@ -358,8 +358,7 @@ impl vte::Perform for VtEngine {
                 if p.contains(&1049) {
                     if action == 'h' && self.alt_cells.is_none() {
                         self.alt_cells = Some(self.term.grid.cells.clone());
-                        self.saved_cursor =
-                            Some((self.term.cursor_row, self.term.cursor_col));
+                        self.saved_cursor = Some((self.term.cursor_row, self.term.cursor_col));
                         self.clear_screen();
                         self.term.cursor_row = 0;
                         self.term.cursor_col = 0;
@@ -370,10 +369,8 @@ impl vte::Perform for VtEngine {
                             // bottom row pushed the first prompt to the last
                             // line and scrolled away row 0.
                             let (r, c) = self.saved_cursor.take().unwrap_or((0, 0));
-                            self.term.cursor_row =
-                                r.min(self.term.grid.rows.saturating_sub(1));
-                            self.term.cursor_col =
-                                c.min(self.term.grid.cols.saturating_sub(1));
+                            self.term.cursor_row = r.min(self.term.grid.rows.saturating_sub(1));
+                            self.term.cursor_col = c.min(self.term.grid.cols.saturating_sub(1));
                         }
                     }
                 }
@@ -574,10 +571,7 @@ mod tests {
         assert_eq!(cell(&e, 0, 3).character, 'C');
         assert_eq!(cell(&e, 0, 3).fg, super::palette_256(200));
         assert_eq!(cell(&e, 0, 4).character, 'D');
-        assert_eq!(
-            cell(&e, 0, 4).fg,
-            crate::surface::Color::rgb(10, 20, 30)
-        );
+        assert_eq!(cell(&e, 0, 4).fg, crate::surface::Color::rgb(10, 20, 30));
         assert_eq!(cell(&e, 0, 5).character, '*');
         assert_eq!(
             cell(&e, 0, 5).fg,

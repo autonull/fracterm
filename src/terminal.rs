@@ -111,9 +111,17 @@ impl TerminalGrid {
         // Preserve overlapping content: window resizes must never wipe the
         // visible terminal.
         let mut cells = vec![vec![TerminalCell::default(); new_cols as usize]; new_rows as usize];
-        for r in 0..(self.rows.min(new_rows) as usize) {
-            for c in 0..(self.cols.min(new_cols) as usize) {
-                cells[r][c] = self.cells[r][c].clone();
+        for (r, row) in cells
+            .iter_mut()
+            .enumerate()
+            .take(self.rows.min(new_rows) as usize)
+        {
+            for (c, cell) in row
+                .iter_mut()
+                .enumerate()
+                .take(self.cols.min(new_cols) as usize)
+            {
+                *cell = self.cells[r][c].clone();
             }
         }
         self.cells = cells;

@@ -291,4 +291,34 @@ mod tests {
         assert!((cam.target_zoom - 1.25).abs() < 1e-9); // min(800/640, 600/400)
         assert!(cam.animating);
     }
+
+    #[test]
+    fn test_animated_convergence_snaps_exact() {
+        let mut cam = Camera::new();
+        cam.target_x = 100.0;
+        cam.target_y = 50.0;
+        cam.target_zoom = 2.0;
+        cam.animating = true;
+        for _ in 0..60 {
+            cam.update(1.0 / 60.0);
+            if !cam.animating {
+                break;
+            }
+        }
+        assert!(!cam.animating);
+        assert_eq!((cam.x, cam.y, cam.zoom), (100.0, 50.0, 2.0));
+    }
+
+    #[test]
+    fn test_pan_cancels_animation() {
+        let mut cam = Camera::new();
+        cam.target_x = 100.0;
+        cam.target_y = 50.0;
+        cam.target_zoom = 2.0;
+        cam.animating = true;
+        cam.pan(5.0, -3.0);
+        assert!(!cam.animating);
+        assert_eq!((cam.target_x, cam.target_y), (cam.x, cam.y));
+        assert_eq!(cam.target_zoom, cam.zoom);
+    }
 }

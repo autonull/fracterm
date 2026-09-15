@@ -4,6 +4,174 @@ Prioritized, consolidated backlog. Order of tiers = order of execution.
 `P0` blocks everything; each `P#` roughly maps to a README milestone (M1–M9).
 Prefer finishing a tier before starting the next.
 
+## Immediate (user-directed, do now)
+
+Status note (2026-09-15): text is legible and verified (OCR reads labels,
+typed echo, prompt `❯` via fallback). 76 tests green, 0 warnings. The items
+below are spec'd in full so a fresh context can execute them without
+re-discovering anything. DO NOT regress the hard-won fixes listed under
+"Must not regress" at the bottom of this section.
+
+### 1. Camera obeys the user completely
+Goal: smooth, fast interpolation between points and zooms; the camera must
+never steer itself back to a center on its own.
+
+Background: `Camera` (`src/camera.rs`) has current (x/y/zoom) + target +
+`animating`. Rule for all future edits: DIRECT manipulation sets current AND
+target AND `animating=false` (user takes over); ANIMATED moves set target AND
+`animating=true`. Anything else produces the "steers itself back" feel.
+
+Already done: `Camera::pan` now syncs targets + cancels animation;
+`Camera::update` is frame-rate independent exponential smoothing
+(`SMOOTH_RATE = 14.0`, ~99% converged in 0.33s).
+
+Still to do (fresh context starts here):
+- [ ] `src/window.rs` `draw_frame`: change `.update(dt.min(0.1) * 10.0)` to
+      `.update(dt.min(0.1))` (REAL seconds). The `* 10.0` with the new
+      exponential update would make every animation snap instantly.
+- [ ] `src/window.rs` `zoom_at_cursor` (wheel): retarget to operate on
+      TARGETS so repeated wheels don't fight the easing:
+      `old = cam.target_zoom; new = clamp(old * factor);`
+      `cam.target_x += cx / old - cx / new;` (same for y, cx/cy = screen
+      cursor); `cam.target_zoom = new; cam.animating = true;`
+- [ ] `src/window.rs` `CursorMoved` pan branch: it sets `cam.x/cam.y`
+      directly WITHOUT touching targets — if `animating` is true the next
+      `update()` drags the camera back toward the stale target. THIS is the
+      reported auto-steer. Fix: route through `cam.pan(dx, dy)` (or set
+      `target_x/target_y = x/y` and `animating = false` alongside).
+- [ ] `fit_dashboard` (`src/window.rs`): add `instant: bool` param.
+      Startup calls with `true` (snap: set current+targets, no animation —
+      app must be ready immediately). `f` key calls with `false` (set
+      targets + `animating = true` for a smooth fly-to).
+- [ ] Audit: every other `camera_mut()` site must be user-triggered
+      (`finish_right_click` fit/zoom, `0`/`b`/digit keys, pin) — keep them,
+      they already go through targets.
+- [ ] Tests (`src/camera.rs` tests module): convergence — from (0,0,1) to
+      target (100,50,2), step `update(1.0/60.0)`, assert `!animating` within
+      60 steps and exact snap; pan-cancels-animation — set animating, call
+      `pan`, assert `!animating` and targets == currents.
+- [ ] Verify live (`DISPLAY=:0`, app window titled `fracterm`): wheel over
+      window = smooth ~0.3s zoom anchored at cursor; left-drag pan = 1:1
+      with NO drift/rubber-band after release (screenshot before/after must
+      differ only by the pan offset).
+
+### 2. Startup: ONE centered terminal, no Node 1/Node 2 confusion
+Goal: app opens on a single complete terminal centered on screen. Delete the
+demo projection node ("Node 2") and the "node N" label chrome.
+
+- [ ] `src/window.rs` `resumed()`: delete the demo-projection block
+      (selector/max_lines 20/Live/`pnode` at (vx,vy)). Keep
+      `pin_current_view` (`p` key) as the on-demand way to create views.
+- [ ] Same function: compute terminal pixel size from measured metrics
+      (`GRID_COLS * cell_w + 2*GRID_PAD_X`,
+      `header_h() + GRID_ROWS * line_h + GRID_PAD_BOTTOM`), then center it
+      in the REAL window size:
+      `tx = round((width - term_w) / 2)`, `ty = round((height - term_h) / 2)`;
+      spawn there; snap camera to (0,0,1) (or instant `fit_dashboard`).
+- [ ] `src/window.rs` `draw_frame`: delete the node-label loop
+      (`format!("node {}", ...)`). Keep projection-content text rendering
+      (pinned views still show their lines).
+- [ ] Note: `arrange::dashboard_layout` becomes unused by startup after
+      this (still `pub` + tested — leave it, do not delete).
+- [ ] Verify live: screenshot shows exactly one terminal, centered
+      (node rect center within ~5px of viewport center); tesseract OCR reads
+      the prompt; log shows `cam=(0,0,x1.00)`.
+
+### 3. New terminals spawn beside; camera drags between them
+- [ ] `src/arrange.rs`: new pure helper + tests:
+      `place_beside(anchor:(x,y,w,h), size:(w,h), gap:f64, view:(w,h)) -> (i32,i32)`
+      — try right of anchor; if `x + w` overflows viewport width, wrap
+      below anchor. Tests: side-by-side no-overlap at 1280 wide; wrap on
+      narrow viewport (mirror the existing `dashboard_layout` tests).
+- [ ] `src/window.rs`: extract `terminal_node_size(cols, rows) -> (i32,i32)`
+      from `spawn_terminal_node` (uses `grid_cell` + `header_h()`).
+- [ ] `src/window.rs` `n` key: anchor = focused session's node rect (or
+      last terminal node); `pos = place_beside(anchor, terminal_node_size(),
+      DASH_GAP, viewport)`; `spawn_terminal_node(GRID_COLS, GRID_ROWS, pos)`.
+      Keep the 8-terminal cap.
+- [ ] Camera drag between terminals already works via pan (item 1 fixes
+      its feel). Verify live: `n` creates a second terminal to the right
+      with a gap, no overlap (screenshot); drag pans across both.
+
+### 4. Select / move / resize terminals (vector-app feel)
+Goal: click a terminal to select it as a whole (accent border), drag to move
+(with edge snapping), drag its corner handle to resize (grid + PTY follow).
+
+- [ ] `src/window.rs` `CanvasState`: add `selected: Option<NodeId>`;
+      replace `pan_anchor: Option<(f64,f64)>` with a drag state machine:
+      `enum DragState { None, Pan { ax: f64, ay: f64 }, Move { node: NodeId, dx: f64, dy: f64 }, Resize { node: NodeId } }`
+      where `dx/dy` = world-space grab offset (`node.pos - world_at_grab`).
+- [ ] Left-press (`MouseInput`): compute world `(wx,wy)` from cursor+camera.
+      If a node is selected and `(wx,wy)` is within ~10 screen px of its
+      bottom-right corner → `Resize`. Else `hit_node(wx,wy)`:
+      hit → `selected = id` + existing terminal-focus logic +
+      `Move{node, dx: node.x - wx, dy: node.y - wy}`;
+      miss → `selected = None`, `term_focus = false`, `Pan{anchor}`.
+      (Copy hit data into owned values BEFORE mutating `self` — borrowck.)
+- [ ] `CursorMoved`: match on drag —
+      Pan: existing camera math, then route through `cam.pan` (item 1);
+      Move: `node.transform = world - offset`, then snap via existing
+      `arrange::snap_to_edges` (build a temp clone at the new pos like
+      `apply_arrange` does; threshold 8 world px; use guide pos when within
+      threshold);
+      Resize: `size = max(world - node.pos, min_size)` where min comes from
+      cell metrics (`2*cell_w + 2*PAD_X` by `header + 2*line_h + PAD_BOTTOM`);
+      if the node has a session, re-derive its grid + PTY (next bullet).
+- [ ] Extract `sync_session_grid(&mut self, node_id: NodeId)` (grid
+      rows/cols from node size via a new pure helper
+      `arrange::terminal_grid_size(node_w, node_h, cell_w, header_h, pad_x,
+      pad_bottom) -> (u32, u32)`, clamped 2..=256, + cursor clamp +
+      `pty.resize`). Reuse it in the Resize drag AND rewrite the
+      `WindowEvent::Resized` handler loop to call it per session node
+      (deletes the duplicated math there).
+- [ ] `src/canvas.rs` `RectRenderer`: add `push_overlay_rect(x,y,w,h,color)`
+      (filled rect into `overlay_verts` via existing `push_rect_verts`).
+- [ ] `draw_frame` rect loop: selected node gets accent border
+      `(0.35, 0.7, 1.0, 1.0)` thickness `2.0`; others keep theme border.
+      After borders: if `selected`, draw the resize handle — filled accent
+      square of `12.0 / zoom` world px at the node's bottom-right corner
+      via `push_overlay_rect`.
+- [ ] Tests: `terminal_grid_size` cases (exact-fit cols/rows, clamp mins);
+      handle hit-test as a pure fn (screen-space distance of node corner to
+      cursor < 10px); `place_beside` (item 3). Keep all 76 existing tests
+      green: `cargo test --lib` (fast; PTY tests spawn real shells).
+- [ ] Verify live: click terminal → accent border screenshot; drag →
+      node follows cursor (diff screenshots); drag corner → node grows and
+      new columns appear (log grid size or OCR wider lines); click empty
+      canvas → border clears.
+- [ ] `PtySession::resize` already exists; confirm SIGWINCH reaches the
+      shell (type `echo $COLUMNS` after a handle-resize).
+
+### Must not regress (hard-won, all verified live + unit-tested)
+- `src/text.rs` glyph VAO byte offsets (`TEXT_UV_OFFSET_BYTES = 8`,
+  `TEXT_COLOR_OFFSET_BYTES = 16` for pos2+uv2+color4). Wrong offsets made
+  every glyph a solid white block with correct positions.
+- `u_atlas_size` plain uniform (no `textureSize()` in the vertex shader);
+  atlas zero-initialized (uninit texels bled through LINEAR filtering).
+- `FontSystem::rasterize` fallback stack (`monospace → DejaVu Sans Mono →
+  Noto Sans Symbols`); `queue_string` takes `fonts + font_id` and keys the
+  atlas by the SUPPLYING face id. (Fish prompt `❯` only exists in DejaVu.)
+- VT answers Primary DA (`\x1b[?1;2c`); without it fish holds its first
+  prompt ~10s (blank window). Replies flow via `take_reply()` → `pty.write`.
+- `PtySession` holds ONE writer (`take_writer` fails after first call —
+  this silently dropped every keystroke after the first).
+- Grid metrics measured from the 'M' glyph advance (9px), NEVER from
+  `FT_Size_Metrics::max_advance` (reports 27px on Noto Sans Mono → giant
+  node → 0.5x camera fit → smear).
+- Pitch-aware `normalize_bitmap` (Gray/Mono/Gray2/Gray4/LCD/LCDV/BGRA,
+  negative pitch); empty-glyph guards in `queue_string` + `Atlas::insert`.
+- Alt-screen save/restore cursor (`saved_cursor`); press-only key handling
+  (releases ignored); click sets `term_focus`; `encode_text_input` /
+  `named_key_sequence` / `control_code` helpers + tests.
+- Live loop that works: `DISPLAY=:0`, `./target/debug/fracterm &`,
+  `xdotool windowfocus --sync $W` + plain `xdotool type` (NEVER
+  `type --window`, XSendEvent is ignored by winit), `import -window $W`
+  screenshots, `tesseract` OCR as legibility oracle, per-pixel numpy
+  analysis. Headless font probe:
+  `cargo test --lib text::tests::test_dump_glyph_geometry -- --nocapture`.
+- Current diagnostics to keep: startup block, `font ... -> path` lines,
+  first-PTY-bytes line. (Per-second stats + key logs were removed as noise.)
+
 ---
 
 ## Session Status (checkpoint)

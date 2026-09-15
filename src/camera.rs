@@ -194,29 +194,41 @@ impl Camera {
         self.animating = true;
     }
 
-    /// Pan the camera by delta
+    /// Pan the camera by delta. Direct manipulation: current and target
+    /// move together and any in-flight animation is cancelled, so the
+    /// camera never steers itself back after the user pans.
     pub fn pan(&mut self, dx: f64, dy: f64) {
         self.x += dx;
         self.y += dy;
         self.target_x = self.x;
         self.target_y = self.y;
+        self.target_zoom = self.zoom;
+        self.animating = false;
     }
 
-    /// Update the camera toward its target
+    /// Smoothing rate (1/s) for animated moves: converges ~99% in 0.33s.
+    /// Fast enough to feel instant, slow enough to read as motion.
+    pub const SMOOTH_RATE: f64 = 14.0;
+
+    /// Update the camera toward its target (frame-rate independent).
+    /// Only acts while `animating`; direct user drags cancel animation
+    /// via `pan`, so this never fights the user.
     pub fn update(&mut self, dt: f64) {
-        if self.animating {
-            self.zoom += (self.target_zoom - self.zoom) * dt * 0.1;
-            self.x += (self.target_x - self.x) * dt * 0.1;
-            self.y += (self.target_y - self.y) * dt * 0.1;
-            if (self.target_zoom - self.zoom).abs() < 0.01
-                && (self.target_x - self.x).abs() < 0.1
-                && (self.target_y - self.y).abs() < 0.1
-            {
-                self.zoom = self.target_zoom;
-                self.x = self.target_x;
-                self.y = self.target_y;
-                self.animating = false;
-            }
+        if !self.animating {
+            return;
+        }
+        let k = 1.0 - (-Self::SMOOTH_RATE * dt.max(0.0)).exp();
+        self.zoom += (self.target_zoom - self.zoom) * k;
+        self.x += (self.target_x - self.x) * k;
+        self.y += (self.target_y - self.y) * k;
+        if (self.target_zoom - self.zoom).abs() < 0.001
+            && (self.target_x - self.x).abs() < 0.05
+            && (self.target_y - self.y).abs() < 0.05
+        {
+            self.zoom = self.target_zoom;
+            self.x = self.target_x;
+            self.y = self.target_y;
+            self.animating = false;
         }
     }
 }

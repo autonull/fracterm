@@ -14,6 +14,10 @@ pub struct PtySession {
     child: Box<dyn Child + Send + Sync>,
     output: Arc<Mutex<Vec<u8>>>,
     reader: Option<JoinHandle<()>>,
+    /// Single master writer held for the session lifetime: portable-pty
+    /// allows `take_writer` exactly once, so per-keystroke takes fail
+    /// after the first key.
+    writer: Mutex<Box<dyn Write + Send>>,
     cols: u16,
     rows: u16,
 }
@@ -43,6 +47,7 @@ impl PtySession {
 
         let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
         let mut reader_io = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
+        let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
 
         let output: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let out_handle = Arc::clone(&output);
@@ -69,6 +74,7 @@ impl PtySession {
             child,
             output,
             reader: Some(reader),
+            writer: Mutex::new(writer),
             cols,
             rows,
         })
@@ -84,7 +90,7 @@ impl PtySession {
 
     /// Write bytes to the PTY master (keyboard input).
     pub fn write(&self, bytes: &[u8]) -> Result<(), String> {
-        let mut writer = self.master.take_writer().map_err(|e| e.to_string())?;
+        let mut writer = self.writer.lock().map_err(|e| e.to_string())?;
         writer.write_all(bytes).map_err(|e| e.to_string())?;
         writer.flush().map_err(|e| e.to_string())
     }
@@ -141,5 +147,31 @@ mod tests {
         let text = String::from_utf8_lossy(&got);
         assert!(text.contains("fracterm-pty-test"), "output was: {text:?}");
         let _ = pty.write(b"\n");
+    }
+
+    #[test]
+    fn test_pty_write_echoes_back() {
+        // Keyboard path: bytes written to the master come back through the
+        // reader thread. `cat` echoes stdin; the PTY line discipline may
+        // also echo input, so either way the marker must reappear.
+        if !std::path::Path::new("/bin/cat").exists() {
+            return;
+        }
+        let pty = PtySession::spawn(80, 24, Some("/bin/cat")).unwrap();
+        // Two separate writes: the writer must survive more than one call
+        // (take_writer-once regression: only the first keystroke arrived).
+        let _ = pty.write(b"fracterm-");
+        let _ = pty.write(b"echo-123\n");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut got = Vec::new();
+        while std::time::Instant::now() < deadline {
+            got.extend(pty.take_output());
+            if got.windows(17).any(|w| w == b"fracterm-echo-123") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let text = String::from_utf8_lossy(&got);
+        assert!(text.contains("fracterm-echo-123"), "output was: {text:?}");
     }
 }

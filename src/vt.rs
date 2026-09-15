@@ -48,6 +48,11 @@ pub struct VtEngine {
     wide_spacer: Option<(u32, u32)>,
     /// Window title from OSC 0/2 sequences.
     pub title: String,
+    /// Cursor saved across the alternate screen (?1049h/?1049l).
+    saved_cursor: Option<(u32, u32)>,
+    /// Reply bytes owed to the child (e.g. Device Attributes answers).
+    /// Drained by the window loop and written back to the PTY.
+    pending_reply: Vec<u8>,
 }
 
 impl VtEngine {
@@ -58,7 +63,14 @@ impl VtEngine {
             alt_cells: None,
             wide_spacer: None,
             title: String::new(),
+            saved_cursor: None,
+            pending_reply: Vec::new(),
         }
+    }
+
+    /// Take bytes the terminal owes the child process.
+    pub fn take_reply(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending_reply)
     }
 
     /// Feed raw PTY output through the parser.
@@ -258,7 +270,7 @@ impl vte::Perform for VtEngine {
     fn csi_dispatch(
         &mut self,
         params: &vte::Params,
-        _intermediates: &[u8],
+        intermediates: &[u8],
         _ignore: bool,
         action: char,
     ) {
@@ -346,13 +358,34 @@ impl vte::Perform for VtEngine {
                 if p.contains(&1049) {
                     if action == 'h' && self.alt_cells.is_none() {
                         self.alt_cells = Some(self.term.grid.cells.clone());
+                        self.saved_cursor =
+                            Some((self.term.cursor_row, self.term.cursor_col));
                         self.clear_screen();
+                        self.term.cursor_row = 0;
+                        self.term.cursor_col = 0;
                     } else if action == 'l' {
                         if let Some(alt) = self.alt_cells.take() {
                             self.term.grid.cells = alt;
-                            self.term.cursor_row = self.term.grid.rows.saturating_sub(1);
+                            // Restore the pre-alt cursor: parking at the
+                            // bottom row pushed the first prompt to the last
+                            // line and scrolled away row 0.
+                            let (r, c) = self.saved_cursor.take().unwrap_or((0, 0));
+                            self.term.cursor_row =
+                                r.min(self.term.grid.rows.saturating_sub(1));
+                            self.term.cursor_col =
+                                c.min(self.term.grid.cols.saturating_sub(1));
                         }
                     }
+                }
+            }
+            'c' => {
+                // Device Attributes: `\e[0c` asks "what terminal are you?".
+                // A real terminal always answers; fish holds its first
+                // prompt until this reply arrives, so silence here means
+                // a blank window for many seconds. Private (`\e[>0c`)
+                // secondary-DA is ignored for now.
+                if !intermediates.contains(&b'>') {
+                    self.pending_reply.extend_from_slice(b"\x1b[?1;2c");
                 }
             }
             _ => {}
@@ -512,5 +545,43 @@ mod tests {
         e.feed("x".as_bytes());
         assert_eq!(cell(&e, 0, 1).width, 0); // spacer filled lazily
         assert_eq!(cell(&e, 0, 2).character, 'x');
+    }
+
+    #[test]
+    fn test_da_query_answered() {
+        // fish holds its first prompt until Primary DA is answered.
+        let mut e = engine(80, 24);
+        e.feed(b"\x1b[0c");
+        assert_eq!(e.take_reply(), b"\x1b[?1;2c");
+        assert!(e.take_reply().is_empty());
+        // Secondary DA (`>`) stays silent.
+        e.feed(b"\x1b[>0c");
+        assert!(e.take_reply().is_empty());
+    }
+
+    #[test]
+    fn test_colored_cells_preserved() {
+        // Colored characters must land in the grid with their colors;
+        // color must never drop a cell.
+        let mut e = engine(80, 24);
+        e.feed(b"\x1b[31mR\x1b[32mG\x1b[90mB\x1b[38;5;200mC\x1b[38;2;10;20;30mD\x1b[m*");
+        assert_eq!(cell(&e, 0, 0).character, 'R');
+        assert_eq!(cell(&e, 0, 0).fg, super::PALETTE[1]);
+        assert_eq!(cell(&e, 0, 1).character, 'G');
+        assert_eq!(cell(&e, 0, 1).fg, super::PALETTE[2]);
+        assert_eq!(cell(&e, 0, 2).character, 'B');
+        assert_eq!(cell(&e, 0, 2).fg, super::PALETTE[8]);
+        assert_eq!(cell(&e, 0, 3).character, 'C');
+        assert_eq!(cell(&e, 0, 3).fg, super::palette_256(200));
+        assert_eq!(cell(&e, 0, 4).character, 'D');
+        assert_eq!(
+            cell(&e, 0, 4).fg,
+            crate::surface::Color::rgb(10, 20, 30)
+        );
+        assert_eq!(cell(&e, 0, 5).character, '*');
+        assert_eq!(
+            cell(&e, 0, 5).fg,
+            crate::surface::Color::rgb(0xdf, 0xe3, 0xee)
+        );
     }
 }

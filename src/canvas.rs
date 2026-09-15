@@ -48,7 +48,7 @@ uniform vec2 u_viewport;
 out vec4 v_color;
 void main() {
     vec2 screen = (a_pos - u_cam_pos) * u_zoom;
-    vec2 ndc = vec2(2.0 * screen.x / u_viewport.x, -2.0 * screen.y / u_viewport.y);
+    vec2 ndc = vec2(2.0 * screen.x / u_viewport.x - 1.0, 1.0 - 2.0 * screen.y / u_viewport.y);
     gl_Position = vec4(ndc, 0.0, 1.0);
     v_color = a_color;
 }

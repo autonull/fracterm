@@ -94,28 +94,18 @@ impl Face {
             .ok()?;
         let slot = self.face.glyph();
         let bitmap = slot.bitmap();
-        let (w, h) = (bitmap.width() as u32, bitmap.rows() as u32);
+        // Normalize every FreeType pixel mode to tight grayscale coverage.
+        // `buffer()` spans `|pitch| * rows` (rows may be padded and pitch
+        // may be negative for up-flow bitmaps), so a pitch-aware copy is
+        // required for legible glyphs.
+        let mode = bitmap
+            .pixel_mode()
+            .unwrap_or(freetype::bitmap::PixelMode::None);
+        let raw_w = bitmap.width().max(0) as u32;
+        let raw_h = bitmap.rows().max(0) as u32;
+        let pitch = bitmap.pitch();
         let src = bitmap.buffer();
-        // LCD target yields 3x coverage; normalize to mono coverage by
-        // averaging channels if wide, else copy directly.
-        let lcd = bitmap.pixel_mode() == Ok(freetype::bitmap::PixelMode::Lcd);
-        let bpp: usize = if lcd { 3 } else { 1 };
-        let mut data = Vec::with_capacity((w * h) as usize);
-        for y in 0..h as usize {
-            for x in 0..w as usize {
-                let base = y * w as usize * bpp + x * bpp;
-                let cov = match bpp {
-                    3 => {
-                        let r = src.get(base).copied().unwrap_or(0) as u32;
-                        let g = src.get(base + 1).copied().unwrap_or(0) as u32;
-                        let b = src.get(base + 2).copied().unwrap_or(0) as u32;
-                        ((r + g + b) / 3) as u8
-                    }
-                    _ => src.get(base).copied().unwrap_or(0),
-                };
-                data.push(cov);
-            }
-        }
+        let (w, h, data) = normalize_bitmap(raw_w, raw_h, pitch, mode, src);
         let glyph_id = self.face.get_char_index(ch as usize).unwrap_or(0);
         Some((
             glyph_id,
@@ -168,6 +158,7 @@ impl FontSystem {
             .font_path(family)
             .or_else(|| self.font_path("monospace"))
             .ok_or_else(|| format!("no font found for family '{family}'"))?;
+        eprintln!("[fracterm] font '{family}' -> {path}");
         let face = self.ft.new_face(&path, 0).map_err(|e| e.to_string())?;
         let font_id = self.next_font_id;
         self.next_font_id += 1;
@@ -177,6 +168,57 @@ impl FontSystem {
             face,
         });
         Ok(font_id)
+    }
+
+    /// Load a primary family plus best-effort fallbacks for glyphs the
+    /// primary lacks (symbols, prompt glyphs like U+276F). Returns all
+    /// loaded ids, primary first; requires at least one success.
+    pub fn load_family_stack(&mut self, families: &[&str]) -> Result<Vec<u32>, String> {
+        let mut ids = Vec::new();
+        for family in families {
+            match self.load_family(family) {
+                Ok(id) => ids.push(id),
+                Err(e) => eprintln!("[fracterm] fallback font '{family}' unavailable: {e}"),
+            }
+        }
+        if ids.is_empty() {
+            return Err("no fonts loaded".to_string());
+        }
+        Ok(ids)
+    }
+
+    /// Rasterize through the fallback stack: the primary face first, then
+    /// fallbacks. The first face whose glyph id is non-zero (really present,
+    /// not .notdef) wins; otherwise the primary's .notdef box is returned
+    /// so the pen still advances with a visible placeholder. Returns the
+    /// supplying face's id and glyph id for atlas keying.
+    pub fn rasterize(
+        &mut self,
+        font_id: u32,
+        ch: char,
+        pixel_size: u32,
+        subpixel: SubpixelBucket,
+    ) -> Option<(u32, u32, GlyphBitmap)> {
+        let primary_idx = self.faces.iter().position(|f| f.font_id == font_id);
+        let mut order: Vec<usize> = (0..self.faces.len()).collect();
+        if let Some(p) = primary_idx {
+            order.retain(|&i| i != p);
+            order.insert(0, p);
+        }
+        let mut notdef: Option<(u32, u32, GlyphBitmap)> = None;
+        for idx in order {
+            let face = &mut self.faces[idx];
+            let Some((gid, bm)) = face.rasterize(ch, pixel_size, subpixel) else {
+                continue;
+            };
+            if gid != 0 {
+                return Some((face.font_id, gid, bm));
+            }
+            if notdef.is_none() {
+                notdef = Some((face.font_id, gid, bm));
+            }
+        }
+        notdef
     }
 
     pub fn face_mut(&mut self, font_id: u32) -> Option<&mut Face> {
@@ -204,6 +246,10 @@ impl Atlas {
     pub unsafe fn new(gl: &glow::Context, size: u32) -> Self {
         let texture = gl.create_texture().expect("atlas texture");
         gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        // Zero the atlas: gaps between packed glyphs must sample as
+        // transparent under LINEAR filtering, never uninitialized memory.
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+        let blank = vec![0u8; (size * size) as usize];
         gl.tex_image_2d(
             glow::TEXTURE_2D,
             0,
@@ -213,7 +259,7 @@ impl Atlas {
             0,
             glow::RED,
             glow::UNSIGNED_BYTE,
-            glow::PixelUnpackData::Slice(None),
+            glow::PixelUnpackData::Slice(Some(&blank)),
         );
         gl.tex_parameter_i32(
             glow::TEXTURE_2D,
@@ -258,6 +304,10 @@ impl Atlas {
         key: GlyphKey,
         bitmap: &GlyphBitmap,
     ) -> (u32, u32, u32, u32) {
+        // Empty glyphs carry no coverage: degenerate placement, no upload.
+        if bitmap.width == 0 || bitmap.height == 0 || bitmap.data.is_empty() {
+            return (0, 0, 0, 0);
+        }
         let (mut px, mut py, mut shelf_h) = self.cursor;
         let (w, h) = (bitmap.width.max(1), bitmap.height.max(1));
         // Row-advance when the current shelf is full.
@@ -301,6 +351,10 @@ impl Atlas {
     pub fn texture(&self) -> glow::Texture {
         self.gl_texture
     }
+
+    pub fn size(&self) -> u32 {
+        self.size
+    }
 }
 
 /// Pixel-size selection for the three-zoom strategy (README §4.3):
@@ -318,18 +372,199 @@ pub fn choose_pixel_size(base_px: u32, zoom: f64) -> u32 {
     }
 }
 
+/// Measured font metrics at a pixel size (all values in pixels).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FontMetrics {
+    pub ascender: f64,
+    pub descender: f64,
+    pub line_height: f64,
+    pub max_advance: f64,
+}
+
+impl FontMetrics {
+    /// Grid cell size for terminal dashboards: full advance by full height.
+    pub fn cell_size(&self) -> (f64, f64) {
+        (
+            self.max_advance.ceil().max(2.0),
+            self.line_height.ceil().max(4.0),
+        )
+    }
+}
+
+impl Face {
+    /// Measure the face at a pixel size for grid layout.
+    ///
+    /// The advance is measured from a real glyph ('M'), not
+    /// `FT_Size_Metrics::max_advance`, which some faces report at a
+    /// multiple of the true advance (observed 3x on Noto Sans Mono:
+    /// 27px vs the real 9px). A wrong cell width sizes the terminal
+    /// node wrong, forces a shrunken camera fit, and turns text into
+    /// an illegible smear.
+    pub fn font_metrics(&mut self, pixel_size: u32) -> Option<FontMetrics> {
+        self.face.set_pixel_sizes(0, pixel_size).ok()?;
+        let m = self.face.size_metrics()?;
+        self.face
+            .load_char('M' as usize, freetype::face::LoadFlag::empty())
+            .ok()?;
+        let advance = self.face.glyph().advance().x as f64 / 64.0;
+        if !advance.is_finite() || advance <= 0.0 {
+            return None;
+        }
+        Some(FontMetrics {
+            ascender: m.ascender as f64 / 64.0,
+            descender: m.descender as f64 / 64.0,
+            line_height: m.height as f64 / 64.0,
+            max_advance: advance,
+        })
+    }
+}
+
+/// Normalize any FreeType bitmap to tight grayscale coverage.
+///
+/// Handles row pitch (including negative/up-flow pitch), Mono bit packing,
+/// Gray2/Gray4 scaling, LCD/LCDV decimation and BGRA alpha. LCD bitmaps are
+/// three times wider (LCDV: taller) than the glyph; the returned size is the
+/// true glyph size.
+pub fn normalize_bitmap(
+    width: u32,
+    rows: u32,
+    pitch: i32,
+    mode: freetype::bitmap::PixelMode,
+    src: &[u8],
+) -> (u32, u32, Vec<u8>) {
+    use freetype::bitmap::PixelMode as PM;
+    if width == 0 || rows == 0 || src.is_empty() || mode == PM::None {
+        return (0, 0, Vec::new());
+    }
+    let stride = pitch.unsigned_abs() as usize;
+    if stride == 0 {
+        return (0, 0, Vec::new());
+    }
+    let flip = pitch < 0;
+    let h = rows as usize;
+    let row_off = |logical: usize| -> usize {
+        let phys = if flip { h - 1 - logical } else { logical };
+        phys * stride
+    };
+    match mode {
+        PM::None => (0, 0, Vec::new()),
+        PM::Gray => {
+            let mut out = Vec::with_capacity((width * rows) as usize);
+            for y in 0..h {
+                let base = row_off(y);
+                for x in 0..width as usize {
+                    out.push(src.get(base + x).copied().unwrap_or(0));
+                }
+            }
+            (width, rows, out)
+        }
+        PM::Mono => {
+            let mut out = Vec::with_capacity((width * rows) as usize);
+            for y in 0..h {
+                let base = row_off(y);
+                for x in 0..width as usize {
+                    let b = src.get(base + x / 8).copied().unwrap_or(0);
+                    let bit = 0x80u8 >> (x % 8);
+                    out.push(if b & bit != 0 { 255 } else { 0 });
+                }
+            }
+            (width, rows, out)
+        }
+        PM::Gray2 => {
+            let mut out = Vec::with_capacity((width * rows) as usize);
+            for y in 0..h {
+                let base = row_off(y);
+                for x in 0..width as usize {
+                    let b = src.get(base + x / 4).copied().unwrap_or(0);
+                    let shift = 6 - 2 * (x % 4);
+                    out.push((((b >> shift) & 3) as u16 * 85) as u8);
+                }
+            }
+            (width, rows, out)
+        }
+        PM::Gray4 => {
+            let mut out = Vec::with_capacity((width * rows) as usize);
+            for y in 0..h {
+                let base = row_off(y);
+                for x in 0..width as usize {
+                    let b = src.get(base + x / 2).copied().unwrap_or(0);
+                    let shift = 4 - 4 * (x % 2);
+                    out.push((((b >> shift) & 15) as u16 * 17) as u8);
+                }
+            }
+            (width, rows, out)
+        }
+        PM::Lcd => {
+            let gw = width / 3;
+            if gw == 0 {
+                return (0, 0, Vec::new());
+            }
+            let mut out = Vec::with_capacity((gw * rows) as usize);
+            for y in 0..h {
+                let base = row_off(y);
+                for x in 0..gw as usize {
+                    let r = src.get(base + x * 3).copied().unwrap_or(0) as u32;
+                    let g = src.get(base + x * 3 + 1).copied().unwrap_or(0) as u32;
+                    let b = src.get(base + x * 3 + 2).copied().unwrap_or(0) as u32;
+                    out.push(((r + g + b) / 3) as u8);
+                }
+            }
+            (gw, rows, out)
+        }
+        PM::LcdV => {
+            let gh = rows / 3;
+            if gh == 0 {
+                return (0, 0, Vec::new());
+            }
+            let w = width as usize;
+            let mut out = Vec::with_capacity((width * gh) as usize);
+            for y in 0..gh as usize {
+                for x in 0..w {
+                    let mut acc = 0u32;
+                    for k in 0..3 {
+                        let phys = if flip {
+                            h - 1 - (y * 3 + k)
+                        } else {
+                            y * 3 + k
+                        };
+                        acc += src.get(phys * stride + x).copied().unwrap_or(0) as u32;
+                    }
+                    out.push((acc / 3) as u8);
+                }
+            }
+            (width, gh, out)
+        }
+        PM::Bgra => {
+            let mut out = Vec::with_capacity((width * rows) as usize);
+            for y in 0..h {
+                let base = row_off(y);
+                for x in 0..width as usize {
+                    out.push(src.get(base + x * 4 + 3).copied().unwrap_or(0));
+                }
+            }
+            (width, rows, out)
+        }
+    }
+}
+
 const GLYPH_VERTEX_SRC: &str = r#"
 #version 330 core
 layout (location = 0) in vec2 a_pos;   // screen pixels
 layout (location = 1) in vec2 a_uv;    // atlas texels
 layout (location = 2) in vec4 a_color; // tint (rgb) + opacity (a)
 uniform vec2 u_viewport;
+uniform vec2 u_atlas_size;
 out vec2 v_uv;
 out vec4 v_color;
 void main() {
-    vec2 ndc = vec2(2.0 * a_pos.x / u_viewport.x, -2.0 * a_pos.y / u_viewport.y);
+    vec2 ndc = vec2(2.0 * a_pos.x / u_viewport.x - 1.0, 1.0 - 2.0 * a_pos.y / u_viewport.y);
     gl_Position = vec4(ndc, 0.0, 1.0);
-    v_uv = a_uv / vec2(textureSize(u_atlas, 0));
+    // Atlas size arrives as a plain uniform: sampler queries in the vertex
+    // stage are fragile across drivers (observed: NaN UVs -> every glyph
+    // quad sampling one bright texel -> solid illegible blocks).
+    // Half-texel offset anchors LINEAR filtering on texel centers so glyph
+    // edges never bleed from neighboring atlas cells.
+    v_uv = (a_uv + vec2(0.5)) / u_atlas_size;
     v_color = a_color;
 }
 "#;
@@ -346,11 +581,18 @@ void main() {
 }
 "#;
 
+/// Text vertex layout: pos2 + uv2 + color4, packed as consecutive f32s.
+/// Attribute offsets are in BYTES: uv starts after pos (2 floats = 8B),
+/// color after pos+uv (4 floats = 16B). Getting these wrong shifts every
+/// attribute (observed: uv reading color → solid white glyph blocks).
+const TEXT_VERT_FLOATS: usize = 8;
+const TEXT_UV_OFFSET_BYTES: i32 = 2 * std::mem::size_of::<f32>() as i32;
+const TEXT_COLOR_OFFSET_BYTES: i32 = 4 * std::mem::size_of::<f32>() as i32;
+
 /// Screen-space glyph renderer sampling the shared glyph atlas.
 /// Glyphs are rasterized at their on-screen pixel size, so text stays crisp
 /// through the whole zoom range (three-zoom strategy, README §4.3).
-pub struct TextRenderer {
-    program: glow::Program,
+pub struct TextRenderer {    program: glow::Program,
     vao: glow::VertexArray,
     vbo: glow::Buffer,
     verts: Vec<f32>,
@@ -381,13 +623,21 @@ impl TextRenderer {
         let vbo = gl.create_buffer()?;
         gl.bind_vertex_array(Some(vao));
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-        let stride = 8 * std::mem::size_of::<f32>() as i32;
+        // Vertex layout is pos2 + uv2 + color4; offsets are in BYTES.
+        let stride = TEXT_VERT_FLOATS as i32 * std::mem::size_of::<f32>() as i32;
         gl.enable_vertex_attrib_array(0);
         gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, stride, 0);
         gl.enable_vertex_attrib_array(1);
-        gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 16);
+        gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, TEXT_UV_OFFSET_BYTES);
         gl.enable_vertex_attrib_array(2);
-        gl.vertex_attrib_pointer_f32(2, 4, glow::FLOAT, false, stride, 32);
+        gl.vertex_attrib_pointer_f32(
+            2,
+            4,
+            glow::FLOAT,
+            false,
+            stride,
+            TEXT_COLOR_OFFSET_BYTES,
+        );
         gl.bind_vertex_array(None);
         gl.bind_buffer(glow::ARRAY_BUFFER, None);
 
@@ -410,7 +660,8 @@ impl TextRenderer {
         &mut self,
         gl: &glow::Context,
         atlas: &mut Atlas,
-        face: &mut Face,
+        fonts: &mut FontSystem,
+        font_id: u32,
         world: (f64, f64),
         cam: (f64, f64, f64),
         base_px: u32,
@@ -427,11 +678,18 @@ impl TextRenderer {
                 continue;
             }
             let subpixel = SubpixelBucket::from_fraction(pen_x.fract());
-            let Some((glyph_id, bm)) = face.rasterize(ch, screen_px, subpixel) else {
+            let Some((supply_id, glyph_id, bm)) =
+                fonts.rasterize(font_id, ch, screen_px, subpixel)
+            else {
                 continue;
             };
+            // Empty glyphs (no coverage) still advance the pen.
+            if bm.width == 0 || bm.height == 0 || bm.data.is_empty() {
+                pen_x += bm.advance as f64 / 64.0;
+                continue;
+            }
             let key = GlyphKey {
-                font_id: face.font_id,
+                font_id: supply_id,
                 glyph_id,
                 pixel_size: screen_px,
                 subpixel,
@@ -481,6 +739,13 @@ impl TextRenderer {
             gl.get_uniform_location(self.program, "u_viewport").as_ref(),
             viewport.0,
             viewport.1,
+        );
+        let atlas_px = atlas.size() as f32;
+        gl.uniform_2_f32(
+            gl.get_uniform_location(self.program, "u_atlas_size")
+                .as_ref(),
+            atlas_px,
+            atlas_px,
         );
         gl.active_texture(glow::TEXTURE0);
         gl.bind_texture(glow::TEXTURE_2D, Some(atlas.texture()));
@@ -559,5 +824,153 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(key.clone(), (0u32, 0, 8, 8));
         assert!(map.contains_key(&key));
+    }
+
+    #[test]
+    fn test_vertex_layout_offsets() {
+        // Regression test: attribute offsets are BYTES into pos2+uv2+color4.
+        // Wrong offsets shift every attribute (uv reading color produced
+        // solid white glyph blocks with correct positions).
+        assert_eq!(TEXT_VERT_FLOATS, 8);
+        assert_eq!(TEXT_UV_OFFSET_BYTES, 8);
+        assert_eq!(TEXT_COLOR_OFFSET_BYTES, 16);
+        // glyph_quad emits exactly one 8-float vertex per 8 floats.
+        let q = glyph_quad(0.0, 0.0, 7.0, 8.0, 0.0, 0.0, 7.0, 8.0, (1.0, 1.0, 1.0, 1.0));
+        assert_eq!(q.len(), 48);
+        assert_eq!(&q[0..4], &[0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(&q[4..8], &[1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_normalize_gray_padded_pitch() {
+        use freetype::bitmap::PixelMode as PM;
+        let src = [10u8, 20, 30, 0, 40, 50, 60, 0];
+        let (w, h, data) = normalize_bitmap(3, 2, 4, PM::Gray, &src);
+        assert_eq!((w, h), (3, 2));
+        assert_eq!(data, vec![10, 20, 30, 40, 50, 60]);
+    }
+
+    #[test]
+    fn test_fallback_resolves_missing_glyph() {
+        let mut fonts = FontSystem::new().expect("freetype init");
+        let ids = fonts
+            .load_family_stack(&["monospace", "DejaVu Sans Mono", "Noto Sans Symbols"])
+            .expect("stack");
+        let primary = ids[0];
+        // Plain ASCII comes from the primary face.
+        let (fid_a, gid_a, _) = fonts
+            .rasterize(primary, 'A', 15, SubpixelBucket(0))
+            .expect("A");
+        assert_eq!(fid_a, primary);
+        assert_ne!(gid_a, 0);
+        // U+276F (fish prompt) is missing from Noto Sans Mono: a fallback
+        // face must supply it with a real glyph id and coverage.
+        let (fid_sym, gid_sym, bm_sym) = fonts
+            .rasterize(primary, '\u{276f}', 15, SubpixelBucket(0))
+            .expect("fallback glyph");
+        if ids.len() > 1 {
+            assert_ne!(fid_sym, primary);
+            assert_ne!(gid_sym, 0);
+        }
+        assert!(!bm_sym.data.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_negative_pitch_flips_rows() {
+        use freetype::bitmap::PixelMode as PM;
+        let src = [30u8, 40, 10, 20];
+        let (w, h, data) = normalize_bitmap(2, 2, -2, PM::Gray, &src);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(data, vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn test_normalize_mono_unpacks_bits() {
+        use freetype::bitmap::PixelMode as PM;
+        let src = [0b10100000u8];
+        let (w, h, data) = normalize_bitmap(8, 1, 1, PM::Mono, &src);
+        assert_eq!((w, h), (8, 1));
+        assert_eq!(data, vec![255, 0, 255, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_normalize_lcd_averages_triples() {
+        use freetype::bitmap::PixelMode as PM;
+        let src = [10u8, 20, 30, 40, 50, 60];
+        let (w, h, data) = normalize_bitmap(6, 1, 6, PM::Lcd, &src);
+        assert_eq!((w, h), (2, 1));
+        assert_eq!(data, vec![20, 50]);
+    }
+
+    #[test]
+    fn test_normalize_bgra_takes_alpha() {
+        use freetype::bitmap::PixelMode as PM;
+        let src = [5u8, 6, 7, 128];
+        let (w, h, data) = normalize_bitmap(1, 1, 4, PM::Bgra, &src);
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(data, vec![128]);
+    }
+
+    #[test]
+    fn test_normalize_empty_is_empty() {
+        use freetype::bitmap::PixelMode as PM;
+        let (w, h, data) = normalize_bitmap(0, 0, 0, PM::Gray, &[]);
+        assert_eq!((w, h), (0, 0));
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn test_font_metrics_cell_size() {
+        let m = FontMetrics {
+            ascender: 12.0,
+            descender: -3.0,
+            line_height: 17.6,
+            max_advance: 8.2,
+        };
+        assert_eq!(m.cell_size(), (9.0, 18.0));
+    }
+
+    /// Headless raster repro: resolve "monospace" exactly like the app and
+    /// dump real glyph geometry. Run with `-- --nocapture` to inspect.
+    #[test]
+    fn test_dump_glyph_geometry() {
+        let mut fonts = FontSystem::new().expect("freetype init");
+        let id = fonts.load_family("monospace").expect("monospace");
+        let face = fonts.face_mut(id).unwrap();
+        let m = face.font_metrics(15).expect("metrics");
+        eprintln!("metrics15: {m:?} cell={:?}", m.cell_size());
+        for ch in ['A', 'g', 'm', '~', '/', '@', '\u{276f}', '\u{2500}'] {
+            let r = face.rasterize(ch, 15, SubpixelBucket(0));
+            match r {
+                None => eprintln!("U+{:04X} {ch:?}: MISSING", ch as u32),
+                Some((gid, bm)) => {
+                    eprintln!(
+                        "U+{:04X} {ch:?}: gid={gid} {}x{} left={} top={} adv={:.1}",
+                        ch as u32,
+                        bm.width,
+                        bm.height,
+                        bm.left,
+                        bm.top,
+                        bm.advance as f64 / 64.0,
+                    );
+                    for y in 0..bm.height as usize {
+                        let mut row = String::new();
+                        for x in 0..bm.width as usize {
+                            let v = bm.data[y * bm.width as usize + x];
+                            row.push(if v > 200 {
+                                '#'
+                            } else if v > 100 {
+                                '+'
+                            } else if v > 25 {
+                                '.'
+                            } else {
+                                ' '
+                            });
+                        }
+                        eprintln!("  |{row}|");
+                    }
+                }
+            }
+        }
     }
 }

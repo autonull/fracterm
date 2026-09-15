@@ -23,6 +23,25 @@ use crate::text::{Atlas, FontSystem, TextRenderer};
 use crate::vt::VtEngine;
 use crate::SurfaceId;
 
+/// Grid + dashboard constants: the startup terminal is an 80x24 grid
+/// rasterized at GRID_PX; cell metrics are measured from the loaded face.
+const GRID_COLS: u32 = 80;
+const GRID_ROWS: u32 = 24;
+const GRID_PX: u32 = 15;
+const GRID_PAD_X: f64 = 8.0;
+const GRID_PAD_BOTTOM: f64 = 10.0;
+const DASH_MARGIN: f64 = 24.0;
+const DASH_GAP: f64 = 24.0;
+const VIEW_NODE_W: f64 = 360.0;
+
+/// One live terminal: VT engine + PTY bound to a workspace node.
+struct TermSession {
+    surface: SurfaceId,
+    node: crate::NodeId,
+    engine: VtEngine,
+    pty: PtySession,
+}
+
 struct CanvasState {
     app: App,
     gl_display: Option<glutin::display::Display>,
@@ -35,12 +54,21 @@ struct CanvasState {
     font_id: Option<u32>,
     atlas: Option<Atlas>,
     text: Option<TextRenderer>,
-    /// Live terminal session: VT engine + PTY (P3).
-    term: Option<(VtEngine, PtySession)>,
-    /// Whether the terminal has keyboard focus.
+    /// Live terminal sessions: one VT engine + PTY per terminal node.
+    terms: Vec<TermSession>,
+    /// Surface id of the focused terminal (keyboard target).
+    focused_term: Option<SurfaceId>,
+    /// Whether the focused terminal has keyboard focus.
     term_focus: bool,
+    /// Measured grid cell (cell_w, line_h) at GRID_PX.
+    grid_cell: (f64, f64),
+    next_surface_id: u64,
+    next_node_id: u64,
     /// Currently held keyboard modifiers.
     modifiers: winit::event::Modifiers,
+    /// Diagnostics: frames drawn, PTY bytes drained.
+    diag_frames: u64,
+    diag_pty_bytes: u64,
     /// Right-drag rectangle-zoom anchor (screen px).
     rect_anchor: Option<(f64, f64)>,
     /// Last frame instant, for camera easing dt.
@@ -68,9 +96,15 @@ impl CanvasState {
             font_id: None,
             atlas: None,
             text: None,
-            term: None,
+            terms: Vec::new(),
+            focused_term: None,
             term_focus: true,
+            grid_cell: (9.0, 18.0),
+            next_surface_id: SurfaceId(1).0,
+            next_node_id: 1,
             modifiers: winit::event::Modifiers::default(),
+            diag_frames: 0,
+            diag_pty_bytes: 0,
             rect_anchor: None,
             last_frame: std::time::Instant::now(),
             capabilities: None,
@@ -231,6 +265,80 @@ impl CanvasState {
         eprintln!("pinned view as node {next_id:?}");
     }
 
+    /// Header height above the grid: label row + clear padding so the
+    /// node label and the first grid row never touch.
+    fn header_h(&self) -> f64 {
+        self.grid_cell.1 + 20.0
+    }
+
+    fn snap_camera(&mut self, x: f64, y: f64, zoom: f64) {
+        let cam = self.app.state.workspace.camera_mut();
+        cam.x = x;
+        cam.y = y;
+        cam.zoom = zoom;
+        cam.target_x = x;
+        cam.target_y = y;
+        cam.target_zoom = zoom;
+        cam.animating = false;
+    }
+
+    /// Fit every node into the viewport with a margin, instantly (no
+    /// animation): the app starts aligned and ready, never mid-flight.
+    fn fit_dashboard(&mut self) {
+        let nodes = self.app.state.workspace.all_nodes();
+        if nodes.is_empty() {
+            return;
+        }
+        let mut x0 = f64::INFINITY;
+        let mut y0 = f64::INFINITY;
+        let mut x1 = f64::NEG_INFINITY;
+        let mut y1 = f64::NEG_INFINITY;
+        for n in nodes {
+            x0 = x0.min(n.transform.x as f64);
+            y0 = y0.min(n.transform.y as f64);
+            x1 = x1.max(n.transform.x as f64 + n.size.0.max(1) as f64);
+            y1 = y1.max(n.transform.y as f64 + n.size.1.max(1) as f64);
+        }
+        let (vw, vh) = (self.viewport_size.0 as f64, self.viewport_size.1 as f64);
+        let bw = (x1 - x0 + 2.0 * DASH_MARGIN).max(1.0);
+        let bh = (y1 - y0 + 2.0 * DASH_MARGIN).max(1.0);
+        let zoom = (vw / bw).min(vh / bh).min(1.0).clamp(0.05, 64.0);
+        self.snap_camera(x0 - DASH_MARGIN, y0 - DASH_MARGIN, zoom);
+    }
+
+    /// Spawn a terminal node at `pos` and register its PTY session.
+    fn spawn_terminal_node(&mut self, cols: u32, rows: u32, pos: (i32, i32)) -> Result<(), String> {
+        let pty = PtySession::spawn(cols as u16, rows as u16, None)?;
+        let surface = SurfaceId(self.next_surface_id);
+        self.next_surface_id += 1;
+        let node_id = crate::NodeId(self.next_node_id);
+        self.next_node_id += 1;
+        let engine = VtEngine::new(Terminal::new(surface, rows, cols));
+        let (cell_w, line_h) = self.grid_cell;
+        let w = (cols as f64 * cell_w + 2.0 * GRID_PAD_X).round() as i32;
+        let h = (self.header_h() + rows as f64 * line_h + GRID_PAD_BOTTOM).round() as i32;
+        let mut node = crate::Node::new(node_id, pos.0, pos.1);
+        node.size = (w, h);
+        node.set_surface(surface);
+        node.set_input(crate::InputBehavior::new("terminal").with_key_focus());
+        self.app.state.workspace.add_node(node);
+        self.terms.push(TermSession {
+            surface,
+            node: node_id,
+            engine,
+            pty,
+        });
+        if self.focused_term.is_none() {
+            self.focused_term = Some(surface);
+        }
+        Ok(())
+    }
+
+    fn focused_session_mut(&mut self) -> Option<&mut TermSession> {
+        let id = self.focused_term?;
+        self.terms.iter_mut().find(|s| s.surface == id)
+    }
+
     fn draw_frame(&mut self) {
         let (Some(surface), Some(context), Some(gl)) =
             (&self.gl_surface, &self.gl_context, &self.gl)
@@ -246,16 +354,33 @@ impl CanvasState {
             .camera_mut()
             .update(dt.min(0.1) * 10.0);
 
-        // Drain PTY output into the VT engine and sync live projections.
-        if let Some((engine, pty)) = &mut self.term {
-            let bytes = pty.take_output();
+        // Drain PTY output into each VT engine and sync live projections.
+        for sess in &mut self.terms {
+            let bytes = sess.pty.take_output();
             if !bytes.is_empty() {
-                engine.feed(&bytes);
+                if self.diag_pty_bytes == 0 {
+                    let sample: String = bytes
+                        .iter()
+                        .take(120)
+                        .map(|b| b.escape_ascii().to_string())
+                        .collect();
+                    eprintln!("[fracterm] first PTY bytes ({}): {sample}", bytes.len());
+                }
+                self.diag_pty_bytes += bytes.len() as u64;
+                sess.engine.feed(&bytes);
             }
+            // Answer terminal queries (DA etc.): the child may hold all
+            // output until we reply.
+            let reply = sess.engine.take_reply();
+            if !reply.is_empty() {
+                let _ = sess.pty.write(&reply);
+            }
+        }
+        for sess in &self.terms {
             for node in self.app.state.workspace.scene.all_nodes_mut() {
                 if let Some(proj) = &mut node.projection {
-                    if proj.source == engine.term.id {
-                        proj.update_from_terminal(&engine.term);
+                    if proj.source == sess.surface {
+                        proj.update_from_terminal(&sess.engine.term);
                     }
                 }
             }
@@ -320,7 +445,7 @@ impl CanvasState {
                     &mut self.fonts,
                     self.font_id,
                 ) {
-                    if let Some(face) = fonts.face_mut(font_id) {
+                    if let Some(fid) = Some(font_id) {
                         let (vw, vh) = (self.viewport_size.0, self.viewport_size.1);
                         let _ = (vw, vh);
                         let fg = (0.87, 0.89, 0.93, 1.0);
@@ -329,7 +454,8 @@ impl CanvasState {
                             text.queue_string(
                                 gl,
                                 atlas,
-                                face,
+                                fonts,
+                                fid,
                                 (
                                     node.transform.x as f64 + 8.0,
                                     node.transform.y as f64 + 20.0,
@@ -340,54 +466,24 @@ impl CanvasState {
                                 fg,
                             );
                         }
-                        let node_x = self
-                            .app
-                            .state
-                            .workspace
-                            .all_nodes()
-                            .first()
-                            .map(|n| n.transform.x as f64)
-                            .unwrap_or(0.0);
-                        let node_y = self
-                            .app
-                            .state
-                            .workspace
-                            .all_nodes()
-                            .first()
-                            .map(|n| n.transform.y as f64)
-                            .unwrap_or(0.0);
-                        // Projection nodes: render their content lines.
-                        for node in self.app.state.workspace.all_nodes() {
-                            let Some(proj) = &node.projection else {
-                                continue;
-                            };
-                            for (li, line) in proj.content.iter().enumerate() {
-                                if line.trim().is_empty() {
-                                    continue;
-                                }
-                                text.queue_string(
-                                    gl,
-                                    atlas,
-                                    face,
-                                    (
-                                        node.transform.x as f64 + 8.0,
-                                        node.transform.y as f64 + 20.0 + 16.0 * li as f64,
-                                    ),
-                                    (cam.x, cam.y, cam.zoom),
-                                    12,
-                                    line,
-                                    (0.55, 0.85, 0.65, 1.0),
-                                );
-                            }
-                        }
-                        // Terminal grid rows: one glyph per non-blank cell.
-                        if let Some((engine, _pty)) = &self.term {
-                            let line_h = 16.0f64;
-                            let cell_w = 8.0f64;
-                            let (rows, cols) = (engine.term.grid.rows, engine.term.grid.cols);
+                        // Terminal grids: one glyph per non-blank cell, set in
+                        // measured cells under each session's node.
+                        let (cell_w, line_h) = self.grid_cell;
+                        let header_h = line_h + 20.0;
+                        for i in 0..self.terms.len() {
+                            let (nx, ny) = self
+                                .app
+                                .state
+                                .workspace
+                                .get_node(self.terms[i].node)
+                                .map(|n| (n.transform.x as f64, n.transform.y as f64))
+                                .unwrap_or((0.0, 0.0));
+                            let rows = self.terms[i].engine.term.grid.rows;
+                            let cols = self.terms[i].engine.term.grid.cols;
                             for r in 0..rows {
                                 for c in 0..cols {
-                                    let Some(cell) = engine.term.grid.get(r, c) else {
+                                    let Some(cell) = self.terms[i].engine.term.grid.get(r, c)
+                                    else {
                                         continue;
                                     };
                                     if cell.character == ' ' || cell.width == 0 {
@@ -403,17 +499,42 @@ impl CanvasState {
                                     text.queue_string(
                                         gl,
                                         atlas,
-                                        face,
-                                        (
-                                            node_x + cell_w * c as f64,
-                                            node_y + 28.0 + line_h * r as f64,
+                                        fonts,
+                                        fid,
+                                        crate::arrange::grid_cell_origin(
+                                            nx, ny, GRID_PAD_X, header_h, cell_w, line_h, c, r,
                                         ),
                                         (cam.x, cam.y, cam.zoom),
-                                        13,
+                                        GRID_PX,
                                         &ch,
                                         color,
                                     );
                                 }
+                            }
+                        }
+                        // Projection nodes: render their content lines.
+                        for node in self.app.state.workspace.all_nodes() {
+                            let Some(proj) = &node.projection else {
+                                continue;
+                            };
+                            for (li, line) in proj.content.iter().enumerate() {
+                                if line.trim().is_empty() {
+                                    continue;
+                                }
+                                text.queue_string(
+                                    gl,
+                                    atlas,
+                                    fonts,
+                                    fid,
+                                    (
+                                        node.transform.x as f64 + 8.0,
+                                        node.transform.y as f64 + 20.0 + 16.0 * li as f64,
+                                    ),
+                                    (cam.x, cam.y, cam.zoom),
+                                    12,
+                                    line,
+                                    (0.55, 0.85, 0.65, 1.0),
+                                );
                             }
                         }
                         text.flush(gl, atlas, self.viewport_size);
@@ -421,6 +542,7 @@ impl CanvasState {
                 }
             }
         }
+        self.diag_frames += 1;
         surface
             .swap_buffers(context)
             .expect("failed to swap GL buffers");
@@ -519,23 +641,43 @@ impl ApplicationHandler for CanvasState {
         // Text pipeline (P2): fontconfig discovery + glyph atlas.
         let mut fonts = FontSystem::new().ok();
         if let Some(fs) = &mut fonts {
-            self.font_id = fs.load_family("monospace").ok();
+            self.font_id = fs
+                .load_family_stack(&["monospace", "DejaVu Sans Mono", "Noto Sans Symbols"])
+                .ok()
+                .and_then(|ids| ids.into_iter().next());
         }
         self.fonts = fonts;
         self.atlas = Some(unsafe { Atlas::new(&gl, 1024) });
         self.text =
             Some(unsafe { TextRenderer::new(&gl) }.expect("failed to create text renderer"));
 
+        // Grid metrics from the real face: crisp cells, aligned startup.
+        if let (Some(fonts), Some(font_id)) = (&mut self.fonts, self.font_id) {
+            if let Some(face) = fonts.face_mut(font_id) {
+                if let Some(m) = face.font_metrics(GRID_PX) {
+                    self.grid_cell = m.cell_size();
+                } else {
+                    eprintln!("font metrics unavailable, using fallback cell");
+                }
+            }
+        } else {
+            eprintln!("font system unavailable, using fallback cell");
+        }
+        let (cell_w, line_h) = self.grid_cell;
+        let term_w = GRID_COLS as f64 * cell_w + 2.0 * GRID_PAD_X;
+        let term_h = line_h + 12.0 + GRID_ROWS as f64 * line_h + GRID_PAD_BOTTOM;
+        let ((tx, ty), (vx, vy)) = crate::arrange::dashboard_layout(
+            width as f64,
+            term_w,
+            term_h,
+            VIEW_NODE_W,
+            DASH_MARGIN,
+            DASH_GAP,
+        );
         // Terminal session (P3): bash in a PTY, 80x24 grid.
-        match PtySession::spawn(80, 24, None) {
-            Ok(pty) => {
-                self.term = Some((VtEngine::new(Terminal::new(SurfaceId(1), 24, 80)), pty));
-                let mut node = crate::Node::new(crate::NodeId(1), 60, 60);
-                node.size = (640, 400);
-                node.set_surface(SurfaceId(1));
-                node.set_input(crate::InputBehavior::new("terminal").with_key_focus());
-                self.app.state.workspace.add_node(node);
-
+        match self.spawn_terminal_node(GRID_COLS, GRID_ROWS, (tx, ty)) {
+            Ok(()) => {
+                let source = self.terms.last().map(|s| s.surface).unwrap_or(SurfaceId(1));
                 // Demo projection: live last-20-lines view of the terminal (P4).
                 let selector = crate::ProjectionSelector {
                     rows: None,
@@ -546,16 +688,45 @@ impl ApplicationHandler for CanvasState {
                     follow: true,
                 };
                 let proj = crate::ProjectionSurface::new(
-                    SurfaceId(1),
+                    source,
                     selector,
                     crate::ProjectionMode::Live,
                 );
-                let mut pnode = crate::Node::new(crate::NodeId(2), 600, 60);
-                pnode.set_surface(SurfaceId(1));
+                let pid = crate::NodeId(self.next_node_id);
+                self.next_node_id += 1;
+                let mut pnode = crate::Node::new(pid, vx, vy);
+                pnode.size = (VIEW_NODE_W as i32, term_h as i32);
+                pnode.set_surface(source);
                 pnode.projection = Some(proj);
                 self.app.state.workspace.add_node(pnode);
             }
             Err(e) => eprintln!("failed to spawn PTY: {e}"),
+        }
+        self.viewport_size = (width as f32, height as f32);
+        self.fit_dashboard();
+        {
+            let cam = self.app.state.workspace.camera();
+            eprintln!(
+                "[fracterm] startup viewport={}x{} cell={:.2}x{:.2} terms={} cam=({:.0},{:.0},x{:.2})",
+                width,
+                height,
+                self.grid_cell.0,
+                self.grid_cell.1,
+                self.terms.len(),
+                cam.x,
+                cam.y,
+                cam.zoom,
+            );
+            for n in self.app.state.workspace.all_nodes() {
+                eprintln!(
+                    "[fracterm] node {} at ({},{}) size {:?} surf {:?}",
+                    n.id.0,
+                    n.transform.x,
+                    n.transform.y,
+                    n.size,
+                    n.surface_id(),
+                );
+            }
         }
         self.capabilities = Some(capabilities);
         self.gl = Some(gl);
@@ -596,16 +767,38 @@ impl ApplicationHandler for CanvasState {
                     if let (Some(g), Some(gl)) = (&mut self.graph, &self.gl) {
                         unsafe { g.resize(gl, size.width, size.height) };
                     }
-                    // Propagate terminal grid resize to the PTY.
-                    if let Some((engine, pty)) = &mut self.term {
-                        let cols = (size.width as f64 / 8.0).floor().max(2.0) as u16;
-                        let rows = (size.height as f64 / 16.0).floor().max(2.0) as u16;
-                        engine.term.grid.resize(rows as u32, cols as u32);
-                        engine.term.cursor_row =
-                            engine.term.cursor_row.min(rows.saturating_sub(1) as u32);
-                        engine.term.cursor_col =
-                            engine.term.cursor_col.min(cols.saturating_sub(1) as u32);
-                        let _ = pty.resize(cols, rows);
+                    // Resize each terminal grid from its own node size, so
+                    // window resizes never wipe content (resize preserves).
+                    let (cell_w, line_h) = self.grid_cell;
+                    let header_h = self.header_h();
+                    for i in 0..self.terms.len() {
+                        let node_id = self.terms[i].node;
+                        let (nw, nh) = self
+                            .app
+                            .state
+                            .workspace
+                            .get_node(node_id)
+                            .map(|n| (n.size.0.max(1) as f64, n.size.1.max(1) as f64))
+                            .unwrap_or((640.0, 400.0));
+                        let cols = ((nw - 2.0 * GRID_PAD_X) / cell_w)
+                            .floor()
+                            .clamp(2.0, 256.0) as u16;
+                        let rows = ((nh - header_h - GRID_PAD_BOTTOM) / line_h)
+                            .floor()
+                            .clamp(2.0, 256.0) as u16;
+                        let sess = &mut self.terms[i];
+                        sess.engine.term.grid.resize(rows as u32, cols as u32);
+                        sess.engine.term.cursor_row = sess
+                            .engine
+                            .term
+                            .cursor_row
+                            .min(rows.saturating_sub(1) as u32);
+                        sess.engine.term.cursor_col = sess
+                            .engine
+                            .term
+                            .cursor_col
+                            .min(cols.saturating_sub(1) as u32);
+                        let _ = sess.pty.resize(cols, rows);
                     }
                 }
             }
@@ -634,7 +827,33 @@ impl ApplicationHandler for CanvasState {
                 }
                 (ElementState::Pressed, MouseButton::Left)
                 | (ElementState::Pressed, MouseButton::Middle) => {
-                    // Pan on empty canvas; Alt-drag over a node moves the node (later).
+                    // Click focuses the terminal under the cursor; clicking
+                    // empty canvas focuses the workspace. Pan still applies.
+                    let cam = self.app.state.workspace.camera().clone();
+                    let (wx, wy) = (
+                        cam.x + self.last_cursor.0 / cam.zoom,
+                        cam.y + self.last_cursor.1 / cam.zoom,
+                    );
+                    let hit = self.hit_node(wx, wy).map(|n| {
+                        (
+                            n.id,
+                            n.surface_id(),
+                            n.input.mode.clone(),
+                            n.input.focus_key,
+                        )
+                    });
+                    match hit {
+                        Some((_, Some(surface), mode, _))
+                            if mode == "terminal"
+                                && self.terms.iter().any(|s| s.surface == surface) =>
+                        {
+                            self.focused_term = Some(surface);
+                            self.term_focus = true;
+                        }
+                        _ => {
+                            self.term_focus = false;
+                        }
+                    }
                     self.pan_anchor = Some(self.last_cursor);
                 }
                 (ElementState::Released, MouseButton::Left)
@@ -648,11 +867,18 @@ impl ApplicationHandler for CanvasState {
                 is_synthetic: _,
                 ..
             } => {
-                let modifiers = self.modifiers;
-                if !self.term_focus {
+                // Releases carry no text and must never write to the PTY
+                // (otherwise Enter/Backspace fire twice: press + release).
+                if event.state != ElementState::Pressed {
                     return;
                 }
+                let modifiers = self.modifiers;
                 use winit::keyboard::{Key, NamedKey};
+                // Esc always drops back to workspace control.
+                if self.term_focus && event.logical_key == Key::Named(NamedKey::Escape) {
+                    self.term_focus = false;
+                    return;
+                }
                 // Workspace shortcuts (workspace mode, not terminal focus).
                 if !self.term_focus {
                     match &event.logical_key {
@@ -718,44 +944,87 @@ impl ApplicationHandler for CanvasState {
                             }
                             return;
                         }
+                        Key::Character(c) if c == "d" => {
+                            // Dashboard: anchor at the margin, tile 2-up, fit.
+                            if let Some(first) =
+                                self.app.state.workspace.all_nodes().first().map(|n| n.id)
+                            {
+                                if let Some(n) = self.app.state.workspace.get_node_mut(first) {
+                                    n.transform.x = DASH_MARGIN as i32;
+                                    n.transform.y = DASH_MARGIN as i32;
+                                }
+                            }
+                            self.apply_arrange(
+                                |ns, _| {
+                                    crate::arrange::tile_grid(ns, 2, crate::arrange::DEFAULT_GAP)
+                                },
+                                0,
+                            );
+                            self.fit_dashboard();
+                            return;
+                        }
+                        Key::Character(c) if c == "f" => {
+                            self.fit_dashboard();
+                            return;
+                        }
+                        Key::Character(c) if c == "n" => {
+                            // New terminal view on the dashboard (up to 8).
+                            if self.terms.len() < 8 {
+                                let k = self.terms.len() as i32;
+                                let anchor = self
+                                    .app
+                                    .state
+                                    .workspace
+                                    .all_nodes()
+                                    .first()
+                                    .map(|n| (n.transform.x, n.transform.y))
+                                    .unwrap_or((DASH_MARGIN as i32, DASH_MARGIN as i32));
+                                let pos = (anchor.0 + k * 48, anchor.1 + k * 48);
+                                if let Err(e) =
+                                    self.spawn_terminal_node(GRID_COLS, GRID_ROWS, pos)
+                                {
+                                    eprintln!("failed to spawn terminal: {e}");
+                                }
+                            } else {
+                                eprintln!("terminal limit reached");
+                            }
+                            return;
+                        }
+                        Key::Character(c) if c == "0" => {
+                            self.app.state.workspace.camera_mut().zoom_to_workspace_fit();
+                            return;
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            self.term_focus = true;
+                            return;
+                        }
+                        Key::Character(c) if c == "i" => {
+                            self.term_focus = true;
+                            return;
+                        }
                         _ => {}
                     }
-                }
-                let Some(text) = &event.text else {
+                    return;
+                } else {
+                    // Terminal input handling.
+                    let Some(text) = &event.text else {
                     // Named keys map to control sequences.
-                    let seq: Option<Vec<u8>> = match &event.logical_key {
-                        Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
-                        Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
-                        Key::Named(NamedKey::Escape) => Some(b"\x1b".to_vec()),
-                        Key::Named(NamedKey::Backspace) => Some(b"\x7f".to_vec()),
-                        Key::Named(NamedKey::ArrowUp) => Some(b"\x1b[A".to_vec()),
-                        Key::Named(NamedKey::ArrowDown) => Some(b"\x1b[B".to_vec()),
-                        Key::Named(NamedKey::ArrowRight) => Some(b"\x1b[C".to_vec()),
-                        Key::Named(NamedKey::ArrowLeft) => Some(b"\x1b[D".to_vec()),
-                        Key::Named(NamedKey::Home) => Some(b"\x1b[H".to_vec()),
-                        Key::Named(NamedKey::End) => Some(b"\x1b[F".to_vec()),
-                        _ => None,
-                    };
+                    let seq = named_key_sequence(&event.logical_key);
                     if let Some(bytes) = seq {
-                        if let Some((_, pty)) = &self.term {
-                            let _ = pty.write(&bytes);
+                        if let Some(sess) = self.focused_session_mut() {
+                            let _ = sess.pty.write(&bytes);
                         }
                     }
                     return;
                 };
-                if let Some((_, pty)) = &self.term {
-                    let mut bytes = Vec::new();
-                    for ch in text.chars() {
-                        // Ctrl+key -> control code
-                        if modifiers.state().control_key() && ch.is_ascii_alphabetic() {
-                            bytes.push((ch.to_ascii_uppercase() as u8) - b'A' + 1);
-                        } else {
-                            let mut buf = [0u8; 4];
-                            bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                        }
+                if let Some(sess) = self.focused_session_mut() {
+                    let bytes =
+                        encode_text_input(text, modifiers.state().control_key());
+                    if !bytes.is_empty() {
+                        let _ = sess.pty.write(&bytes);
                     }
-                    let _ = pty.write(&bytes);
                 }
+            }
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m,
             WindowEvent::MouseWheel { delta, .. } => {
@@ -776,10 +1045,105 @@ impl ApplicationHandler for CanvasState {
     }
 }
 
+/// Ctrl+key -> ASCII control code (Ctrl+C = 0x03). Pure: unit-tested.
+fn control_code(ch: char) -> Option<u8> {
+    if ch.is_ascii_alphabetic() {
+        Some(ch.to_ascii_uppercase() as u8 - b'A' + 1)
+    } else {
+        None
+    }
+}
+
+/// Named keys -> terminal control sequences. Pure: unit-tested.
+fn named_key_sequence(key: &winit::keyboard::Key) -> Option<Vec<u8>> {
+    use winit::keyboard::{Key, NamedKey};
+    match key {
+        Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
+        Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
+        Key::Named(NamedKey::Escape) => Some(b"\x1b".to_vec()),
+        Key::Named(NamedKey::Backspace) => Some(b"\x7f".to_vec()),
+        Key::Named(NamedKey::ArrowUp) => Some(b"\x1b[A".to_vec()),
+        Key::Named(NamedKey::ArrowDown) => Some(b"\x1b[B".to_vec()),
+        Key::Named(NamedKey::ArrowRight) => Some(b"\x1b[C".to_vec()),
+        Key::Named(NamedKey::ArrowLeft) => Some(b"\x1b[D".to_vec()),
+        Key::Named(NamedKey::Home) => Some(b"\x1b[H".to_vec()),
+        Key::Named(NamedKey::End) => Some(b"\x1b[F".to_vec()),
+        _ => None,
+    }
+}
+
+/// Encode typed text for the PTY, applying the Ctrl mapping.
+/// Pure: unit-tested.
+fn encode_text_input(text: &str, ctrl: bool) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for ch in text.chars() {
+        if ctrl {
+            if let Some(code) = control_code(ch) {
+                bytes.push(code);
+                continue;
+            }
+        }
+        let mut buf = [0u8; 4];
+        bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+    }
+    bytes
+}
+
 /// Run the app with a real OpenGL window. Returns an error when a 3.3 core
 /// context cannot be created so the caller can degrade to headless mode.
 pub fn run_windowed(app: App) -> Result<(), String> {
     let event_loop = EventLoop::builder().build().map_err(|e| e.to_string())?;
     let mut handler = CanvasState::new(app);
     event_loop.run_app(&mut handler).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::keyboard::{Key, NamedKey};
+
+    #[test]
+    fn test_control_codes() {
+        assert_eq!(control_code('c'), Some(3));
+        assert_eq!(control_code('C'), Some(3));
+        assert_eq!(control_code('z'), Some(26));
+        assert_eq!(control_code('5'), None);
+    }
+
+    #[test]
+    fn test_named_sequences() {
+        assert_eq!(
+            named_key_sequence(&Key::Named(NamedKey::Enter)),
+            Some(b"\r".to_vec())
+        );
+        assert_eq!(
+            named_key_sequence(&Key::Named(NamedKey::ArrowUp)),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            named_key_sequence(&Key::Named(NamedKey::Backspace)),
+            Some(b"\x7f".to_vec())
+        );
+        assert_eq!(named_key_sequence(&Key::Character("a".into())), None);
+    }
+
+    #[test]
+    fn test_text_encoding() {
+        assert_eq!(encode_text_input("hi", false), b"hi");
+        assert_eq!(encode_text_input("c", true), vec![3]);
+        assert_eq!(encode_text_input("5", true), b"5");
+        assert_eq!(encode_text_input("é", false), "é".as_bytes());
+    }
+
+    #[test]
+    fn test_key_bytes_reach_terminal_grid() {
+        // Full input path: encoded key bytes -> VT engine -> grid cell.
+        let bytes = encode_text_input("hi", false);
+        let mut engine = VtEngine::new(Terminal::new(SurfaceId(99), 24, 80));
+        engine.feed(&bytes);
+        assert_eq!(engine.term.grid.get(0, 0).unwrap().character, 'h');
+        assert_eq!(engine.term.grid.get(0, 1).unwrap().character, 'i');
+        let enter = named_key_sequence(&Key::Named(NamedKey::Enter)).unwrap();
+        assert_eq!(enter, b"\r");
+    }
 }

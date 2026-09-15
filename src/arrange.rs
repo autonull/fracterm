@@ -180,6 +180,72 @@ pub fn snap_to_grid(value: i32, grid: i32) -> i32 {
     }
 }
 
+/// Fractal-dashboard geometry: pure world/screen/NDC math shared by the
+/// zooming canvas and its simulation tests.
+///
+/// World space is an infinite pixel plane. Screen space is physical window
+/// pixels: `screen = (world - cam) * zoom`. NDC maps the viewport onto
+/// `[-1, 1]`: `ndc = (2 * s / view - 1, 1 - 2 * s / view)`, matching the
+/// canvas and glyph vertex shaders.
+pub fn world_to_screen(wx: f64, wy: f64, cam_x: f64, cam_y: f64, zoom: f64) -> (f64, f64) {
+    ((wx - cam_x) * zoom, (wy - cam_y) * zoom)
+}
+
+pub fn screen_to_ndc(sx: f64, sy: f64, view_w: f64, view_h: f64) -> (f64, f64) {
+    (2.0 * sx / view_w - 1.0, 1.0 - 2.0 * sy / view_h)
+}
+
+pub fn world_to_ndc(
+    wx: f64,
+    wy: f64,
+    cam_x: f64,
+    cam_y: f64,
+    zoom: f64,
+    view_w: f64,
+    view_h: f64,
+) -> (f64, f64) {
+    let (sx, sy) = world_to_screen(wx, wy, cam_x, cam_y, zoom);
+    screen_to_ndc(sx, sy, view_w, view_h)
+}
+
+/// Grid cell baseline origin in world pixels for terminal dashboards.
+pub fn grid_cell_origin(
+    node_x: f64,
+    node_y: f64,
+    pad_x: f64,
+    header_h: f64,
+    cell_w: f64,
+    line_h: f64,
+    col: u32,
+    row: u32,
+) -> (f64, f64) {
+    (
+        node_x + pad_x + cell_w * col as f64,
+        node_y + header_h + line_h * row as f64,
+    )
+}
+
+/// Startup dashboard: terminal node left, live-view node right, never
+/// overlapping. Wraps the view node below when the viewport is narrow.
+pub fn dashboard_layout(
+    view_w: f64,
+    term_w: f64,
+    term_h: f64,
+    view_node_w: f64,
+    margin: f64,
+    gap: f64,
+) -> ((i32, i32), (i32, i32)) {
+    let tx = margin;
+    let ty = margin;
+    let mut vx = tx + term_w + gap;
+    let mut vy = margin;
+    if vx + view_node_w > view_w - margin {
+        vx = tx;
+        vy = ty + term_h + gap;
+    }
+    ((tx as i32, ty as i32), (vx as i32, vy as i32))
+}
+
 /// A suggested snap: the node edge aligns with a nearby other edge.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SnapGuide {
@@ -336,5 +402,46 @@ mod tests {
         let mut nodes = vec![node(1, 0, 0, 100, 50), node(2, 0, 0, 100, 50)];
         let r = cascade(&refs(&mut nodes), 24);
         assert_eq!(r[1], (NodeId(2), 24, 24));
+    }
+
+    #[test]
+    fn test_world_screen_ndc_roundtrip() {
+        let (sx, sy) = world_to_screen(60.0, 60.0, 0.0, 0.0, 1.0);
+        assert_eq!((sx, sy), (60.0, 60.0));
+        assert_eq!(screen_to_ndc(0.0, 0.0, 1280.0, 720.0), (-1.0, 1.0));
+        assert_eq!(screen_to_ndc(1280.0, 720.0, 1280.0, 720.0), (1.0, -1.0));
+        assert_eq!(screen_to_ndc(640.0, 360.0, 1280.0, 720.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn test_startup_node_inside_clip_space() {
+        // Terminal node top-left and bottom-right must land inside NDC.
+        let (x0, y0) = world_to_ndc(24.0, 24.0, 0.0, 0.0, 1.0, 1280.0, 720.0);
+        let (x1, y1) = world_to_ndc(760.0, 520.0, 0.0, 0.0, 1.0, 1280.0, 720.0);
+        for v in [x0, y0, x1, y1] {
+            assert!(v > -1.0 && v < 1.0, "out of clip: {v}");
+        }
+        assert!(x0 < x1 && y0 > y1);
+    }
+
+    #[test]
+    fn test_grid_cell_origin_monotonic() {
+        let a = grid_cell_origin(24.0, 24.0, 8.0, 30.0, 9.0, 18.0, 0, 0);
+        let b = grid_cell_origin(24.0, 24.0, 8.0, 30.0, 9.0, 18.0, 79, 23);
+        assert_eq!(a, (32.0, 54.0));
+        assert!(b.0 > a.0 && b.1 > a.1);
+        assert_eq!(b, (32.0 + 9.0 * 79.0, 54.0 + 18.0 * 23.0));
+    }
+
+    #[test]
+    fn test_dashboard_layout_no_overlap() {
+        let (t, v) = dashboard_layout(1280.0, 736.0, 472.0, 360.0, 24.0, 24.0);
+        assert_eq!(t, (24, 24));
+        assert!(v.0 as f64 >= t.0 as f64 + 736.0 + 24.0);
+        assert_eq!(v.1, 24);
+        // Narrow viewport wraps the view node below.
+        let (t2, v2) = dashboard_layout(700.0, 736.0, 472.0, 360.0, 24.0, 24.0);
+        assert_eq!(t2, (24, 24));
+        assert_eq!(v2, (24, 24 + 472 + 24));
     }
 }

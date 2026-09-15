@@ -103,9 +103,22 @@ impl TerminalGrid {
     }
 
     pub fn resize(&mut self, new_rows: u32, new_cols: u32) {
+        if new_rows == self.rows && new_cols == self.cols {
+            return;
+        }
+        let new_rows = new_rows.max(1);
+        let new_cols = new_cols.max(1);
+        // Preserve overlapping content: window resizes must never wipe the
+        // visible terminal.
+        let mut cells = vec![vec![TerminalCell::default(); new_cols as usize]; new_rows as usize];
+        for r in 0..(self.rows.min(new_rows) as usize) {
+            for c in 0..(self.cols.min(new_cols) as usize) {
+                cells[r][c] = self.cells[r][c].clone();
+            }
+        }
+        self.cells = cells;
         self.rows = new_rows;
         self.cols = new_cols;
-        self.cells = vec![vec![TerminalCell::default(); new_cols as usize]; new_rows as usize];
     }
 }
 
@@ -344,5 +357,36 @@ mod tests {
         assert!(source.is_active());
         let text = source.read();
         assert!(text.is_some());
+    }
+
+    #[test]
+    fn test_resize_preserves_content() {
+        let mut grid = TerminalGrid::new(4, 4);
+        grid.set(
+            0,
+            0,
+            TerminalCell {
+                character: 'A',
+                ..TerminalCell::default()
+            },
+        );
+        grid.set(
+            3,
+            3,
+            TerminalCell {
+                character: 'Z',
+                ..TerminalCell::default()
+            },
+        );
+        grid.resize(6, 6);
+        assert_eq!(grid.rows, 6);
+        assert_eq!(grid.cols, 6);
+        assert_eq!(grid.get(0, 0).unwrap().character, 'A');
+        assert_eq!(grid.get(3, 3).unwrap().character, 'Z');
+        assert_eq!(grid.get(5, 5).unwrap().character, ' ');
+        grid.resize(2, 2);
+        assert_eq!(grid.rows, 2);
+        assert_eq!(grid.cols, 2);
+        assert_eq!(grid.get(0, 0).unwrap().character, 'A');
     }
 }

@@ -211,12 +211,13 @@ labels.
 | Input | Action |
 |---|---|
 | `p` | Pin the current viewport as a snapshot projection node |
-| `b` | Save a camera bookmark (currently named `bm`) |
-| `0`–`9` | Restore camera bookmark `bm<n>` |
+| `b` | Save a camera bookmark to the next rotating slot `bm0`–`bm9` |
+| `1`–`9` | Restore camera bookmark `bm<n>` |
+| `0` | Restore `bm0` if saved, otherwise zoom to workspace fit |
 
-Note: `b` saves under the name `bm` while digits restore `bm0`–`bm9`, so a
-plain `b` save is not yet retrievable by digit — named bookmark UI is
-planned (TODO P5).
+Pressing `b` fills `bm0`–`bm9` in rotation (re-saving a name updates it
+in place rather than stacking duplicates), so every plain save is
+retrievable by digit. Named-bookmark UI is still planned (TODO P5).
 
 Any zoom can be pinned: zoom into a terminal range, press `p`, and it becomes
 an independent subrange-view node.
@@ -1386,7 +1387,7 @@ Example:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "camera": {
     "x": 0,
     "y": 0,
@@ -1394,9 +1395,16 @@ Example:
   },
   "bookmarks": [],
   "nodes": [],
-  "groups": []
+  "z_order": [],
+  "groups": [],
+  "children": []
 }
 ```
+
+v2 stores full nodes (in z-order) plus explicit z-order, groups, and
+parent→child edges; v1 layouts still import camera-only. Live PTY
+sessions are not persisted — terminal nodes restore as structure and
+re-spawn fresh shells.
 
 ---
 
@@ -1786,11 +1794,12 @@ partial), **spec** (design only; see TODO.md phase for landing it).
 | `src/transform.rs` | Position/size math | §1.2 | live |
 | `src/surface.rs` | `Surface`, `SurfaceType`, `Cell`, `Color` — textual content sources | §1.3 | live |
 | `src/terminal.rs` | `Terminal`, `TerminalGrid`, `TextSource` trait + PTY/command/file-tail sources | §7 | live (sources scaffold) |
-| `src/vt.rs` | VT/ANSI/xterm parser (`vte`): SGR, cursor, erase, alt screen, 256/24-bit color | §7.2 | live |
+| `src/vt.rs` | VT/ANSI/xterm parser (`vte`): SGR, cursor, erase, alt screen, 256/24-bit color; DEC modes (?7/?25/?2004/mouse), DECSCUSR style, DSR/CPR, kitty/XTVERSION/OSC-11/XTGETTCAP replies, OSC 0/2 title | §7.2 | live |
 | `src/pty.rs` | `PtySession` via `portable-pty`: spawn, reader thread, write, resize (SIGWINCH) | §7 | live |
 | `src/projection.rs` | `ProjectionSurface`, selectors (rows/cols/filter/search/tail/follow), live/snapshot modes | §8 | live (presentation scaffold) |
 | `src/camera.rs` | `Camera`: eased pan/zoom, cursor-anchored wheel zoom, bookmarks, `fit_rect` | §6 | live |
-| `src/lens.rs` | `CameraLens`, `Lens`, `ZoomTarget`, `Rect`, `GridRange` | §1.5, §6 | live (targets partial) |
+| `src/lens.rs` | `CameraLens`, `Lens`, `ZoomTarget`, `Rect`, `GridRange`; full viewport-aware target resolution + `terminal_range_rect` | §1.5, §6 | live |
+| `src/dts.rs` | Generated `fracterm.d.ts` bundle (`config`/`plugin`/`widget` modules) from the Rust API surface | §24.1 | live |
 | `src/canvas.rs` | GL context/capabilities, `RectRenderer` batching, `RenderTarget` FBOs, `RenderGraphExecutor` | §4.1–4.2 | live (PostProcess placeholder) |
 | `src/text.rs` | fontconfig discovery, FreeType rasterization, `Atlas`/`GlyphKey` cache, `TextRenderer`, zoom-size strategy | §4.3–4.4 | live (far-zoom layers pending) |
 | `src/rendering.rs` | Logical `RenderGraph` model (`RenderPass`, node config, glyph-atlas stub) | §4.1 | live |
@@ -1802,8 +1811,8 @@ partial), **spec** (design only; see TODO.md phase for landing it).
 | `src/event.rs` | `Event`, `EventBus` (serde, throttling) | §9.4 | live |
 | `src/command.rs` | `Command`, typed `CommandInput` params | §17 | scaffold |
 | `src/permission.rs` | `Permission`, `PermissionScope`, `PermissionContext` | §15 | live |
-| `src/plugin.rs` | `Plugin` trait, `Widget`, `V8Host` stub, `PluginSDK` | §21 | scaffold |
-| `src/script.rs` | `ScriptHost` trait, `PluginManifest`, `QuickJsScriptHost` (rquickjs), SWC `transpile_ts` | §13, §9.1 | live (QuickJS; V8 spec'd) |
+| `src/plugin.rs` | `Plugin` trait, `Widget`, `V8Host` stub, `PluginSDK`, settings validation + `settings_ui_rows` descriptors | §21 | scaffold |
+| `src/script.rs` | `ScriptHost` trait, `PluginManifest`, `QuickJsScriptHost` (rquickjs), SWC `transpile_ts`, web-globals polyfill (§14) + `poll_timers`/`poll_all_timers` frame drain | §13, §9.1, §14 | live (QuickJS; V8 spec'd) |
 
 Pipeline: `window.rs` pumps winit events → mutates `Workspace`/`Camera`
 → drains PTY bytes through `vt.rs` into `Terminal` grids → `canvas.rs` +
@@ -1818,7 +1827,7 @@ Plugins enter via `script.rs` behind `ScriptHost`.
 | Text rendering | **live** | atlas + subpixel + near/large zoom sizes; far-zoom layer textures pending |
 | Terminal (PTY/VT/grid) | **live** | SGR 16/256/24-bit, alt screen, scrollback, keyboard; mouse/paste/OSC pending |
 | Projections | **live** | selectors + live/snapshot; presentation options pending |
-| Lens zoom + pin | **live** | workspace-fit/object/rect targets; terminal-range/reading targets spec |
+| Lens zoom + pin | **live** | all targets resolve (workspace-fit/object/rect/terminal-range/projection/reading); grid-precise range zoom via `terminal_range_rect` |
 | Script host + TS load | **live** | QuickJS + SWC; V8 behind trait pending |
 | Permissions | **live** | scoped matching; enforcement surface partial |
 | Arrange/dashboard | **live** | tile/align/distribute/snap/persist; guides UI + multi-select drag pending |

@@ -6,6 +6,7 @@ pub mod camera;
 pub mod canvas;
 pub mod command;
 pub mod config;
+pub mod dts;
 pub mod event;
 pub mod input;
 pub mod lens;
@@ -28,18 +29,25 @@ pub mod workspace;
 
 pub use app::{default_config, App, CliArgs};
 pub use camera::{Camera, CameraBookmark};
-pub use command::{Command, CommandContext, CommandInputSchema, CommandRegistry, CommandResult, CommandValue, InputParam, KeyBinding};
+pub use command::{
+    Command, CommandContext, CommandInputSchema, CommandRegistry, CommandResult, CommandValue,
+    InputParam, KeyBinding,
+};
 pub use config::Config;
 pub use event::{Event, EventBus, EventType};
-pub use input::{ContextMenuBuilder, ContextMenuItem, DragState, InputContext, InputEvent, InputHandler, InputManager, InputResult, InteractionMode};
+pub use input::{
+    ContextMenuBuilder, ContextMenuItem, DragState, InputContext, InputEvent, InputHandler,
+    InputManager, InputResult, InteractionMode,
+};
 pub use lens::{CameraLens, Lens};
 pub use node::{InputBehavior, Node, PluginBehavior};
 pub use permission::{Permission, PermissionScope};
 pub use plugin::{
-    CommandManifest, Disposable, DrawCommand, Modifiers, MouseButton,
-    PluginContext, PluginHost, PluginId, PluginManager, PluginManifest, PluginSDK, PermissionRequest,
-    PluginStorage, PluginLogger, SettingSchema, SettingValue, TextAlign, TextOptions, UiBuilder,
-    WidgetEvent, WidgetManifest, WidgetRenderContext, WidgetRenderer, V8Host,
+    settings_ui_rows, CommandManifest, Disposable, DrawCommand, Modifiers, MouseButton,
+    PermissionRequest, PluginContext, PluginHost, PluginId, PluginLogger, PluginManager,
+    PluginManifest, PluginSDK, PluginStorage, SettingSchema, SettingUiRow, SettingValue, TextAlign,
+    TextOptions, UiBuilder, V8Host, WidgetEvent, WidgetManifest, WidgetRenderContext,
+    WidgetRenderer,
 };
 pub use projection::{
     ProjectionMode, ProjectionPresentation, ProjectionSelector, ProjectionSurface,
@@ -52,7 +60,9 @@ pub use terminal::{
 };
 pub use theme::Theme;
 pub use transform::Transform;
-pub use widget::{WidgetDisplayList, WidgetRegistry, collect_widget_display_lists, render_widget_display_list};
+pub use widget::{
+    collect_widget_display_lists, render_widget_display_list, WidgetDisplayList, WidgetRegistry,
+};
 pub use workspace::{SceneGraph, Workspace};
 
 /// Unique identifier for a node

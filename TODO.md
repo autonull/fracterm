@@ -7,9 +7,10 @@ regression guardrails this plan must respect are in Development Guardrails
 below. Prefer finishing a phase before starting the next. Unfinished items
 carry forward in-place, so this file is always the single resume point.
 
-**Current state (2026-09-15): all gates green** — `cargo build`, 83 tests
+**Current state (2026-09-16): all gates green** — `cargo build`, 139 tests
 passing, `cargo clippy --all-targets -- -D warnings` clean,
-`cargo fmt --check` clean. Binary runs on-display (X :0, 1280x720 Luscombe);
+`cargo fmt --check` clean. Fish startup fixed (~1s prompt via terminal-query
+replies); caret/title/modes live-verified on :0. Binary runs on-display (X :0, 1280x720 Luscombe);
 headless fallback intact. Text legible and verified (OCR reads labels, typed
 echo, prompt `❯` via fallback).
 
@@ -109,9 +110,24 @@ target AND `animating=false`; ANIMATED moves set target AND
         min-size from cell metrics; snap threshold 8 world px via temp-clone
         like `apply_arrange`.
   - [x] `terminal_grid_size` + handle-hit-test + `place_beside` unit tests.
-- [ ] Cursor styles; line wrapping (partial); resize propagation verify.
-- [ ] Mouse tracking, bracketed paste.
-- [ ] OSC title, OSC 8 hyperlinks, OSC 52 clipboard (permission-gated).
+- [x] Cursor visibility (?25) + style (DECSCUSR block/bar/underline +
+      blink) + autowrap (?7) + bracketed-paste mode (?2004) + mouse-mode
+      tracking (?1000/1002/1003/1006); caret rendered as overlay rect shaped
+      by style, blinked at ~530ms, hidden on ?25l (all live-verified:
+      `tput civis` → 0 caret px, `ESC[5 q` → 2px bar, restore → block).
+- [x] Terminal query replies (no more timeout stalls): Primary DA (was),
+      DSR `CSI 5 n`/`CSI 6 n` (CPR), kitty `CSI ? u` → `?0u`, XTVERSION
+      `CSI > 0 q`, OSC 11 background (`rgb:0b0b/0d0d/1212`), XTGETTCAP
+      `DCS + q` → `DCS 0 + r` (Sixel `q`-final payloads guarded by `+`).
+      Fish first prompt now ~1s (was ~10–14s intermittently).
+- [x] OSC 0/2 window title applied to the winit window on change
+      (live: fish `~ - fish` title appears; falls back to `fracterm`).
+- [ ] Line wrapping edge cases; resize propagation verify (`echo $COLUMNS`
+      after handle-resize).
+- [ ] Mouse event forwarding to the child (mode tracked, forwarding pending);
+      bracketed-paste wrapping helper exists, clipboard/middle-click paste
+      path pending.
+- [ ] OSC 8 hyperlinks, OSC 52 clipboard (permission-gated).
 - [ ] Unicode: graphemes, emoji, Nerd Fonts, ambiguous-width config (wide
       chars + spacer cells done).
 - [ ] `TextSource` impls beyond PTY: command output, file tail, plugin
@@ -120,11 +136,13 @@ target AND `animating=false`; ANIMATED moves set target AND
       (scaffold only).
 
 **Live-verify queue (P3):**
+- [x] Caret visible by default; `?25l` hides, `?25h` restores; bar/underline
+      shapes render; OSC title reaches the window title.
+- [x] `Return`/Ctrl+chords execute (verified `echo` round-trips repeatedly).
 - [ ] Move-drag follows cursor (diff screenshots); drag corner → node grows,
       new columns appear; click empty canvas → border clears.
 - [ ] Post-resize SIGWINCH: handle-resize then `echo $COLUMNS`.
 - [ ] Side-by-side (non-wrap) `n`-spawn on a wider viewport.
-- [ ] Fish prompt itself slow (~14s blank until first input) — investigate.
 
 ## Phase P4 — Projection System (README M4)
 
@@ -150,11 +168,21 @@ target AND `animating=false`; ANIMATED moves set target AND
       menu target.
 - [x] "Pin as View": `p` materializes viewport into snapshot projection node.
 - [x] Camera bookmarks: `b` saves, digits restore; named-bookmark UI pending.
-- [ ] Fix bookmark naming: `b` saves under `"bm"` while digits restore
-      `"bm0"`–`"bm9"`, so a plain save is unrestorable — rotate slot names
-      (`bm0..bm9`) and/or add named-bookmark UI.
+- [x] Fix bookmark naming: `b` saves to rotating slots `bm0`–`bm9`
+      (`Camera::save_next_bookmark`), digits restore, `save_bookmark`
+      upserts instead of stacking duplicates; `0` restores `bm0` when
+      present, else zooms to workspace fit. Named-bookmark UI still pending.
 - [x] Node `size` component (hit-tests/zoom used wrong bounds before).
-- [ ] Reading lens target; terminal-range target.
+- [x] Reading + terminal-range targets (session 2026-09-16):
+  - [x] `CameraLens::zoom_to_viewport`: WorkspaceFit (content bounds +
+        margin, capped at 1.0), Object, Rectangle, TerminalRange (whole-node
+        fit — grid dims live in window sessions, not the workspace),
+        Projection (node/surface id, else first projection node), Reading
+        (source-surface fit + `reading_mode` flag). Unknown ids are no-ops.
+        All branches are animated (target + `animating`), per the camera rule.
+  - [x] `terminal_range_rect` pure helper: grid-range → node sub-rect with
+        clamping; window code with live `Terminal` dims zooms to it as a
+        `Rectangle`. `workspace_content_bounds` shared with dashboard fit.
 - [ ] Exit: any zoom can become a pinned view (live pin + UI polish).
 
 ## Phase P6 — JS Host & Typed SDK (README M6–M7)
@@ -168,13 +196,32 @@ target AND `animating=false`; ANIMATED moves set target AND
 - [x] SWC transpile on load for `.ts/.mts/.tsx` (`transpile_ts`: parse +
       type-strip + codegen); `.js/.mjs` pass through.
 - [x] Scoped permission enforcement (`has_permission`), denial aborts load.
-- [ ] Typed commands (input schema), typed throttled events, declarative
-      widgets.
-- [ ] Schema-driven settings UI auto-generation.
-- [ ] More web globals: timers, structuredClone, crypto, URL,
-      AbortController.
-- [ ] Generate `.d.ts`: `fracterm`, `fracterm/config`, `fracterm/plugin`,
-      `fracterm/widget`.
+- [x] Throttled events enforced (`Subscription::poll_throttle` with
+      interior mutability, so `emit(&self)` rate-limits; explicit windows
+      win, else spec `default_throttle` for `TerminalOutput`/`ZoomChanged`;
+      `emit_for_plugin` honors the same windows).
+- [x] Command input type checking (`check_param_type`: string/number/
+      boolean/array/object/any; unknown type names pass leniently).
+- [ ] Declarative widgets SDK surface.
+- [x] Setting validation (`SettingSchema::validate_value`: type, numeric
+      min/max, string enum; `resolve_settings` fills defaults, rejects
+      unknown keys and invalid values/defaults).
+- [x] Schema-driven settings UI data (`settings_ui_rows`: stable
+      key-sorted `SettingUiRow`s with kind/default/min/max/options for the
+      border options menu); menu rendering itself pending.
+- [x] Web globals (README §14): `setTimeout`/`setInterval`/
+      `clearTimeout`/`clearInterval` (JS due-queue drained by host
+      `poll_timers`), `queueMicrotask`, `structuredClone` (JSON
+      round-trip), `TextEncoder`/`TextDecoder` (UTF-8), `URL`/
+      `URLSearchParams` (subset), `crypto.randomUUID` (v4),
+      `AbortController`/`AbortSignal`, `console.warn/info/debug` aliases.
+      `poll_all_timers` drains every plugin in one call (frame-loop entry
+      point); calling it from `draw_frame` still pending — `CanvasState`
+      holds no script host yet.
+- [x] Generate `.d.ts` (`src/dts.rs`): `fracterm`, `fracterm/config`,
+      `fracterm/plugin`, `fracterm/widget` — generated from the Rust API
+      surface (defineConfig/definePlugin/defineWidget, commands, events,
+      permissions, settings schemas, UiBuilder shapes).
 - [ ] `V8ScriptHost` via `deno_core`/`v8` behind the same trait.
 - [ ] Exit: a TS plugin registers commands + widgets with pleasant DX.
 
@@ -185,10 +232,14 @@ target AND `animating=false`; ANIMATED moves set target AND
 - [x] Arrange commands: tile H/V, grid, cascade; align L/R/T/B; distribute
       H/V (keys T/H/V/A).
 - [x] Multi-select foundation: z-order bring/send; drag reorder pending.
-- [x] Layout persistence: nodes/transforms/groups/z-order/bookmarks via
-      `export_state`/`import_state`.
+- [x] Layout persistence (v2 format): full nodes in z-order, explicit
+      z-order (`set_z_order`), groups, parent→child edges, camera +
+      bookmarks + slot via `export_state`/`import_state`; `save_to_file`/
+      `load_from_file` helpers; v1 imports camera-only; malformed entries
+      skipped; round-trip + file + v1-compat tests. Live PTY sessions are
+      not persisted — terminal nodes restore as structure, shells re-spawn.
 - [ ] Alignment-guide rendering, multi-select drag reorder, layout
-      auto-save/import-export; profiles/selectors/modes in layouts.
+      auto-save; profiles/selectors/modes in layouts.
 - [ ] Exit: dashboards can be built quickly.
 
 ## Phase P8 — Accessibility (README M9)
@@ -336,6 +387,20 @@ screenshots, `tesseract` OCR as legibility oracle, per-pixel numpy analysis.
 Headless font probe:
 `cargo test --lib text::tests::test_dump_glyph_geometry -- --nocapture`.
 
+Lessons 2026-09-16 (don't re-learn):
+- Focus/keys at the WM FRAME are lost: find the frame by geometry
+  (`1290x754+315+163`), then the client inside it (`("fracterm"` class,
+  1280x720) — `windowactivate` the CLIENT id and confirm with
+  `getwindowfocus` + a typed-char probe before trusting key delivery.
+- `kill <PID>` only (never `pkill` — hangs); wait ~2s after kill before
+  relaunch or the new instance may map no window.
+- Prefer quoteless/shiftless typed commands (`tput civis`, `echo X`);
+  for exact bytes write a script file and run `sh /tmp/x.sh`.
+- Fish redraws its prompt (and `?25h`) after every command: observe
+  hidden/styled-cursor states mid-`sleep`, not after.
+- A stuck-pending line + dead Returns usually means fish went multiline
+  (lost quote char) — `ctrl+c` resets to a fresh prompt.
+
 ## Environment Notes
 
 - Window spawns at screen offset — add window pos to window-rel coords for
@@ -356,7 +421,9 @@ Headless font probe:
 - Per-frame `glow::Context` recreate risk: none (stored once).
 - Full-bleed startup ⇒ no empty canvas: left-drag always grabs a node;
   pan is middle-drag only. Consider space-pan / Alt-drag fallback.
-- Fish first prompt slow (~14s blank window until first input).
+- Fish first prompt FIXED 2026-09-16 (was ~14s blank): fish's startup query
+  burst (kitty `?u`, XTVERSION, OSC 11, XTGETTCAP, CPR) now gets instant
+  replies; prompt lands ~1s after launch, verified across relaunches.
 - Startup diagnostics to keep: startup block, `font ... -> path` lines,
   first-PTY-bytes line. (Per-second stats + key logs removed as noise.)
 

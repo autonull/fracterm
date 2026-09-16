@@ -22,10 +22,16 @@ pub struct WidgetDisplayList {
 
 /// Convert Color to tuple for canvas renderer
 fn color_to_tuple(color: Color) -> (f32, f32, f32, f32) {
-    (color.r as f32 / 255.0, color.g as f32 / 255.0, color.b as f32 / 255.0, color.a as f32 / 255.0)
+    (
+        color.r as f32 / 255.0,
+        color.g as f32 / 255.0,
+        color.b as f32 / 255.0,
+        color.a as f32 / 255.0,
+    )
 }
 
 /// Render a widget display list using the canvas renderer
+#[allow(clippy::too_many_arguments)]
 pub fn render_widget_display_list(
     gl: &glow::Context,
     rect_renderer: &mut RectRenderer,
@@ -48,13 +54,20 @@ pub fn render_widget_display_list(
             DrawCommand::Rect { x, y, w, h, color } => {
                 rect_renderer.push_rect(bx + x, by + y, *w, *h, color_to_tuple(*color));
             }
-            DrawCommand::Text { x, y, text, scale, color, align: _ } => {
+            DrawCommand::Text {
+                x,
+                y,
+                text,
+                scale,
+                color,
+                align: _,
+            } => {
                 let tx = bx + x;
                 let ty = by + y;
 
                 // Get the font face
                 if let Some(_face) = fonts.face_mut(font_id) {
-                    let _ = unsafe {
+                    unsafe {
                         text_renderer.queue_string(
                             gl,
                             atlas,
@@ -69,7 +82,14 @@ pub fn render_widget_display_list(
                     };
                 }
             }
-            DrawCommand::Line { x1, y1, x2, y2, color, width } => {
+            DrawCommand::Line {
+                x1,
+                y1,
+                x2,
+                y2,
+                color,
+                width,
+            } => {
                 // Lines are rendered as thin rects
                 let x1w = bx + x1;
                 let y1w = by + y1;
@@ -91,10 +111,22 @@ pub fn render_widget_display_list(
                     }
                 }
             }
-            DrawCommand::Image { x, y, w, h, texture_id } => {
+            DrawCommand::Image {
+                x,
+                y,
+                w,
+                h,
+                texture_id: _,
+            } => {
                 // Image rendering would require texture binding
                 // Placeholder for future implementation
-                rect_renderer.push_rect(bx + x, by + y, *w, *h, color_to_tuple(Color::from_hex("#ff00ff")));
+                rect_renderer.push_rect(
+                    bx + x,
+                    by + y,
+                    *w,
+                    *h,
+                    color_to_tuple(Color::from_hex("#ff00ff")),
+                );
             }
             DrawCommand::Scissor { x, y, w, h } => {
                 unsafe {
@@ -144,12 +176,7 @@ pub fn collect_widget_display_lists(
                     let mut ui = UiBuilder::new();
                     let ctx = WidgetRenderContext {
                         widget_id: widget_id.clone(),
-                        bounds: (
-                            node.transform.x as f64,
-                            node.transform.y as f64,
-                            node.size.0 as f64,
-                            node.size.1 as f64,
-                        ),
+                        bounds: (node.transform.x, node.transform.y, node.size.0, node.size.1),
                         theme,
                         scale,
                         camera_x,
@@ -198,6 +225,7 @@ impl WidgetRegistry {
         self.renderers.get(id).map(|b| &**b)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render_all(
         &self,
         gl: &glow::Context,
@@ -255,7 +283,13 @@ mod tests {
     fn test_widget_display_list() {
         let list = WidgetDisplayList {
             widget_id: "test".to_string(),
-            commands: vec![DrawCommand::Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0, color: Color::from_hex("#ff0000") }],
+            commands: vec![DrawCommand::Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 100.0,
+                h: 100.0,
+                color: Color::from_hex("#ff0000"),
+            }],
             bounds: (0.0, 0.0, 100.0, 100.0),
             z_index: 0,
         };
@@ -265,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_widget_registry() {
-        let mut registry = WidgetRegistry::new();
+        let registry = WidgetRegistry::new();
         // Can't easily test without a real renderer implementation
         assert!(registry.get("nonexistent").is_none());
     }

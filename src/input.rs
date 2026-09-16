@@ -6,9 +6,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Interaction mode for input handling
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum InteractionMode {
     /// Default canvas navigation
+    #[default]
     Workspace,
     /// Terminal focused mode
     Terminal,
@@ -26,12 +27,6 @@ impl InteractionMode {
             InteractionMode::Reading => "reading",
             InteractionMode::Dashboard => "dashboard",
         }
-    }
-}
-
-impl Default for InteractionMode {
-    fn default() -> Self {
-        InteractionMode::Workspace
     }
 }
 
@@ -55,15 +50,48 @@ pub struct Modifiers {
 /// Input event types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputEvent {
-    KeyDown { key: String, modifiers: Modifiers },
-    KeyUp { key: String, modifiers: Modifiers },
-    MouseMove { x: f64, y: f64 },
-    MouseDown { x: f64, y: f64, button: MouseButton, modifiers: Modifiers },
-    MouseUp { x: f64, y: f64, button: MouseButton, modifiers: Modifiers },
-    MouseWheel { delta_x: f64, delta_y: f64, modifiers: Modifiers },
-    TouchStart { id: u64, x: f64, y: f64 },
-    TouchMove { id: u64, x: f64, y: f64 },
-    TouchEnd { id: u64 },
+    KeyDown {
+        key: String,
+        modifiers: Modifiers,
+    },
+    KeyUp {
+        key: String,
+        modifiers: Modifiers,
+    },
+    MouseMove {
+        x: f64,
+        y: f64,
+    },
+    MouseDown {
+        x: f64,
+        y: f64,
+        button: MouseButton,
+        modifiers: Modifiers,
+    },
+    MouseUp {
+        x: f64,
+        y: f64,
+        button: MouseButton,
+        modifiers: Modifiers,
+    },
+    MouseWheel {
+        delta_x: f64,
+        delta_y: f64,
+        modifiers: Modifiers,
+    },
+    TouchStart {
+        id: u64,
+        x: f64,
+        y: f64,
+    },
+    TouchMove {
+        id: u64,
+        x: f64,
+        y: f64,
+    },
+    TouchEnd {
+        id: u64,
+    },
 }
 
 /// Input handler trait for different interaction modes
@@ -82,7 +110,10 @@ pub enum InputResult {
     /// Request mode change
     ChangeMode(InteractionMode),
     /// Execute a command
-    ExecuteCommand { command: String, args: HashMap<String, CommandValue> },
+    ExecuteCommand {
+        command: String,
+        args: HashMap<String, CommandValue>,
+    },
 }
 
 /// Context for input handlers
@@ -124,10 +155,22 @@ impl InputContext {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DragState {
     None,
-    Pan { start_x: f64, start_y: f64 },
-    Move { node: NodeId, offset_x: f64, offset_y: f64 },
-    Resize { node: NodeId },
-    RectSelect { start_x: f64, start_y: f64 },
+    Pan {
+        start_x: f64,
+        start_y: f64,
+    },
+    Move {
+        node: NodeId,
+        offset_x: f64,
+        offset_y: f64,
+    },
+    Resize {
+        node: NodeId,
+    },
+    RectSelect {
+        start_x: f64,
+        start_y: f64,
+    },
 }
 
 /// Workspace input handler - default canvas navigation
@@ -140,7 +183,9 @@ impl InputHandler for WorkspaceInputHandler {
 
     fn handle_event(&mut self, event: InputEvent, ctx: &mut InputContext) -> InputResult {
         match event {
-            InputEvent::MouseWheel { delta_y, modifiers, .. } => {
+            InputEvent::MouseWheel {
+                delta_y, modifiers, ..
+            } => {
                 if modifiers.ctrl || modifiers.shift {
                     return InputResult::PassThrough;
                 }
@@ -150,10 +195,18 @@ impl InputHandler for WorkspaceInputHandler {
                 camera.animating = true;
                 InputResult::Handled
             }
-            InputEvent::MouseDown { x, y, button, modifiers } => {
+            InputEvent::MouseDown {
+                x,
+                y,
+                button,
+                modifiers,
+            } => {
                 match button {
                     MouseButton::Middle => {
-                        ctx.drag_state = Some(DragState::Pan { start_x: x, start_y: y });
+                        ctx.drag_state = Some(DragState::Pan {
+                            start_x: x,
+                            start_y: y,
+                        });
                         InputResult::Handled
                     }
                     MouseButton::Right => {
@@ -167,7 +220,10 @@ impl InputHandler for WorkspaceInputHandler {
                                 ]),
                             }
                         } else {
-                            ctx.drag_state = Some(DragState::RectSelect { start_x: x, start_y: y });
+                            ctx.drag_state = Some(DragState::RectSelect {
+                                start_x: x,
+                                start_y: y,
+                            });
                             InputResult::Handled
                         }
                     }
@@ -178,16 +234,15 @@ impl InputHandler for WorkspaceInputHandler {
                 }
             }
             InputEvent::MouseUp { button, .. } => {
-                if matches!(ctx.drag_state, Some(DragState::RectSelect { .. })) && button == MouseButton::Right {
+                if matches!(ctx.drag_state, Some(DragState::RectSelect { .. }))
+                    && button == MouseButton::Right
+                {
                     // Finish rectangle zoom
                     ctx.drag_state = None;
                     InputResult::ExecuteCommand {
                         command: "camera.zoomToRect".to_string(),
                         args: HashMap::new(),
                     }
-                } else if matches!(ctx.drag_state, Some(DragState::Pan { .. })) && button == MouseButton::Middle {
-                    ctx.drag_state = None;
-                    InputResult::Handled
                 } else {
                     ctx.drag_state = None;
                     InputResult::Handled
@@ -199,7 +254,10 @@ impl InputHandler for WorkspaceInputHandler {
                     let dy = (start_y - y) / ctx.hidpi_scale;
                     let mut camera = ctx.camera.lock().unwrap();
                     camera.pan(dx, dy);
-                    ctx.drag_state = Some(DragState::Pan { start_x: x, start_y: y });
+                    ctx.drag_state = Some(DragState::Pan {
+                        start_x: x,
+                        start_y: y,
+                    });
                     InputResult::Handled
                 } else {
                     InputResult::PassThrough
@@ -209,21 +267,56 @@ impl InputHandler for WorkspaceInputHandler {
                 // Workspace shortcuts
                 if !modifiers.ctrl && !modifiers.alt && !modifiers.meta {
                     match key.as_str() {
-                        "p" => InputResult::ExecuteCommand { command: "view.pin".to_string(), args: HashMap::new() },
-                        "t" => InputResult::ExecuteCommand { command: "layout.tileGrid".to_string(), args: HashMap::from([("cols".to_string(), CommandValue::Number(3.0))]) },
-                        "h" => InputResult::ExecuteCommand { command: "layout.tileHorizontal".to_string(), args: HashMap::new() },
-                        "v" => InputResult::ExecuteCommand { command: "layout.tileVertical".to_string(), args: HashMap::new() },
-                        "a" => InputResult::ExecuteCommand { command: "layout.alignLeft".to_string(), args: HashMap::new() },
-                        "b" => InputResult::ExecuteCommand { command: "camera.saveBookmark".to_string(), args: HashMap::from([("name".to_string(), "bm".into())]) },
-                        "f" => InputResult::ExecuteCommand { command: "camera.fitDashboard".to_string(), args: HashMap::new() },
-                        "d" => InputResult::ExecuteCommand { command: "layout.dashboard".to_string(), args: HashMap::new() },
-                        "n" => InputResult::ExecuteCommand { command: "terminal.new".to_string(), args: HashMap::new() },
-                        "0" => InputResult::ExecuteCommand { command: "camera.zoomToFit".to_string(), args: HashMap::new() },
+                        "p" => InputResult::ExecuteCommand {
+                            command: "view.pin".to_string(),
+                            args: HashMap::new(),
+                        },
+                        "t" => InputResult::ExecuteCommand {
+                            command: "layout.tileGrid".to_string(),
+                            args: HashMap::from([("cols".to_string(), CommandValue::Number(3.0))]),
+                        },
+                        "h" => InputResult::ExecuteCommand {
+                            command: "layout.tileHorizontal".to_string(),
+                            args: HashMap::new(),
+                        },
+                        "v" => InputResult::ExecuteCommand {
+                            command: "layout.tileVertical".to_string(),
+                            args: HashMap::new(),
+                        },
+                        "a" => InputResult::ExecuteCommand {
+                            command: "layout.alignLeft".to_string(),
+                            args: HashMap::new(),
+                        },
+                        "b" => InputResult::ExecuteCommand {
+                            command: "camera.saveBookmark".to_string(),
+                            args: HashMap::new(),
+                        },
+                        "f" => InputResult::ExecuteCommand {
+                            command: "camera.fitDashboard".to_string(),
+                            args: HashMap::new(),
+                        },
+                        "d" => InputResult::ExecuteCommand {
+                            command: "layout.dashboard".to_string(),
+                            args: HashMap::new(),
+                        },
+                        "n" => InputResult::ExecuteCommand {
+                            command: "terminal.new".to_string(),
+                            args: HashMap::new(),
+                        },
+                        "0" => InputResult::ExecuteCommand {
+                            command: "camera.zoomToFit".to_string(),
+                            args: HashMap::new(),
+                        },
                         "Enter" | "i" => InputResult::ChangeMode(InteractionMode::Terminal),
-                        c if c.len() == 1 && c.chars().next().unwrap().is_ascii_digit() => {
+                        c if c.len() == 1
+                            && matches!(c, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9") =>
+                        {
                             InputResult::ExecuteCommand {
                                 command: "camera.restoreBookmark".to_string(),
-                                args: HashMap::from([("name".to_string(), format!("bm{}", c).into())]),
+                                args: HashMap::from([(
+                                    "name".to_string(),
+                                    format!("bm{}", c).into(),
+                                )]),
                             }
                         }
                         _ => InputResult::PassThrough,
@@ -245,7 +338,7 @@ impl InputHandler for TerminalInputHandler {
         InteractionMode::Terminal
     }
 
-    fn handle_event(&mut self, event: InputEvent, ctx: &mut InputContext) -> InputResult {
+    fn handle_event(&mut self, event: InputEvent, _ctx: &mut InputContext) -> InputResult {
         match event {
             InputEvent::KeyDown { key, modifiers } => {
                 if key == "Escape" {
@@ -263,12 +356,19 @@ impl InputHandler for TerminalInputHandler {
                     ]),
                 }
             }
-            InputEvent::MouseWheel { delta_x: _, delta_y, modifiers } => {
+            InputEvent::MouseWheel {
+                delta_x: _,
+                delta_y,
+                modifiers,
+            } => {
                 if modifiers.shift {
                     // Scroll terminal
                     InputResult::ExecuteCommand {
                         command: "terminal.scroll".to_string(),
-                        args: HashMap::from([("lines".to_string(), CommandValue::Number(-delta_y))]),
+                        args: HashMap::from([(
+                            "lines".to_string(),
+                            CommandValue::Number(-delta_y),
+                        )]),
                     }
                 } else {
                     InputResult::PassThrough // Let workspace handle zoom
@@ -287,7 +387,7 @@ impl InputHandler for ReadingInputHandler {
         InteractionMode::Reading
     }
 
-    fn handle_event(&mut self, event: InputEvent, ctx: &mut InputContext) -> InputResult {
+    fn handle_event(&mut self, event: InputEvent, _ctx: &mut InputContext) -> InputResult {
         match event {
             InputEvent::KeyDown { key, .. } => {
                 if key == "Escape" || key == "q" {
@@ -309,7 +409,7 @@ impl InputHandler for DashboardInputHandler {
         InteractionMode::Dashboard
     }
 
-    fn handle_event(&mut self, event: InputEvent, ctx: &mut InputContext) -> InputResult {
+    fn handle_event(&mut self, event: InputEvent, _ctx: &mut InputContext) -> InputResult {
         match event {
             InputEvent::KeyDown { key, .. } => {
                 if key == "Escape" {
@@ -438,11 +538,15 @@ impl ContextMenuBuilder {
         vec![
             ContextMenuItem::new("copy", "Copy").with_command("clipboard.copy"),
             ContextMenuItem::new("pin_live", "Pin as Live View").with_command("view.pinLive"),
-            ContextMenuItem::new("pin_snapshot", "Pin as Snapshot").with_command("view.pinSnapshot"),
-            ContextMenuItem::new("zoom_sel", "Zoom to Selection").with_command("camera.zoomToSelection"),
+            ContextMenuItem::new("pin_snapshot", "Pin as Snapshot")
+                .with_command("view.pinSnapshot"),
+            ContextMenuItem::new("zoom_sel", "Zoom to Selection")
+                .with_command("camera.zoomToSelection"),
             ContextMenuItem::separator(),
-            ContextMenuItem::new("read_sel", "Read Selection").with_command("reading.enterSelection"),
-            ContextMenuItem::new("filter_sel", "Filter Selection").with_command("view.filterSelection"),
+            ContextMenuItem::new("read_sel", "Read Selection")
+                .with_command("reading.enterSelection"),
+            ContextMenuItem::new("filter_sel", "Filter Selection")
+                .with_command("view.filterSelection"),
             ContextMenuItem::new("search_sel", "Search Selection").with_command("search.selection"),
         ]
     }
@@ -450,14 +554,17 @@ impl ContextMenuBuilder {
     /// Build context menu for terminal node
     pub fn for_terminal_node() -> Vec<ContextMenuItem> {
         vec![
-            ContextMenuItem::new("new_profile", "New Terminal from Profile").with_command("terminal.newFromProfile"),
+            ContextMenuItem::new("new_profile", "New Terminal from Profile")
+                .with_command("terminal.newFromProfile"),
             ContextMenuItem::new("rename", "Rename").with_command("terminal.rename"),
             ContextMenuItem::new("opacity", "Opacity").with_command("terminal.opacity"),
             ContextMenuItem::new("style", "Style").with_command("terminal.style"),
             ContextMenuItem::new("input_mode", "Input Mode").with_command("terminal.inputMode"),
             ContextMenuItem::separator(),
             ContextMenuItem::new("save_layout", "Save to Layout").with_command("layout.save"),
-            ContextMenuItem::new("close", "Close").with_command("terminal.close").disabled(),
+            ContextMenuItem::new("close", "Close")
+                .with_command("terminal.close")
+                .disabled(),
         ]
     }
 
@@ -465,7 +572,8 @@ impl ContextMenuBuilder {
     pub fn for_projection_node() -> Vec<ContextMenuItem> {
         vec![
             ContextMenuItem::new("follow", "Follow Source").with_command("projection.follow"),
-            ContextMenuItem::new("edit_filter", "Edit Filter").with_command("projection.editFilter"),
+            ContextMenuItem::new("edit_filter", "Edit Filter")
+                .with_command("projection.editFilter"),
             ContextMenuItem::new("snapshot", "Snapshot").with_command("projection.snapshot"),
             ContextMenuItem::new("detach", "Detach").with_command("projection.detach"),
             ContextMenuItem::separator(),
@@ -519,6 +627,6 @@ mod tests {
         let menu = ContextMenuBuilder::for_terminal_selection();
         assert!(!menu.is_empty());
         assert_eq!(menu[0].id, "copy");
-        assert!(menu[1].separator == false);
+        assert!(!menu[1].separator);
     }
 }

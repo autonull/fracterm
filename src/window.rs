@@ -89,6 +89,10 @@ struct CanvasState {
     diag_pty_bytes: u64,
     /// Right-drag rectangle-zoom anchor (screen px).
     rect_anchor: Option<(f64, f64)>,
+    /// Last window title applied from the focused session's OSC title.
+    last_title: String,
+    /// Blink clock for steady-vs-blinking cursor styles.
+    blink_epoch: std::time::Instant,
     /// Last frame instant, for camera easing dt.
     last_frame: std::time::Instant,
     capabilities: Option<Capabilities>,
@@ -126,6 +130,8 @@ impl CanvasState {
             diag_frames: 0,
             diag_pty_bytes: 0,
             rect_anchor: None,
+            last_title: String::from("fracterm"),
+            blink_epoch: std::time::Instant::now(),
             last_frame: std::time::Instant::now(),
             capabilities: None,
             window: None,
@@ -442,6 +448,20 @@ impl CanvasState {
                 let _ = sess.pty.write(&reply);
             }
         }
+        // OSC window title: the focused session's title wins, else the
+        // default. Applied only on change.
+        let want_title = self
+            .focused_term
+            .and_then(|f| self.terms.iter().find(|s| s.surface == f))
+            .map(|s| s.engine.title.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "fracterm".to_string());
+        if want_title != self.last_title {
+            if let Some(window) = &self.window {
+                window.set_title(&want_title);
+            }
+            self.last_title = want_title;
+        }
         for sess in &self.terms {
             for node in self.app.state.workspace.scene.all_nodes_mut() {
                 if let Some(proj) = &mut node.projection {
@@ -465,8 +485,8 @@ impl CanvasState {
                 let width = w.max(1.0);
                 let height = h.max(1.0);
                 renderer.push_rect(
-                    node.transform.x as f64,
-                    node.transform.y as f64,
+                    node.transform.x,
+                    node.transform.y,
                     width,
                     height,
                     (
@@ -478,8 +498,8 @@ impl CanvasState {
                 );
                 if Some(node.id) == selected {
                     renderer.push_border(
-                        node.transform.x as f64,
-                        node.transform.y as f64,
+                        node.transform.x,
+                        node.transform.y,
                         width,
                         height,
                         2.0,
@@ -488,8 +508,8 @@ impl CanvasState {
                 } else {
                     let border = node.style.border;
                     renderer.push_border(
-                        node.transform.x as f64,
-                        node.transform.y as f64,
+                        node.transform.x,
+                        node.transform.y,
                         width,
                         height,
                         1.0,
@@ -509,8 +529,8 @@ impl CanvasState {
                     let handle = 12.0 / cam.zoom.max(0.05);
                     let (w, h) = (node.size.0.max(1.0), node.size.1.max(1.0));
                     renderer.push_overlay_rect(
-                        node.transform.x as f64 + w - handle,
-                        node.transform.y as f64 + h - handle,
+                        node.transform.x + w - handle,
+                        node.transform.y + h - handle,
                         handle,
                         handle,
                         (0.35, 0.7, 1.0, 1.0),
@@ -552,7 +572,7 @@ impl CanvasState {
                                 .state
                                 .workspace
                                 .get_node(self.terms[i].node)
-                                .map(|n| (n.transform.x as f64, n.transform.y as f64))
+                                .map(|n| (n.transform.x, n.transform.y))
                                 .unwrap_or((0.0, 0.0));
                             let rows = self.terms[i].engine.term.grid.rows;
                             let cols = self.terms[i].engine.term.grid.cols;
@@ -588,6 +608,61 @@ impl CanvasState {
                                 }
                             }
                         }
+                        // Terminal caret: shaped by DECSCUSR, hidden when the
+                        // child asked (?25l), blinking styles gated by a
+                        // ~530ms phase. Shown on the focused session only.
+                        // The text pass runs after the overlay, so glyphs
+                        // stay legible over a block caret.
+                        let blink_on = self.blink_epoch.elapsed().as_millis() % 1060 < 530;
+                        let cc =
+                            crate::surface::Color::from_hex(&self.app.state.config.theme.cursor);
+                        let cursor_rgba = (
+                            cc.r as f32 / 255.0,
+                            cc.g as f32 / 255.0,
+                            cc.b as f32 / 255.0,
+                            1.0,
+                        );
+                        let thin = 2.0 / cam.zoom.max(0.05);
+                        let focused_surface = self.focused_term;
+                        for sess in &self.terms {
+                            if !self.term_focus
+                                || Some(sess.surface) != focused_surface
+                                || !sess.engine.cursor_visible
+                            {
+                                continue;
+                            }
+                            let style = sess.engine.cursor_style;
+                            if style.blink && !blink_on {
+                                continue;
+                            }
+                            let Some(node) = self
+                                .app
+                                .state
+                                .workspace
+                                .get_node(sess.node)
+                                .map(|n| (n.transform.x, n.transform.y))
+                            else {
+                                continue;
+                            };
+                            let (ox, oy) = crate::arrange::grid_cell_origin(
+                                node.0,
+                                node.1,
+                                GRID_PAD_X,
+                                header_h,
+                                cell_w,
+                                line_h,
+                                sess.engine.term.cursor_col,
+                                sess.engine.term.cursor_row,
+                            );
+                            let (cx, cy, cw, ch) = match style.shape {
+                                crate::vt::CursorShape::Block => (ox, oy, cell_w, line_h),
+                                crate::vt::CursorShape::Bar => (ox, oy, thin, line_h),
+                                crate::vt::CursorShape::Underline => {
+                                    (ox, oy + line_h - thin, cell_w, thin)
+                                }
+                            };
+                            renderer.push_overlay_rect(cx, cy, cw, ch, cursor_rgba);
+                        }
                         // Projection nodes: render their content lines.
                         for node in self.app.state.workspace.all_nodes() {
                             let Some(proj) = &node.projection else {
@@ -603,8 +678,8 @@ impl CanvasState {
                                     fonts,
                                     fid,
                                     (
-                                        node.transform.x as f64 + 8.0,
-                                        node.transform.y as f64 + 20.0 + 16.0 * li as f64,
+                                        node.transform.x + 8.0,
+                                        node.transform.y + 20.0 + 16.0 * li as f64,
                                     ),
                                     (cam.x, cam.y, cam.zoom),
                                     12,
@@ -916,7 +991,7 @@ impl ApplicationHandler for CanvasState {
                                 .state
                                 .workspace
                                 .get_node(node)
-                                .map(|n| (n.transform.x as f64, n.transform.y as f64));
+                                .map(|n| (n.transform.x, n.transform.y));
                             let min_w = 2.0 * grid.0 + 2.0 * GRID_PAD_X;
                             let min_h = header + 2.0 * grid.1 + GRID_PAD_BOTTOM;
                             (p, (min_w, min_h))
@@ -1005,8 +1080,8 @@ impl ApplicationHandler for CanvasState {
                                 }
                                 self.drag = DragState::Move {
                                     node: id,
-                                    dx: nx as f64 - wx,
-                                    dy: ny as f64 - wy,
+                                    dx: nx - wx,
+                                    dy: ny - wy,
                                 };
                             }
                             None => {
@@ -1083,11 +1158,13 @@ impl ApplicationHandler for CanvasState {
                             );
                         }
                         Key::Character(c) if c == "b" => {
-                            self.app.state.workspace.camera_mut().save_bookmark("bm");
-                            eprintln!("bookmark saved");
+                            let name = self.app.state.workspace.camera_mut().save_next_bookmark();
+                            eprintln!("bookmark {name} saved");
                         }
                         Key::Character(c)
-                            if c.len() == 1 && c.chars().next().unwrap().is_ascii_digit() =>
+                            if c.len() == 1
+                                && c.chars().next().unwrap().is_ascii_digit()
+                                && c != "0" =>
                         {
                             let n = c.chars().next().unwrap();
                             let name = format!("bm{n}");
@@ -1107,8 +1184,8 @@ impl ApplicationHandler for CanvasState {
                                 self.app.state.workspace.all_nodes().first().map(|n| n.id)
                             {
                                 if let Some(n) = self.app.state.workspace.get_node_mut(first) {
-                                    n.transform.x = DASH_MARGIN as f64;
-                                    n.transform.y = DASH_MARGIN as f64;
+                                    n.transform.x = DASH_MARGIN;
+                                    n.transform.y = DASH_MARGIN;
                                 }
                             }
                             self.apply_arrange(
@@ -1140,12 +1217,7 @@ impl ApplicationHandler for CanvasState {
                                             (n.transform.x, n.transform.y, n.size.0, n.size.1)
                                         })
                                     })
-                                    .unwrap_or((
-                                        DASH_MARGIN as f64,
-                                        DASH_MARGIN as f64,
-                                        size.0,
-                                        size.1,
-                                    ));
+                                    .unwrap_or((DASH_MARGIN, DASH_MARGIN, size.0, size.1));
                                 let pos =
                                     crate::arrange::place_beside(anchor, size, DASH_GAP, view);
                                 if let Err(e) = self.spawn_terminal_node(GRID_COLS, GRID_ROWS, pos)
@@ -1157,11 +1229,21 @@ impl ApplicationHandler for CanvasState {
                             }
                         }
                         Key::Character(c) if c == "0" => {
-                            self.app
+                            // `0` restores slot bm0 when one was saved,
+                            // otherwise it zooms to workspace fit.
+                            if !self
+                                .app
                                 .state
                                 .workspace
                                 .camera_mut()
-                                .zoom_to_workspace_fit();
+                                .restore_bookmark("bm0")
+                            {
+                                self.app
+                                    .state
+                                    .workspace
+                                    .camera_mut()
+                                    .zoom_to_workspace_fit();
+                            }
                         }
                         Key::Named(NamedKey::Enter) => {
                             self.term_focus = true;

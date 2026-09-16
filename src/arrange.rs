@@ -8,10 +8,7 @@ use crate::NodeId;
 pub const DEFAULT_GAP: f64 = 16.0;
 
 fn sizes(nodes: &[&Node]) -> Vec<(f64, f64)> {
-    nodes
-        .iter()
-        .map(|n| (n.size.0 as f64, n.size.1 as f64))
-        .collect()
+    nodes.iter().map(|n| (n.size.0, n.size.1)).collect()
 }
 
 /// Tile nodes left-to-right in one row, preserving vertical order of
@@ -103,8 +100,14 @@ pub fn align(nodes: &[&Node], edge: Edge) -> Vec<(NodeId, f64, f64)> {
         .zip(&sizes)
         .map(|(n, (_, h))| n.transform.y + h)
         .fold(f64::NEG_INFINITY, f64::max);
-    let min_left = nodes.iter().map(|n| n.transform.x).fold(f64::INFINITY, f64::min);
-    let min_top = nodes.iter().map(|n| n.transform.y).fold(f64::INFINITY, f64::min);
+    let min_left = nodes
+        .iter()
+        .map(|n| n.transform.x)
+        .fold(f64::INFINITY, f64::min);
+    let min_top = nodes
+        .iter()
+        .map(|n| n.transform.y)
+        .fold(f64::INFINITY, f64::min);
     nodes
         .iter()
         .zip(&sizes)
@@ -362,16 +365,12 @@ pub fn snap_to_edges(moving: &Node, others: &[&Node], threshold: f64) -> SnapGui
             if d > threshold {
                 continue;
             }
-            if best
-                .as_ref()
-                .map(|b| d < b.distance)
-                .unwrap_or(true)
-            {
+            if best.as_ref().map(|b| d < b.distance).unwrap_or(true) {
                 best = Some(SnapGuide {
                     node_id: moving.id,
                     x: cx,
                     y: cy,
-                    distance: d as f64,
+                    distance: d,
                 });
             }
         }
@@ -402,7 +401,10 @@ mod tests {
 
     #[test]
     fn test_tile_horizontally() {
-        let mut nodes = vec![node(1, 0.0, 0.0, 100.0, 50.0), node(2, 500.0, 0.0, 80.0, 50.0)];
+        let mut nodes = vec![
+            node(1, 0.0, 0.0, 100.0, 50.0),
+            node(2, 500.0, 0.0, 80.0, 50.0),
+        ];
         let r = tile_horizontally(&refs(&mut nodes), 10.0);
         assert_eq!(r[0], (NodeId(1), 0.0, 0.0));
         assert_eq!(r[1], (NodeId(2), 110.0, 0.0));
@@ -410,7 +412,10 @@ mod tests {
 
     #[test]
     fn test_tile_vertically() {
-        let mut nodes = vec![node(1, 0.0, 0.0, 100.0, 50.0), node(2, 0.0, 500.0, 100.0, 30.0)];
+        let mut nodes = vec![
+            node(1, 0.0, 0.0, 100.0, 50.0),
+            node(2, 0.0, 500.0, 100.0, 30.0),
+        ];
         let r = tile_vertically(&refs(&mut nodes), 5.0);
         assert_eq!(r[1], (NodeId(2), 0.0, 55.0));
     }
@@ -430,7 +435,10 @@ mod tests {
 
     #[test]
     fn test_align_edges() {
-        let mut nodes = vec![node(1, 10.0, 5.0, 100.0, 50.0), node(2, 200.0, 60.0, 80.0, 40.0)];
+        let mut nodes = vec![
+            node(1, 10.0, 5.0, 100.0, 50.0),
+            node(2, 200.0, 60.0, 80.0, 40.0),
+        ];
         let left = align(&refs(&mut nodes), Edge::Left);
         assert_eq!(left[1].1, 10.0);
         let top = align(&refs(&mut nodes), Edge::Top);
@@ -478,7 +486,10 @@ mod tests {
 
     #[test]
     fn test_cascade() {
-        let mut nodes = vec![node(1, 0.0, 0.0, 100.0, 50.0), node(2, 0.0, 0.0, 100.0, 50.0)];
+        let mut nodes = vec![
+            node(1, 0.0, 0.0, 100.0, 50.0),
+            node(2, 0.0, 0.0, 100.0, 50.0),
+        ];
         let r = cascade(&refs(&mut nodes), 24.0);
         assert_eq!(r[1], (NodeId(2), 24.0, 24.0));
     }
@@ -529,7 +540,12 @@ mod tests {
         // Anchor 736 wide at x=24; new 736 wide + 24 gap fits in 1280? No:
         // 24+736+24=784, 784+736=1520 > 1280, so wraps below. Use a
         // smaller anchor to test the beside path.
-        let pos = place_beside((24.0, 24.0, 200.0, 100.0), (200.0, 100.0), 24.0, (1280.0, 720.0));
+        let pos = place_beside(
+            (24.0, 24.0, 200.0, 100.0),
+            (200.0, 100.0),
+            24.0,
+            (1280.0, 720.0),
+        );
         assert_eq!(pos, (24.0 + 200.0 + 24.0, 24.0));
         // No overlap: right edge of anchor + gap == left of new.
         assert!(pos.0 >= 24.0 + 200.0 + 24.0);
@@ -553,7 +569,12 @@ mod tests {
 
     #[test]
     fn test_place_beside_wraps_on_narrow_viewport() {
-        let pos = place_beside((24.0, 24.0, 736.0, 472.0), (736.0, 472.0), 24.0, (700.0, 720.0));
+        let pos = place_beside(
+            (24.0, 24.0, 736.0, 472.0),
+            (736.0, 472.0),
+            24.0,
+            (700.0, 720.0),
+        );
         assert_eq!(pos, (24.0, 24.0 + 472.0 + 24.0));
     }
 

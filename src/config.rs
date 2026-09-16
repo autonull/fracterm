@@ -1,6 +1,5 @@
 //! Configuration system - TypeScript-first configuration with profile support.
 
-use super::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -148,7 +147,7 @@ impl TerminalConfig {
         }
     }
 
-    pub fn profile(name: &str, font_size: u32) -> Self {
+    pub fn profile(_name: &str, _font_size: u32) -> Self {
         Self {
             scrollback_lines: 10000,
             copy_on_select: false,
@@ -363,7 +362,11 @@ impl Config {
             let default_path = Self::config_path();
             if default_path.exists() {
                 Self::load_from_ts(&default_path).unwrap_or_else(|e| {
-                    eprintln!("Failed to load config from {}: {}", default_path.display(), e);
+                    eprintln!(
+                        "Failed to load config from {}: {}",
+                        default_path.display(),
+                        e
+                    );
                     Self::new()
                 })
             } else {
@@ -454,7 +457,8 @@ fn eval_ts_config(js: &str) -> Result<Config, String> {
             }
             globalThis.defineConfig = defineConfig;
         "#;
-        ctx.eval::<(), _>(define_config.as_bytes()).map_err(|e| e.to_string())?;
+        ctx.eval::<(), _>(define_config.as_bytes())
+            .map_err(|e| e.to_string())?;
 
         // Evaluate the user's config
         let result: rquickjs::Value = ctx.eval(js.as_bytes()).map_err(|e| e.to_string())?;
@@ -466,7 +470,8 @@ fn eval_ts_config(js: &str) -> Result<Config, String> {
                 (function(val) {
                     return JSON.stringify(val);
                 })
-                "#.as_bytes(),
+                "#
+                .as_bytes(),
             )
             .map_err(|e| e.to_string())?;
         let json_str: String = stringify_fn.call((result,)).map_err(|e| e.to_string())?;
@@ -479,45 +484,90 @@ fn eval_ts_config(js: &str) -> Result<Config, String> {
 pub fn builtin_profiles() -> HashMap<String, ProfileConfig> {
     let mut profiles = HashMap::new();
 
-    profiles.insert("big-text".to_string(), ProfileConfig {
-        font: Some(FontConfig { size: 24, weight: 500, ..FontConfig::default() }),
-        theme: Some(ThemeConfig { background: "#000000".to_string(), foreground: "#ffffff".to_string(), ..ThemeConfig::default() }),
-        terminal: None,
-        accessibility: None,
-        effects: None,
-    });
+    profiles.insert(
+        "big-text".to_string(),
+        ProfileConfig {
+            font: Some(FontConfig {
+                size: 24,
+                weight: 500,
+                ..FontConfig::default()
+            }),
+            theme: Some(ThemeConfig {
+                background: "#000000".to_string(),
+                foreground: "#ffffff".to_string(),
+                ..ThemeConfig::default()
+            }),
+            terminal: None,
+            accessibility: None,
+            effects: None,
+        },
+    );
 
-    profiles.insert("ssh".to_string(), ProfileConfig {
-        font: None,
-        theme: None,
-        terminal: Some(TerminalConfig { scrollback_lines: 50000, ..TerminalConfig::default() }),
-        accessibility: None,
-        effects: None,
-    });
+    profiles.insert(
+        "ssh".to_string(),
+        ProfileConfig {
+            font: None,
+            theme: None,
+            terminal: Some(TerminalConfig {
+                scrollback_lines: 50000,
+                ..TerminalConfig::default()
+            }),
+            accessibility: None,
+            effects: None,
+        },
+    );
 
-    profiles.insert("logs".to_string(), ProfileConfig {
-        font: Some(FontConfig { size: 12, ..FontConfig::default() }),
-        theme: None,
-        terminal: Some(TerminalConfig { copy_on_select: true, ..TerminalConfig::default() }),
-        accessibility: None,
-        effects: None,
-    });
+    profiles.insert(
+        "logs".to_string(),
+        ProfileConfig {
+            font: Some(FontConfig {
+                size: 12,
+                ..FontConfig::default()
+            }),
+            theme: None,
+            terminal: Some(TerminalConfig {
+                copy_on_select: true,
+                ..TerminalConfig::default()
+            }),
+            accessibility: None,
+            effects: None,
+        },
+    );
 
-    profiles.insert("presentation".to_string(), ProfileConfig {
-        font: Some(FontConfig { size: 20, ..FontConfig::default() }),
-        theme: None,
-        terminal: None,
-        accessibility: None,
-        effects: Some(EffectsConfig { motion_blur: true, ..EffectsConfig::default() }),
-    });
+    profiles.insert(
+        "presentation".to_string(),
+        ProfileConfig {
+            font: Some(FontConfig {
+                size: 20,
+                ..FontConfig::default()
+            }),
+            theme: None,
+            terminal: None,
+            accessibility: None,
+            effects: Some(EffectsConfig {
+                motion_blur: true,
+                ..EffectsConfig::default()
+            }),
+        },
+    );
 
-    profiles.insert("high-contrast".to_string(), ProfileConfig {
-        font: None,
-        theme: Some(ThemeConfig::default()),
-        terminal: None,
-        accessibility: Some(AccessibilityConfig { reading_mode: ReadingModeConfig { high_contrast: true, font_size: 28, ..ReadingModeConfig::default() }, ..AccessibilityConfig::default() }),
-        effects: None,
-    });
+    profiles.insert(
+        "high-contrast".to_string(),
+        ProfileConfig {
+            font: None,
+            theme: Some(ThemeConfig::default()),
+            terminal: None,
+            accessibility: Some(AccessibilityConfig {
+                reading_mode: ReadingModeConfig {
+                    high_contrast: true,
+                    font_size: 28,
+                    ..ReadingModeConfig::default()
+                },
+                ..AccessibilityConfig::default()
+            }),
+            effects: None,
+        },
+    );
 
     profiles
 }
@@ -535,8 +585,10 @@ mod tests {
 
     #[test]
     fn test_profile_application() {
-        let mut config = Config::default();
-        config.profiles = builtin_profiles();
+        let mut config = Config {
+            profiles: builtin_profiles(),
+            ..Default::default()
+        };
         config.apply_profile("big-text");
         assert_eq!(config.font.size, 24);
         assert_eq!(config.font.weight, 500);

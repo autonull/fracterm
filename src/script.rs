@@ -73,6 +73,134 @@ fn manifest_permissions_allows(
     })
 }
 
+/// Web-compat polyfill injected into every plugin context (README §14).
+/// QuickJS `Context::full` provides the JS standard library but none of the
+/// Web host globals, so we install a minimal, dependency-free subset:
+/// timers (backed by a JS-side due-queue drained by `poll_timers`),
+/// `queueMicrotask`, `structuredClone` (JSON round-trip), `TextEncoder` /
+/// `TextDecoder` (UTF-8), `URL` / `URLSearchParams` (RFC 3986 subset),
+/// `crypto.randomUUID` (Math.random-based v4), `AbortController` /
+/// `AbortSignal`. The host event loop drains timers via `poll_timers`;
+/// wiring that into the frame loop is still pending (TODO P6).
+const WEB_POLYFILL_JS: &str = r#"
+(function(g) {
+    if (g.__fracterm_web_installed) return;
+    g.__fracterm_web_installed = true;
+    g.__fracterm_timer_seq = 0;
+    g.__fracterm_timers = [];
+    g.setTimeout = function(cb, ms) {
+        var id = ++g.__fracterm_timer_seq;
+        g.__fracterm_timers.push({ id: id, kind: "timeout", callback: cb, due: Date.now() + (ms || 0) });
+        return id;
+    };
+    g.setInterval = function(cb, ms) {
+        var id = ++g.__fracterm_timer_seq;
+        g.__fracterm_timers.push({ id: id, kind: "interval", callback: cb, due: Date.now() + (ms || 0), every: (ms || 0) });
+        return id;
+    };
+    function clearTimer(id) {
+        g.__fracterm_timers = g.__fracterm_timers.filter(function(t) { return t.id !== id; });
+    }
+    g.clearTimeout = clearTimer;
+    g.clearInterval = clearTimer;
+    g.__fracterm_poll_timers = function() {
+        var now = Date.now();
+        var fired = 0;
+        var keep = [];
+        for (var i = 0; i < g.__fracterm_timers.length; i++) {
+            var t = g.__fracterm_timers[i];
+            if (t.due <= now) {
+                try { t.callback(); } catch (e) { if (g.console) g.console.error("timer error: " + e); }
+                fired++;
+                if (t.kind === "interval") { t.due = Date.now() + t.every; keep.push(t); }
+            } else {
+                keep.push(t);
+            }
+        }
+        g.__fracterm_timers = keep;
+        return fired;
+    };
+    g.queueMicrotask = g.queueMicrotask || function(cb) {
+        if (g.Promise) { g.Promise.resolve().then(cb); } else { cb(); }
+    };
+    g.structuredClone = g.structuredClone || function(v) { return JSON.parse(JSON.stringify(v)); };
+    if (!g.TextEncoder) {
+        g.TextEncoder = function() {};
+        g.TextEncoder.prototype.encode = function(s) {
+            var bin = unescape(encodeURIComponent(s));
+            var out = new Uint8Array(bin.length);
+            for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+            return out;
+        };
+    }
+    if (!g.TextDecoder) {
+        g.TextDecoder = function() {};
+        g.TextDecoder.prototype.decode = function(bytes) {
+            var bin = "";
+            for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+            return decodeURIComponent(escape(bin));
+        };
+    }
+    if (!g.URLSearchParams) {
+        g.URLSearchParams = function(init) {
+            this.params = [];
+            var s = (init || "").replace(/^\?/, "");
+            if (s) {
+                var pairs = s.split("&");
+                for (var i = 0; i < pairs.length; i++) {
+                    var kv = pairs[i].split("=");
+                    this.params.push([decodeURIComponent(kv[0] || ""), decodeURIComponent(kv[1] || "")]);
+                }
+            }
+        };
+        g.URLSearchParams.prototype.get = function(k) {
+            for (var i = 0; i < this.params.length; i++) if (this.params[i][0] === k) return this.params[i][1];
+            return null;
+        };
+        g.URLSearchParams.prototype.set = function(k, v) {
+            for (var i = 0; i < this.params.length; i++) if (this.params[i][0] === k) { this.params[i][1] = v; return; }
+            this.params.push([k, v]);
+        };
+        g.URLSearchParams.prototype.append = function(k, v) { this.params.push([k, v]); };
+        g.URLSearchParams.prototype.toString = function() {
+            return this.params.map(function(p) { return encodeURIComponent(p[0]) + "=" + encodeURIComponent(p[1]); }).join("&");
+        };
+    }
+    if (!g.URL) {
+        g.URL = function(href) {
+            var m = String(href).match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^\/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/);
+            if (!m) throw new Error("Invalid URL: " + href);
+            this.protocol = m[1] + ":";
+            this.host = m[2];
+            this.hostname = m[2].split(":")[0];
+            this.pathname = m[3] || "/";
+            this.search = m[4] || "";
+            this.hash = m[5] || "";
+            this.href = href;
+            this.searchParams = new g.URLSearchParams(this.search);
+        };
+    }
+    g.crypto = g.crypto || {};
+    if (!g.crypto.randomUUID) {
+        g.crypto.randomUUID = function() {
+            return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function(c) {
+                var r = Math.floor(Math.random() * 16);
+                var v = c === "x" ? r : ((r & 0x3) | 0x8);
+                return v.toString(16);
+            });
+        };
+    }
+    if (!g.AbortController) {
+        g.AbortSignal = function() { this.aborted = false; this.onabort = null; };
+        g.AbortController = function() { this.signal = new g.AbortSignal(); };
+        g.AbortController.prototype.abort = function() {
+            this.signal.aborted = true;
+            if (this.signal.onabort) this.signal.onabort();
+        };
+    }
+})(globalThis);
+"#;
+
 /// Per-plugin runtime state.
 struct PluginInstance {
     /// Kept alive by the context; named explicitly for clarity.
@@ -112,12 +240,13 @@ impl QuickJsScriptHost {
         let can_register_commands =
             manifest_permissions_allows(manifest, "commands.register", None);
         let tag_err = tag.clone();
+        let tag_log = tag.clone();
         use rquickjs::function::Func;
         let console = rquickjs::Object::new(ctx.clone()).map_err(|e| e.to_string())?;
         console
             .set(
                 "log",
-                Func::from(move |msg: String| eprintln!("[plugin {tag}] {msg}")),
+                Func::from(move |msg: String| eprintln!("[plugin {tag_log}] {msg}")),
             )
             .map_err(|e| e.to_string())?;
         console
@@ -125,6 +254,21 @@ impl QuickJsScriptHost {
                 "error",
                 Func::from(move |msg: String| eprintln!("[plugin {tag_err}] ERROR: {msg}")),
             )
+            .map_err(|e| e.to_string())?;
+        for alias in ["warn", "info", "debug"] {
+            let tag_alias = tag.clone();
+            console
+                .set(
+                    alias,
+                    Func::from(move |msg: String| eprintln!("[plugin {tag_alias}] {msg}")),
+                )
+                .map_err(|e| e.to_string())?;
+        }
+
+        // Web-compat globals (README §14): timers, structuredClone,
+        // TextEncoder/Decoder, URL, crypto.randomUUID, AbortController.
+        let _: () = ctx
+            .eval(WEB_POLYFILL_JS.as_bytes())
             .map_err(|e| e.to_string())?;
 
         // fracterm host API surface.
@@ -180,6 +324,36 @@ impl QuickJsScriptHost {
     /// Get a loaded plugin's manifest.
     pub fn manifest(&self, id: &PluginId) -> Option<&PluginManifest> {
         self.plugins.get(id).map(|p| &p.manifest)
+    }
+
+    /// Drain due timers for every loaded plugin — the frame loop calls
+    /// this once per frame. Returns one fire count per loaded plugin.
+    pub fn poll_all_timers(&mut self) -> Vec<(PluginId, Result<u32, String>)> {
+        let ids: Vec<PluginId> = self.plugins.keys().cloned().collect();
+        ids.into_iter()
+            .map(|id| {
+                let result = self.poll_timers(&id);
+                (id, result)
+            })
+            .collect()
+    }
+
+    /// Drain due timers for one plugin (see `WEB_POLYFILL_JS`). Returns the
+    /// number of callbacks fired. The frame loop drains every plugin via
+    /// `poll_all_timers`; direct callers use this for a single plugin.
+    pub fn poll_timers(&mut self, id: &PluginId) -> Result<u32, String> {
+        let instance = self
+            .plugins
+            .get_mut(id)
+            .ok_or_else(|| format!("plugin {id:?} not loaded"))?;
+        instance.context.with(|ctx| -> Result<u32, String> {
+            let poll: rquickjs::Function = ctx
+                .globals()
+                .get("__fracterm_poll_timers")
+                .map_err(|e| e.to_string())?;
+            let fired: u32 = poll.call(()).map_err(|e| e.to_string())?;
+            Ok(fired)
+        })
     }
 }
 
@@ -593,5 +767,149 @@ mod tests {
             })
             .unwrap_err();
         assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn test_web_globals_present() {
+        let mut h = host();
+        let id = h
+            .load_plugin(PluginManifest {
+                source: r#"
+                    function probe() {
+                        return {
+                            timeout: typeof setTimeout,
+                            interval: typeof setInterval,
+                            clearTimeout: typeof clearTimeout,
+                            clearInterval: typeof clearInterval,
+                            microtask: typeof queueMicrotask,
+                            clone: typeof structuredClone,
+                            encoder: typeof TextEncoder,
+                            decoder: typeof TextDecoder,
+                            url: typeof URL,
+                            urlParams: typeof URLSearchParams,
+                            uuid: typeof crypto.randomUUID,
+                            abort: typeof AbortController,
+                            warn: typeof console.warn,
+                            info: typeof console.info,
+                        };
+                    }
+                "#
+                .into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let result = h.call(&id, "probe", serde_json::json!(null)).unwrap();
+        for key in [
+            "timeout",
+            "interval",
+            "clearTimeout",
+            "clearInterval",
+            "microtask",
+            "clone",
+            "encoder",
+            "decoder",
+            "url",
+            "urlParams",
+            "uuid",
+            "abort",
+            "warn",
+            "info",
+        ] {
+            assert_eq!(
+                result.get(key),
+                Some(&serde_json::json!("function")),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_timers_fire_on_poll_and_clear() {
+        let mut h = host();
+        let id = h
+            .load_plugin(PluginManifest {
+                source: r#"
+                    var count = 0;
+                    var cancelled = 0;
+                    setTimeout(function() { count++; }, 0);
+                    var kill = setTimeout(function() { cancelled++; }, 0);
+                    clearTimeout(kill);
+                    var iv = setInterval(function() { count += 10; }, 0);
+                    function stop() { clearInterval(iv); return true; }
+                    function snapshot() { return [count, cancelled]; }
+                "#
+                .into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let fired = h.poll_timers(&id).unwrap();
+        assert!(fired >= 2, "timeout + interval fire, got {fired}");
+        let snap = h.call(&id, "snapshot", serde_json::json!(null)).unwrap();
+        assert_eq!(snap, serde_json::json!([11, 0]));
+        h.call(&id, "stop", serde_json::json!(null)).unwrap();
+        let fired_again = h.poll_timers(&id).unwrap();
+        assert_eq!(fired_again, 0);
+    }
+
+    #[test]
+    fn test_structured_clone_text_url_uuid_abort() {
+        let mut h = host();
+        let id = h
+            .load_plugin(PluginManifest {
+                source: r#"
+                    function check() {
+                        var src = { a: [1, { b: "x" }] };
+                        var copy = structuredClone(src);
+                        copy.a[1].b = "changed";
+                        var enc = new TextEncoder().encode("a\u276Fb");
+                        var dec = new TextDecoder().decode(enc);
+                        var u = new URL("https://api.example.com:8080/v1/items?tag=a&tag=b#frag");
+                        var uuid = crypto.randomUUID();
+                        var uuidOk = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(uuid);
+                        var ctl = new AbortController();
+                        var before = ctl.signal.aborted;
+                        ctl.abort();
+                        var chain = [];
+                        queueMicrotask(function() { chain.push(1); });
+                        return {
+                            isolated: src.a[1].b === "x",
+                            text: dec === "a\u276Fb" && enc.length === 5,
+                            host: u.host === "api.example.com:8080" && u.pathname === "/v1/items",
+                            param: u.searchParams.get("tag") === "a",
+                            uuid: uuidOk,
+                            abort: before === false && ctl.signal.aborted === true,
+                        };
+                    }
+                "#
+                .into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let result = h.call(&id, "check", serde_json::json!(null)).unwrap();
+        for key in ["isolated", "text", "host", "param", "uuid", "abort"] {
+            assert_eq!(result.get(key), Some(&serde_json::json!(true)), "{key}");
+        }
+    }
+
+    #[test]
+    fn test_poll_all_timers_drains_every_plugin() {
+        let mut h = host();
+        for name in ["a.js", "b.js"] {
+            h.load_plugin(PluginManifest {
+                source: "var n = 0; setTimeout(function() { n++; }, 0);".into(),
+                source_path: Some(name.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let drained = h.poll_all_timers();
+        assert_eq!(drained.len(), 2);
+        for (_, fired) in &drained {
+            assert_eq!(*fired, Ok(1));
+        }
+        let drained_again = h.poll_all_timers();
+        for (_, fired) in &drained_again {
+            assert_eq!(*fired, Ok(0));
+        }
     }
 }

@@ -38,6 +38,69 @@ pub struct Pen {
     pub reverse: bool,
 }
 
+/// Visible cursor shape (DECSCUSR, `CSI Ps SP q`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CursorShape {
+    #[default]
+    Block,
+    Underline,
+    Bar,
+}
+
+/// Cursor style: shape + whether it blinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CursorStyle {
+    pub shape: CursorShape,
+    pub blink: bool,
+}
+
+impl CursorStyle {
+    /// Decode a DECSCUSR parameter: 0/1 blinking block, 2 steady block,
+    /// 3 blinking underline, 4 steady underline, 5 blinking bar, 6 steady
+    /// bar. Unknown values keep the current style.
+    pub fn from_decscusr(param: u16, current: Self) -> Self {
+        match param {
+            0 | 1 => Self {
+                shape: CursorShape::Block,
+                blink: true,
+            },
+            2 => Self {
+                shape: CursorShape::Block,
+                blink: false,
+            },
+            3 => Self {
+                shape: CursorShape::Underline,
+                blink: true,
+            },
+            4 => Self {
+                shape: CursorShape::Underline,
+                blink: false,
+            },
+            5 => Self {
+                shape: CursorShape::Bar,
+                blink: true,
+            },
+            6 => Self {
+                shape: CursorShape::Bar,
+                blink: false,
+            },
+            _ => current,
+        }
+    }
+}
+
+/// Mouse reporting modes requested by the child (xterm 1000/1002/1003 +
+/// SGR 1006). Tracked so the host can forward events; forwarding itself
+/// is still pending (TODO P3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MouseMode {
+    /// Any of 1000/1002/1003 active: clicks (and maybe drags/motion) go to
+    /// the child instead of the canvas.
+    pub report: bool,
+    /// SGR (1006) extended coordinates; otherwise legacy X10 encoding.
+    pub sgr: bool,
+}
+
 /// `vte::Perform` implementation driving a [`Terminal`] grid.
 pub struct VtEngine {
     pub term: Terminal,
@@ -53,6 +116,21 @@ pub struct VtEngine {
     /// Reply bytes owed to the child (e.g. Device Attributes answers).
     /// Drained by the window loop and written back to the PTY.
     pending_reply: Vec<u8>,
+    /// DCS sequence being collected (`dcs_hook` → `dcs_put`* → `unhook`).
+    dcs_action: Option<char>,
+    dcs_plus: bool,
+    dcs_payload: Vec<u8>,
+    /// DECTCEM (?25): false while the child hides the cursor (vim, etc.).
+    pub cursor_visible: bool,
+    /// DECSCUSR cursor style (block/bar/underline + blink).
+    pub cursor_style: CursorStyle,
+    /// DECAWM (?7): automatic wrap at the right margin.
+    pub auto_wrap: bool,
+    /// Bracketed paste (?2004): pastes must be wrapped in
+    /// `ESC[200~` … `ESC[201~` (see [`VtEngine::bracket_paste`]).
+    pub bracketed_paste: bool,
+    /// Mouse reporting requested by the child.
+    pub mouse_mode: MouseMode,
 }
 
 impl VtEngine {
@@ -65,6 +143,29 @@ impl VtEngine {
             title: String::new(),
             saved_cursor: None,
             pending_reply: Vec::new(),
+            dcs_action: None,
+            dcs_plus: false,
+            dcs_payload: Vec::new(),
+            cursor_visible: true,
+            cursor_style: CursorStyle::default(),
+            auto_wrap: true,
+            bracketed_paste: false,
+            mouse_mode: MouseMode::default(),
+        }
+    }
+
+    /// Wrap pasted text for the child: when the child enabled bracketed
+    /// paste (?2004), the paste is framed with `ESC[200~` … `ESC[201~` so
+    /// shells treat it as one literal unit instead of keystrokes.
+    pub fn bracket_paste(&self, text: &str) -> Vec<u8> {
+        if self.bracketed_paste {
+            let mut out = Vec::with_capacity(text.len() + 12);
+            out.extend_from_slice(b"\x1b[200~");
+            out.extend_from_slice(text.as_bytes());
+            out.extend_from_slice(b"\x1b[201~");
+            out
+        } else {
+            text.as_bytes().to_vec()
         }
     }
 
@@ -134,8 +235,14 @@ impl VtEngine {
         let (fg, bg) = self.cell_colors();
         let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1) as u8;
         if self.term.cursor_col >= self.term.grid.cols {
-            self.term.cursor_col = 0;
-            self.linefeed();
+            if self.auto_wrap {
+                self.term.cursor_col = 0;
+                self.linefeed();
+            } else {
+                // No autowrap (?7l): the cursor sticks at the last column
+                // and new output overwrites it.
+                self.term.cursor_col = self.term.grid.cols.saturating_sub(1);
+            }
         }
         // Fill the spacer cell left of the current char if a wide char
         // advanced the cursor past it earlier.
@@ -354,25 +461,58 @@ impl vte::Perform for VtEngine {
                 }
             }
             'h' | 'l' => {
-                // ?25 cursor visibility, ?1049 alt screen, ?2004 bracketed paste
-                if p.contains(&1049) {
-                    if action == 'h' && self.alt_cells.is_none() {
-                        self.alt_cells = Some(self.term.grid.cells.clone());
-                        self.saved_cursor = Some((self.term.cursor_row, self.term.cursor_col));
-                        self.clear_screen();
-                        self.term.cursor_row = 0;
-                        self.term.cursor_col = 0;
-                    } else if action == 'l' {
-                        if let Some(alt) = self.alt_cells.take() {
-                            self.term.grid.cells = alt;
-                            // Restore the pre-alt cursor: parking at the
-                            // bottom row pushed the first prompt to the last
-                            // line and scrolled away row 0.
-                            let (r, c) = self.saved_cursor.take().unwrap_or((0, 0));
-                            self.term.cursor_row = r.min(self.term.grid.rows.saturating_sub(1));
-                            self.term.cursor_col = c.min(self.term.grid.cols.saturating_sub(1));
+                let set = action == 'h';
+                // DEC private modes (`CSI ? …`) vs. ANSI modes (`CSI …`):
+                // only the `?` forms touch terminal state.
+                if intermediates.contains(&b'?') {
+                    for mode in p {
+                        match mode {
+                            7 => self.auto_wrap = set,
+                            25 => self.cursor_visible = set,
+                            1049 => self.set_alt_screen(set),
+                            2004 => self.bracketed_paste = set,
+                            1000 | 1002 | 1003 => self.mouse_mode.report = set,
+                            1006 => self.mouse_mode.sgr = set,
+                            _ => {}
                         }
                     }
+                }
+            }
+            'q' => {
+                // DECSCUSR (`CSI Ps SP q`): cursor style. The space
+                // intermediate distinguishes it from XTVERSION (`CSI > 0 q`),
+                // which asks for the terminal version string.
+                if intermediates.contains(&b' ') {
+                    let param = p.first().copied().unwrap_or(0);
+                    self.cursor_style = CursorStyle::from_decscusr(param, self.cursor_style);
+                } else if intermediates.contains(&b'>') {
+                    self.pending_reply
+                        .extend_from_slice(b"\x1bP>|fracterm 2.0.0\x1b\\");
+                }
+            }
+            'u' => {
+                // Kitty keyboard capability query (`CSI ? u`): answer "not
+                // supported" instead of stalling the child on a timeout.
+                if intermediates.contains(&b'?') {
+                    self.pending_reply.extend_from_slice(b"\x1b[?0u");
+                }
+            }
+            'n' => {
+                // Device Status Report: `CSI 5 n` asks "are you OK?",
+                // `CSI 6 n` asks for the cursor position. Prompts and
+                // shells (fish among them) can stall their first render
+                // until the position report arrives, so answer both.
+                match p.first().copied().unwrap_or(0) {
+                    5 => self.pending_reply.extend_from_slice(b"\x1b[0n"),
+                    6 => {
+                        let report = format!(
+                            "\x1b[{};{}R",
+                            self.term.cursor_row + 1,
+                            self.term.cursor_col + 1
+                        );
+                        self.pending_reply.extend_from_slice(report.as_bytes());
+                    }
+                    _ => {}
                 }
             }
             'c' => {
@@ -396,12 +536,59 @@ impl vte::Perform for VtEngine {
         if let Some(first) = params.first() {
             if (first == b"0" || first == b"2") && params.len() > 1 {
                 self.title = String::from_utf8_lossy(params[1]).into_owned();
+            } else if first == b"11" {
+                // OSC 11 background query (`OSC 11;?`): answer with the
+                // default background so the child never waits on a timeout.
+                self.pending_reply
+                    .extend_from_slice(b"\x1b]11;rgb:0b0b/0d0d/1212\x1b\\");
             }
         }
+    }
+
+    fn hook(&mut self, _params: &vte::Params, intermediates: &[u8], _ignore: bool, action: char) {
+        self.dcs_action = Some(action);
+        self.dcs_plus = intermediates.contains(&b'+');
+        self.dcs_payload.clear();
+    }
+
+    fn put(&mut self, byte: u8) {
+        self.dcs_payload.push(byte);
+    }
+
+    fn unhook(&mut self) {
+        // XTGETTCAP (`DCS + q <hex> ST`): we expose no terminfo caps, so
+        // answer "unknown" (`DCS 0 + r ST`) instead of stalling the child.
+        // The `+` guard keeps Sixel payloads (also `q`-final) untouched.
+        if self.dcs_action == Some('q') && self.dcs_plus && !self.dcs_payload.is_empty() {
+            self.pending_reply.extend_from_slice(b"\x1bP0+r\x1b\\");
+        }
+        self.dcs_action = None;
+        self.dcs_plus = false;
+        self.dcs_payload.clear();
     }
 }
 
 impl VtEngine {
+    fn set_alt_screen(&mut self, on: bool) {
+        if on && self.alt_cells.is_none() {
+            self.alt_cells = Some(self.term.grid.cells.clone());
+            self.saved_cursor = Some((self.term.cursor_row, self.term.cursor_col));
+            self.clear_screen();
+            self.term.cursor_row = 0;
+            self.term.cursor_col = 0;
+        } else if !on {
+            if let Some(alt) = self.alt_cells.take() {
+                self.term.grid.cells = alt;
+                // Restore the pre-alt cursor: parking at the
+                // bottom row pushed the first prompt to the last
+                // line and scrolled away row 0.
+                let (r, c) = self.saved_cursor.take().unwrap_or((0, 0));
+                self.term.cursor_row = r.min(self.term.grid.rows.saturating_sub(1));
+                self.term.cursor_col = c.min(self.term.grid.cols.saturating_sub(1));
+            }
+        }
+    }
+
     fn clear_screen(&mut self) {
         for r in 0..self.term.grid.rows {
             self.clear_row_from(r, 0);
@@ -514,6 +701,97 @@ mod tests {
         assert_eq!(cell(&e, 0, 0).character, 'a');
         e.feed(b"\x1b[?1049l");
         assert_eq!(cell(&e, 0, 0).character, 'm');
+    }
+
+    #[test]
+    fn test_cursor_visibility_and_style() {
+        let mut e = engine(20, 5);
+        assert!(e.cursor_visible);
+        e.feed(b"\x1b[?25l");
+        assert!(!e.cursor_visible);
+        e.feed(b"\x1b[?25h");
+        assert!(e.cursor_visible);
+        // DECSCUSR shapes.
+        e.feed(b"\x1b[4 q");
+        assert_eq!(e.cursor_style.shape, CursorShape::Underline);
+        assert!(!e.cursor_style.blink);
+        e.feed(b"\x1b[5 q");
+        assert_eq!(e.cursor_style.shape, CursorShape::Bar);
+        assert!(e.cursor_style.blink);
+        e.feed(b"\x1b[0 q");
+        assert_eq!(e.cursor_style.shape, CursorShape::Block);
+        // A bare `q` without the space intermediate is not DECSCUSR.
+        e.feed(b"\x1b[5q");
+        assert_eq!(e.cursor_style.shape, CursorShape::Block);
+    }
+
+    #[test]
+    fn test_bracketed_paste_mode_and_wrap() {
+        let mut e = engine(20, 5);
+        assert!(!e.bracketed_paste);
+        assert_eq!(e.bracket_paste("hi"), b"hi");
+        e.feed(b"\x1b[?2004h");
+        assert!(e.bracketed_paste);
+        assert_eq!(e.bracket_paste("hi"), b"\x1b[200~hi\x1b[201~");
+        e.feed(b"\x1b[?2004l");
+        assert!(!e.bracketed_paste);
+    }
+
+    #[test]
+    fn test_autowrap_off_overwrites_last_column() {
+        let mut e = engine(4, 2);
+        e.feed(b"\x1b[?7l");
+        assert!(!e.auto_wrap);
+        e.feed(b"abcdef");
+        assert_eq!(cell(&e, 0, 3).character, 'f');
+        assert_eq!(e.term.cursor_row, 0);
+        e.feed(b"\x1b[?7h");
+        assert!(e.auto_wrap);
+    }
+
+    #[test]
+    fn test_mouse_mode_tracking() {
+        let mut e = engine(20, 5);
+        assert!(!e.mouse_mode.report);
+        e.feed(b"\x1b[?1000h\x1b[?1006h");
+        assert!(e.mouse_mode.report);
+        assert!(e.mouse_mode.sgr);
+        e.feed(b"\x1b[?1000l");
+        assert!(!e.mouse_mode.report);
+    }
+
+    #[test]
+    fn test_dsr_status_and_cursor_report() {
+        let mut e = engine(80, 24);
+        e.feed(b"\x1b[5n");
+        assert_eq!(e.take_reply(), b"\x1b[0n");
+        e.feed(b"\x1b[3;7H\x1b[6n");
+        assert_eq!(e.take_reply(), b"\x1b[3;7R");
+        assert!(e.take_reply().is_empty());
+    }
+
+    #[test]
+    fn test_terminal_queries_answered() {
+        // fish's startup burst must never stall on a timeout: kitty,
+        // XTVERSION, background-color, and terminfo queries all get
+        // immediate replies.
+        let mut e = engine(80, 24);
+        e.feed(b"\x1b[?u");
+        assert_eq!(e.take_reply(), b"\x1b[?0u");
+        e.feed(b"\x1b[>0q");
+        assert_eq!(e.take_reply(), b"\x1bP>|fracterm 2.0.0\x1b\\");
+        e.feed(b"\x1b]11;?\x1b\\");
+        assert_eq!(e.take_reply(), b"\x1b]11;rgb:0b0b/0d0d/1212\x1b\\");
+        // Exact bytes of fish's first-prompt XTGETTCAP probe.
+        e.feed(b"\x1bP+q696e646e\x1b\\");
+        assert_eq!(e.take_reply(), b"\x1bP0+r\x1b\\");
+        // Sixel payloads (also `q`-final, no `+`) stay untouched.
+        e.feed(b"\x1bPq#0;2;0;0;0~-~\x1b\\");
+        assert!(e.take_reply().is_empty());
+        // A bare DECSCUSR `q` (space intermediate) still styles the cursor.
+        e.feed(b"\x1b[2 q");
+        assert_eq!(e.cursor_style.shape, CursorShape::Block);
+        assert!(e.take_reply().is_empty());
     }
 
     #[test]

@@ -153,6 +153,33 @@ impl SceneGraph {
         self.nodes.contains_key(&node_id)
     }
 
+    /// Remove every node, edge, group, and z-order entry.
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+        self.children.clear();
+        self.parents.clear();
+        self.groups.clear();
+        self.z_order.clear();
+    }
+
+    /// Replace the z-order with the given sequence: unknown ids are dropped,
+    /// nodes missing from the sequence keep their relative order at the end.
+    pub fn set_z_order(&mut self, order: Vec<NodeId>) {
+        let mut seen = std::collections::HashSet::new();
+        let mut next = Vec::with_capacity(self.z_order.len());
+        for id in order {
+            if self.nodes.contains_key(&id) && seen.insert(id) {
+                next.push(id);
+            }
+        }
+        for id in &self.z_order {
+            if seen.insert(*id) {
+                next.push(*id);
+            }
+        }
+        self.z_order = next;
+    }
+
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -243,6 +270,14 @@ impl Workspace {
         self.scene.get_groups()
     }
 
+    pub fn bring_to_front(&mut self, node_id: NodeId) {
+        self.scene.bring_to_front(node_id);
+    }
+
+    pub fn send_to_back(&mut self, node_id: NodeId) {
+        self.scene.send_to_back(node_id);
+    }
+
     pub fn is_active(&self) -> bool {
         self.active
     }
@@ -251,22 +286,53 @@ impl Workspace {
         self.active = active;
     }
 
-    /// Export workspace state as JSON for persistence
+    /// Current layout format version. v1 stored only counts for
+    /// nodes/groups ( unrestorable); v2 stores the full scene.
+    pub const LAYOUT_VERSION: u64 = 2;
+
+    /// Export workspace state as JSON for persistence (v2): camera +
+    /// bookmarks, nodes in z-order, explicit z-order, groups, and
+    /// parent→child edges. Terminal *sessions* (PTY/live grid) are not
+    /// persisted — nodes restore as structure and re-spawn fresh shells.
     pub fn export_state(&self) -> serde_json::Value {
+        let nodes: Vec<&Node> = self
+            .scene
+            .z_order()
+            .iter()
+            .filter_map(|id| self.scene.get_node(*id))
+            .collect();
+        let mut edges = Vec::new();
+        for id in self.scene.node_ids() {
+            for child in self.scene.get_children(id) {
+                edges.push((id, child));
+            }
+        }
+        let groups: Vec<serde_json::Value> = self
+            .scene
+            .get_groups()
+            .into_iter()
+            .map(|(id, members)| serde_json::json!({"id": id, "members": members}))
+            .collect();
         serde_json::json!({
-            "version": 1,
+            "version": Self::LAYOUT_VERSION,
             "camera": {
                 "x": self.camera.x,
                 "y": self.camera.y,
                 "zoom": self.camera.zoom,
                 "bookmarks": self.camera.bookmarks,
+                "bookmark_slot": self.camera.bookmark_slot,
             },
-            "nodes": self.scene.node_ids().len(),
-            "groups": self.scene.get_groups().len(),
+            "nodes": nodes,
+            "z_order": self.scene.z_order(),
+            "groups": groups,
+            "children": edges,
         })
     }
 
-    /// Import workspace state from JSON
+    /// Import workspace state from JSON. v2 restores the full scene
+    /// (replacing the current one); v1 restores only the camera.
+    /// Malformed nodes/edges are skipped so one bad entry cannot sink a
+    /// whole session restore.
     pub fn import_state(
         &mut self,
         state: &serde_json::Value,
@@ -285,6 +351,7 @@ impl Workspace {
                 self.camera.target_zoom = zoom;
             }
             if let Some(bookmarks) = camera_val.get("bookmarks").and_then(|v| v.as_array()) {
+                self.camera.bookmarks.clear();
                 for bm in bookmarks {
                     if let (Some(name), Some(bx), Some(by), Some(bz)) = (
                         bm.get("name").and_then(|v| v.as_str()),
@@ -300,9 +367,97 @@ impl Workspace {
                         });
                     }
                 }
+                // Continue rotation after the highest used digit slot so a
+                // restored session does not immediately overwrite bm0.
+                // Explicitly persisted slots win over the heuristic.
+                let mut next_slot = self
+                    .camera
+                    .bookmarks
+                    .iter()
+                    .filter_map(|b| {
+                        b.name
+                            .strip_prefix("bm")
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .filter(|n| *n < 10)
+                    })
+                    .max()
+                    .map(|m| (m + 1) % 10)
+                    .unwrap_or(0);
+                if let Some(slot) = camera_val.get("bookmark_slot").and_then(|v| v.as_u64()) {
+                    next_slot = (slot as usize) % 10;
+                }
+                self.camera.bookmark_slot = next_slot;
             }
         }
+        if state.get("version").and_then(|v| v.as_u64()).unwrap_or(1) >= 2 {
+            self.import_scene(state);
+        }
         Ok(())
+    }
+
+    /// Replace the scene graph from a v2 layout value.
+    fn import_scene(&mut self, state: &serde_json::Value) {
+        self.scene.clear();
+        if let Some(nodes) = state.get("nodes").and_then(|v| v.as_array()) {
+            for raw in nodes {
+                if let Ok(node) = serde_json::from_value::<Node>(raw.clone()) {
+                    self.scene.add_node(node);
+                }
+            }
+        }
+        if let Ok(order) = serde_json::from_value::<Vec<NodeId>>(
+            state
+                .get("z_order")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        ) {
+            self.scene.set_z_order(order);
+        }
+        if let Some(groups) = state.get("groups").and_then(|v| v.as_array()) {
+            for raw in groups {
+                let id = raw
+                    .get("id")
+                    .and_then(|v| serde_json::from_value::<NodeId>(v.clone()).ok());
+                let members: Vec<NodeId> = raw
+                    .get("members")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                if let Some(id) = id {
+                    let live: Vec<NodeId> = members
+                        .into_iter()
+                        .filter(|m| self.scene.contains(*m))
+                        .collect();
+                    if !live.is_empty() {
+                        self.scene.create_group(id, live);
+                    }
+                }
+            }
+        }
+        if let Some(edges) = state.get("children").and_then(|v| v.as_array()) {
+            for raw in edges {
+                if let Ok((parent, child)) = serde_json::from_value::<(NodeId, NodeId)>(raw.clone())
+                {
+                    self.scene.add_child(parent, child);
+                }
+            }
+        }
+    }
+
+    /// Save the exported layout to a file.
+    pub fn save_to_file(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+        let text = serde_json::to_string_pretty(&self.export_state())?;
+        std::fs::write(path, text)?;
+        Ok(())
+    }
+
+    /// Load a layout file, replacing the current scene.
+    pub fn load_from_file(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let text = std::fs::read_to_string(path)?;
+        let state: serde_json::Value = serde_json::from_str(&text)?;
+        self.import_state(&state)
     }
 }
 
@@ -374,8 +529,8 @@ mod tests {
         let mut ws = Workspace::new();
         ws.add_node(Node::new(NodeId(1), 0.0, 0.0));
         let state = ws.export_state();
-        assert_eq!(state["version"], 1);
-        assert_eq!(state["nodes"], 1);
+        assert_eq!(state["version"], 2);
+        assert_eq!(state["nodes"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -389,5 +544,85 @@ mod tests {
         assert_eq!(ws2.camera().x, 100.0);
         assert_eq!(ws2.camera().y, 200.0);
         assert_eq!(ws2.camera().zoom, 2.0);
+    }
+
+    fn stocked_workspace() -> Workspace {
+        let mut ws = Workspace::new();
+        let mut a = Node::new(NodeId(1), 10.0, 20.0);
+        a.size = (640.0, 400.0);
+        let mut b = Node::new(NodeId(2), 700.0, 20.0);
+        b.input = crate::InputBehavior::new("terminal");
+        let c = Node::new(NodeId(3), 10.0, 500.0);
+        ws.add_node(a);
+        ws.add_node(b);
+        ws.add_node(c);
+        ws.bring_to_front(NodeId(1));
+        ws.create_group(NodeId(100), vec![NodeId(1), NodeId(2)]);
+        ws.scene.add_child(NodeId(1), NodeId(3));
+        ws.camera_mut().save_bookmark("bm3");
+        ws
+    }
+
+    #[test]
+    fn test_layout_round_trips_scene() {
+        let ws = stocked_workspace();
+        let state = ws.export_state();
+        let mut restored = Workspace::new();
+        assert!(restored.import_state(&state).is_ok());
+
+        assert_eq!(restored.scene.len(), 3);
+        let a = restored.get_node(NodeId(1)).unwrap();
+        assert_eq!((a.transform.x, a.transform.y), (10.0, 20.0));
+        assert_eq!(a.size, (640.0, 400.0));
+        assert_eq!(a.group_id, Some(NodeId(100)));
+        assert_eq!(restored.get_node(NodeId(2)).unwrap().input.mode, "terminal");
+        // z-order: node 1 was brought to front.
+        assert_eq!(*restored.scene.z_order().last().unwrap(), NodeId(1));
+        // groups + hierarchy.
+        assert_eq!(
+            restored.get_group_members(NodeId(100)),
+            vec![NodeId(1), NodeId(2)]
+        );
+        assert_eq!(restored.scene.get_children(NodeId(1)), vec![NodeId(3)]);
+        assert_eq!(restored.scene.get_parent(NodeId(3)), Some(NodeId(1)));
+        // bookmarks.
+        assert!(restored.camera().get_bookmark("bm3").is_some());
+    }
+
+    #[test]
+    fn test_layout_file_round_trip() {
+        let ws = stocked_workspace();
+        let path = std::env::temp_dir().join("fracterm-layout-test.json");
+        ws.save_to_file(&path).unwrap();
+        let mut restored = Workspace::new();
+        restored.load_from_file(&path).unwrap();
+        assert_eq!(restored.scene.len(), 3);
+        assert_eq!(*restored.scene.z_order().last().unwrap(), NodeId(1));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_layout_v1_imports_camera_only() {
+        let state = serde_json::json!({
+            "version": 1,
+            "camera": {"x": 5.0, "y": 6.0, "zoom": 3.0, "bookmarks": []},
+            "nodes": 4,
+            "groups": 2,
+        });
+        let mut ws = Workspace::new();
+        assert!(ws.import_state(&state).is_ok());
+        assert_eq!(ws.camera().x, 5.0);
+        assert!(ws.scene.is_empty());
+    }
+
+    #[test]
+    fn test_layout_skips_malformed_nodes() {
+        let mut state = stocked_workspace().export_state();
+        let mut nodes = state["nodes"].as_array().cloned().unwrap();
+        nodes.push(serde_json::json!({"id": "not-a-node"}));
+        state["nodes"] = serde_json::Value::Array(nodes);
+        let mut restored = Workspace::new();
+        assert!(restored.import_state(&state).is_ok());
+        assert_eq!(restored.scene.len(), 3);
     }
 }

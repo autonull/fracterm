@@ -23,6 +23,8 @@ pub struct Camera {
     pub target_y: f64,
     /// Saved camera positions
     pub bookmarks: Vec<CameraBookmark>,
+    /// Next digit slot for `save_next_bookmark` (cycles 0..10).
+    pub bookmark_slot: usize,
 }
 
 /// A saved camera position/bookmark
@@ -46,6 +48,7 @@ impl Camera {
             target_x: 0.0,
             target_y: 0.0,
             bookmarks: Vec::new(),
+            bookmark_slot: 0,
         }
     }
 
@@ -60,6 +63,7 @@ impl Camera {
             target_x: layout.x,
             target_y: layout.y,
             bookmarks: layout.bookmarks.clone(),
+            bookmark_slot: layout.bookmark_slot,
         }
     }
 
@@ -70,17 +74,33 @@ impl Camera {
             y: self.y,
             zoom: self.zoom,
             bookmarks: self.bookmarks.clone(),
+            bookmark_slot: self.bookmark_slot,
         }
     }
 
-    /// Save a camera bookmark
+    /// Save a camera bookmark, replacing any existing bookmark with the
+    /// same name instead of stacking duplicates.
     pub fn save_bookmark(&mut self, name: &str) {
-        self.bookmarks.push(CameraBookmark {
+        let bookmark = CameraBookmark {
             name: name.to_string(),
             x: self.x,
             y: self.y,
             zoom: self.zoom,
-        });
+        };
+        if let Some(existing) = self.bookmarks.iter_mut().find(|b| b.name == name) {
+            *existing = bookmark;
+        } else {
+            self.bookmarks.push(bookmark);
+        }
+    }
+
+    /// Save to the next rotating digit slot (`bm0`..`bm9`) and return its
+    /// name, so a plain `b` press is always restorable via `0`–`9`.
+    pub fn save_next_bookmark(&mut self) -> String {
+        let name = format!("bm{}", self.bookmark_slot % 10);
+        self.save_bookmark(&name);
+        self.bookmark_slot = (self.bookmark_slot + 1) % 10;
+        name
     }
 
     /// Get a bookmark by name
@@ -159,16 +179,16 @@ impl Camera {
     /// Fit the camera to a rectangle
     pub fn fit_to(&mut self, rect: Rect) {
         self.target_zoom = 1.0;
-        self.target_x = rect.x as f64;
-        self.target_y = rect.y as f64;
+        self.target_x = rect.x;
+        self.target_y = rect.y;
         self.animating = true;
     }
 
     /// Zoom to a rectangle
     pub fn zoom_to_rect(&mut self, rect: Rect, duration_ms: u64) {
         self.target_zoom = 2.0;
-        self.target_x = rect.x as f64;
-        self.target_y = rect.y as f64;
+        self.target_x = rect.x;
+        self.target_y = rect.y;
         self.animating = true;
         let _ = duration_ms;
     }
@@ -240,6 +260,8 @@ pub struct CameraLayout {
     pub y: f64,
     pub zoom: f64,
     pub bookmarks: Vec<CameraBookmark>,
+    #[serde(default)]
+    pub bookmark_slot: usize,
 }
 
 /// Camera bookmark for persistence
@@ -320,5 +342,41 @@ mod tests {
         assert!(!cam.animating);
         assert_eq!((cam.target_x, cam.target_y), (cam.x, cam.y));
         assert_eq!(cam.target_zoom, cam.zoom);
+    }
+
+    #[test]
+    fn test_save_bookmark_upserts_same_name() {
+        let mut cam = Camera::new();
+        cam.x = 1.0;
+        cam.save_bookmark("bm1");
+        cam.x = 42.0;
+        cam.save_bookmark("bm1");
+        assert_eq!(cam.bookmarks.len(), 1);
+        assert_eq!(cam.bookmarks[0].x, 42.0);
+    }
+
+    #[test]
+    fn test_save_next_bookmark_rotates_slots() {
+        let mut cam = Camera::new();
+        assert_eq!(cam.save_next_bookmark(), "bm0");
+        assert_eq!(cam.save_next_bookmark(), "bm1");
+        for _ in 2..10 {
+            cam.save_next_bookmark();
+        }
+        // Full cycle wraps back to bm0 without stacking duplicates.
+        assert_eq!(cam.save_next_bookmark(), "bm0");
+        assert_eq!(cam.bookmarks.len(), 10);
+        assert!(cam.restore_bookmark("bm0"));
+    }
+
+    #[test]
+    fn test_bookmark_slot_round_trips_layout() {
+        let mut cam = Camera::new();
+        cam.save_next_bookmark();
+        cam.save_next_bookmark();
+        let layout = cam.to_layout();
+        let restored = Camera::from_layout(&layout);
+        assert_eq!(restored.bookmark_slot, 2);
+        assert_eq!(restored.bookmarks.len(), 2);
     }
 }

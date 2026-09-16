@@ -1,7 +1,7 @@
 //! Event - typed event bus for plugin communication with throttling and permission gating.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Event types in Fracterm
@@ -94,12 +94,40 @@ impl Event {
     }
 }
 
-/// Subscription entry with optional throttling
+/// Subscription entry with optional throttling.
+/// `last_emit` uses interior mutability so `emit(&self)` — the only shape
+/// the shared `Arc<EventBus>` / `Arc<Mutex<EventBus>>` call sites allow —
+/// still records deliveries and actually rate-limits.
 struct Subscription {
     handler: Arc<dyn Fn(&Event) + Send + Sync>,
     throttle: Option<Duration>,
-    last_emit: Option<Instant>,
+    last_emit: Mutex<Option<Instant>>,
     required_permission: Option<String>,
+}
+
+impl Subscription {
+    /// Effective throttle window: the explicit per-subscription value wins,
+    /// otherwise the event type's spec default (§9.4) applies.
+    fn window(&self, event_type: &EventType) -> Option<Duration> {
+        self.throttle.or_else(|| event_type.default_throttle())
+    }
+
+    /// Returns true when the event may be delivered, recording the delivery.
+    /// A poisoned lock fails open rather than silently dropping events.
+    fn poll_throttle(&self, event_type: &EventType) -> bool {
+        let Some(window) = self.window(event_type) else {
+            return true;
+        };
+        let Ok(mut last) = self.last_emit.lock() else {
+            return true;
+        };
+        let now = Instant::now();
+        if last.is_some_and(|t| now.duration_since(t) < window) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
 }
 
 /// Typed event bus for plugin communication.
@@ -128,8 +156,12 @@ impl EventBus {
     }
 
     /// Subscribe to an event type with custom throttle interval
-    pub fn subscribe_throttled<F>(&mut self, event_type: EventType, handler: F, throttle: Option<Duration>)
-    where
+    pub fn subscribe_throttled<F>(
+        &mut self,
+        event_type: EventType,
+        handler: F,
+        throttle: Option<Duration>,
+    ) where
         F: Fn(&Event) + Send + Sync + 'static,
     {
         self.subscribers
@@ -138,14 +170,18 @@ impl EventBus {
             .push(Subscription {
                 handler: Arc::new(handler),
                 throttle,
-                last_emit: None,
+                last_emit: Mutex::new(None),
                 required_permission: None,
             });
     }
 
     /// Subscribe with permission requirement (for plugins)
-    pub fn subscribe_with_permission<F>(&mut self, event_type: EventType, handler: F, permission: &str)
-    where
+    pub fn subscribe_with_permission<F>(
+        &mut self,
+        event_type: EventType,
+        handler: F,
+        permission: &str,
+    ) where
         F: Fn(&Event) + Send + Sync + 'static,
     {
         self.subscribers
@@ -154,7 +190,7 @@ impl EventBus {
             .push(Subscription {
                 handler: Arc::new(handler),
                 throttle: None,
-                last_emit: None,
+                last_emit: Mutex::new(None),
                 required_permission: Some(permission.to_string()),
             });
     }
@@ -170,15 +206,9 @@ impl EventBus {
                     }
                 }
 
-                // Check throttling
-                if let Some(throttle) = sub.throttle {
-                    if let Some(last) = sub.last_emit {
-                        if last.elapsed() < throttle {
-                            continue;
-                        }
-                    }
-                    // Note: In a real implementation, we'd need interior mutability
-                    // For now, we skip throttling on emit and handle it externally
+                // Check throttling (per-subscription window or spec default).
+                if !sub.poll_throttle(&event.event_type) {
+                    continue;
                 }
 
                 (sub.handler)(event);
@@ -195,6 +225,10 @@ impl EventBus {
                     if !plugin_permissions.contains(req_perm) {
                         continue;
                     }
+                }
+
+                if !sub.poll_throttle(&event.event_type) {
+                    continue;
                 }
 
                 (sub.handler)(event);
@@ -214,7 +248,10 @@ impl EventBus {
 
     /// Get subscriber count for an event type
     pub fn subscriber_count(&self, event_type: &EventType) -> usize {
-        self.subscribers.get(event_type).map(|v| v.len()).unwrap_or(0)
+        self.subscribers
+            .get(event_type)
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 
     /// Clear all subscribers for an event type
@@ -227,8 +264,6 @@ impl EventBus {
         self.subscribers.clear();
     }
 }
-
-type SubscriberList = Vec<Subscription>;
 
 impl Default for EventBus {
     fn default() -> Self {
@@ -360,8 +395,7 @@ mod tests {
 
     #[test]
     fn test_event_permission() {
-        let event = Event::new(EventType::TerminalOutput)
-            .with_permission("terminal.read");
+        let event = Event::new(EventType::TerminalOutput).with_permission("terminal.read");
         assert_eq!(event.required_permission, Some("terminal.read".to_string()));
     }
 
@@ -387,5 +421,79 @@ mod tests {
         assert!(filter.matches(&event1));
         assert!(!filter.matches(&event2));
         assert!(!filter.matches(&event3));
+    }
+
+    fn counted_subscriber(bus: &mut EventBus, event_type: EventType) -> Arc<Mutex<usize>> {
+        let count = Arc::new(Mutex::new(0usize));
+        let count_clone = count.clone();
+        bus.subscribe(event_type, move |_| {
+            *count_clone.lock().unwrap() += 1;
+        });
+        count
+    }
+
+    #[test]
+    fn test_explicit_throttle_drops_rapid_emit() {
+        let mut bus = EventBus::new();
+        let count = Arc::new(Mutex::new(0usize));
+        let count_clone = count.clone();
+        bus.subscribe_throttled(
+            EventType::CommandExecuted,
+            move |_| {
+                *count_clone.lock().unwrap() += 1;
+            },
+            Some(Duration::from_millis(50)),
+        );
+
+        bus.emit(&Event::new(EventType::CommandExecuted));
+        bus.emit(&Event::new(EventType::CommandExecuted));
+        assert_eq!(*count.lock().unwrap(), 1);
+
+        std::thread::sleep(Duration::from_millis(60));
+        bus.emit(&Event::new(EventType::CommandExecuted));
+        assert_eq!(*count.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_default_throttle_applies_to_terminal_output() {
+        let mut bus = EventBus::new();
+        let count = counted_subscriber(&mut bus, EventType::TerminalOutput);
+
+        bus.emit(&Event::new(EventType::TerminalOutput));
+        bus.emit(&Event::new(EventType::TerminalOutput));
+        assert_eq!(*count.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_unthrottled_type_delivers_every_emit() {
+        let mut bus = EventBus::new();
+        let count = counted_subscriber(&mut bus, EventType::CommandExecuted);
+
+        for _ in 0..5 {
+            bus.emit(&Event::new(EventType::CommandExecuted));
+        }
+        assert_eq!(*count.lock().unwrap(), 5);
+    }
+
+    #[test]
+    fn test_emit_for_plugin_honors_throttle() {
+        let mut bus = EventBus::new();
+        let count = Arc::new(Mutex::new(0usize));
+        let count_clone = count.clone();
+        bus.subscribe_with_permission(
+            EventType::ZoomChanged,
+            move |_| {
+                *count_clone.lock().unwrap() += 1;
+            },
+            "workspace.read",
+        );
+        let perms = vec!["workspace.read".to_string()];
+        // ZoomChanged defaults to a 50ms window: rapid second emit drops.
+        bus.emit_for_plugin(&Event::new(EventType::ZoomChanged), &perms);
+        bus.emit_for_plugin(&Event::new(EventType::ZoomChanged), &perms);
+        assert_eq!(*count.lock().unwrap(), 1);
+        // Unpermitted plugins receive nothing.
+        bus.emit_for_plugin(&Event::new(EventType::ZoomChanged), &[]);
+        assert_eq!(*count.lock().unwrap(), 1);
     }
 }

@@ -147,6 +147,8 @@ impl CommandInputSchema {
                 return Err(format!("Missing required parameter: {}", name));
             }
             if let Some(value) = input.get(name) {
+                check_param_type(&param.param_type, value)
+                    .map_err(|e| format!("Invalid type for {name}: {e}"))?;
                 if let Some(enum_values) = &param.enum_values {
                     if let CommandValue::String(s) = value {
                         if !enum_values.contains(s) {
@@ -176,6 +178,38 @@ impl CommandInputSchema {
 impl Default for CommandInputSchema {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Check a value against the schema's declared type name (`string`,
+/// `number`, `boolean`/`bool`, `array`, `object`, `any`). Unknown type
+/// names are accepted: the schema cannot judge what it does not know.
+fn check_param_type(expected: &str, value: &CommandValue) -> Result<(), String> {
+    let ok = match expected {
+        "string" => matches!(value, CommandValue::String(_)),
+        "number" => matches!(value, CommandValue::Number(_)),
+        "boolean" | "bool" => matches!(value, CommandValue::Bool(_)),
+        "array" => matches!(value, CommandValue::Array(_)),
+        "object" => matches!(value, CommandValue::Object(_)),
+        "any" => true,
+        _ => return Ok(()),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("expected {expected}, got {}", kind_of(value)))
+    }
+}
+
+/// Short kind name for a value, used in type-mismatch errors.
+fn kind_of(value: &CommandValue) -> &'static str {
+    match value {
+        CommandValue::String(_) => "string",
+        CommandValue::Number(_) => "number",
+        CommandValue::Bool(_) => "boolean",
+        CommandValue::Array(_) => "array",
+        CommandValue::Object(_) => "object",
+        CommandValue::Null => "null",
     }
 }
 
@@ -230,6 +264,13 @@ impl CommandResult {
     }
 }
 
+/// Handler invoked when a command executes.
+pub type CommandHandler = Arc<
+    dyn Fn(CommandContext, HashMap<String, CommandValue>) -> Result<CommandResult, String>
+        + Send
+        + Sync,
+>;
+
 /// A command that can be invoked from palette, keybindings, plugins, HUD, tests, CLI.
 pub struct Command {
     pub id: CommandId,
@@ -239,7 +280,7 @@ pub struct Command {
     pub input_schema: CommandInputSchema,
     pub enabled: bool,
     pub source: Option<String>,
-    handler: Arc<dyn Fn(CommandContext, HashMap<String, CommandValue>) -> Result<CommandResult, String> + Send + Sync>,
+    handler: CommandHandler,
 }
 
 impl std::fmt::Debug for Command {
@@ -262,7 +303,10 @@ impl Command {
         command_id: &str,
         title: &str,
         category: &str,
-        handler: impl Fn(CommandContext, HashMap<String, CommandValue>) -> Result<CommandResult, String> + Send + Sync + 'static,
+        handler: impl Fn(CommandContext, HashMap<String, CommandValue>) -> Result<CommandResult, String>
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
         Self {
             id,
@@ -286,7 +330,11 @@ impl Command {
         self
     }
 
-    pub fn execute(&self, ctx: CommandContext, input: HashMap<String, CommandValue>) -> Result<CommandResult, String> {
+    pub fn execute(
+        &self,
+        ctx: CommandContext,
+        input: HashMap<String, CommandValue>,
+    ) -> Result<CommandResult, String> {
         let mut input = input;
         self.input_schema.apply_defaults(&mut input);
         self.input_schema.validate(&input)?;
@@ -363,8 +411,16 @@ impl CommandRegistry {
         self.commands.get_mut(command_id)
     }
 
-    pub fn execute(&self, command_id: &str, ctx: CommandContext, input: HashMap<String, CommandValue>) -> Result<CommandResult, String> {
-        let command = self.commands.get(command_id).ok_or_else(|| format!("Command not found: {}", command_id))?;
+    pub fn execute(
+        &self,
+        command_id: &str,
+        ctx: CommandContext,
+        input: HashMap<String, CommandValue>,
+    ) -> Result<CommandResult, String> {
+        let command = self
+            .commands
+            .get(command_id)
+            .ok_or_else(|| format!("Command not found: {}", command_id))?;
         if !command.is_enabled() {
             return Err(format!("Command disabled: {}", command_id));
         }
@@ -376,7 +432,10 @@ impl CommandRegistry {
     }
 
     pub fn list_by_category(&self, category: &str) -> Vec<&Command> {
-        self.commands.values().filter(|c| c.category == category).collect()
+        self.commands
+            .values()
+            .filter(|c| c.category == category)
+            .collect()
     }
 
     pub fn add_keybinding(&mut self, binding: KeyBinding) {
@@ -385,12 +444,15 @@ impl CommandRegistry {
 
     pub fn remove_keybinding(&mut self, key: &str, when: Option<&str>) -> bool {
         let len = self.keybindings.len();
-        self.keybindings.retain(|b| b.key != key || b.when.as_deref() != when);
+        self.keybindings
+            .retain(|b| b.key != key || b.when.as_deref() != when);
         self.keybindings.len() != len
     }
 
     pub fn find_keybinding(&self, key: &str, when: Option<&str>) -> Option<&KeyBinding> {
-        self.keybindings.iter().find(|b| b.key == key && b.when.as_deref() == when)
+        self.keybindings
+            .iter()
+            .find(|b| b.key == key && b.when.as_deref() == when)
     }
 
     pub fn keybindings(&self) -> &[KeyBinding] {
@@ -406,11 +468,21 @@ impl Default for CommandRegistry {
 
 /// Plugin host trait for command execution context
 pub trait PluginHost: Send + Sync {
-    fn execute_command(&self, plugin_id: &str, command: &str, args: serde_json::Value) -> Result<serde_json::Value, String>;
+    fn execute_command(
+        &self,
+        plugin_id: &str,
+        command: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String>;
 }
 
 impl PluginHost for () {
-    fn execute_command(&self, _plugin_id: &str, _command: &str, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+    fn execute_command(
+        &self,
+        _plugin_id: &str,
+        _command: &str,
+        _args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         Err("No plugin host available".to_string())
     }
 }
@@ -422,19 +494,17 @@ mod tests {
     #[test]
     fn test_command_registration_and_execution() {
         let mut registry = CommandRegistry::new();
-        let cmd = Command::new(
-            CommandId(1),
-            "test.echo",
-            "Echo",
-            "Test",
-            |_ctx, input| {
-                let msg = input.get("message").and_then(|v| v.as_string()).unwrap_or("");
-                Ok(CommandResult::ok(msg.to_string()))
-            },
-        ).with_input(
+        let cmd = Command::new(CommandId(1), "test.echo", "Echo", "Test", |_ctx, input| {
+            let msg = input
+                .get("message")
+                .and_then(|v| v.as_string())
+                .unwrap_or("");
+            Ok(CommandResult::ok(msg.to_string()))
+        })
+        .with_input(
             CommandInputSchema::new()
                 .add_param("message", "string", false)
-                .with_description("message", "Message to echo")
+                .with_description("message", "Message to echo"),
         );
         registry.register(cmd);
 
@@ -459,13 +529,12 @@ mod tests {
             "test.required",
             "Required Param",
             "Test",
-            |_ctx, input| {
-                Ok(CommandResult::ok(input.get("required").unwrap().clone()))
-            },
-        ).with_input(
+            |_ctx, input| Ok(CommandResult::ok(input.get("required").unwrap().clone())),
+        )
+        .with_input(
             CommandInputSchema::new()
                 .add_param("required", "string", false)
-                .add_param("optional", "string", true)
+                .add_param("optional", "string", true),
         );
         registry.register(cmd);
 
@@ -488,6 +557,38 @@ mod tests {
     }
 
     #[test]
+    fn test_command_type_validation() {
+        let schema = CommandInputSchema::new()
+            .add_param("count", "number", false)
+            .add_param("label", "string", true)
+            .add_param("flag", "boolean", true);
+
+        let mut good = HashMap::new();
+        good.insert("count".to_string(), CommandValue::Number(3.0));
+        good.insert("label".to_string(), "x".into());
+        good.insert("flag".to_string(), CommandValue::Bool(true));
+        assert!(schema.validate(&good).is_ok());
+
+        let mut wrong = HashMap::new();
+        wrong.insert("count".to_string(), "three".into());
+        let err = schema.validate(&wrong).unwrap_err();
+        assert!(err.contains("count") && err.contains("number"));
+
+        // Optional params may be omitted entirely.
+        let mut minimal = HashMap::new();
+        minimal.insert("count".to_string(), CommandValue::Number(1.0));
+        assert!(schema.validate(&minimal).is_ok());
+    }
+
+    #[test]
+    fn test_command_unknown_type_is_lenient() {
+        let schema = CommandInputSchema::new().add_param("custom", "some-future-type", false);
+        let mut input = HashMap::new();
+        input.insert("custom".to_string(), "anything".into());
+        assert!(schema.validate(&input).is_ok());
+    }
+
+    #[test]
     fn test_keybindings() {
         let mut registry = CommandRegistry::new();
         registry.add_keybinding(KeyBinding {
@@ -503,8 +604,18 @@ mod tests {
             args: HashMap::new(),
         });
 
-        assert_eq!(registry.find_keybinding("Ctrl+N", Some("workspace")).map(|b| b.command.as_str()), Some("terminal.new"));
-        assert_eq!(registry.find_keybinding("Ctrl+N", Some("terminal")).map(|b| b.command.as_str()), Some("terminal.split"));
+        assert_eq!(
+            registry
+                .find_keybinding("Ctrl+N", Some("workspace"))
+                .map(|b| b.command.as_str()),
+            Some("terminal.new")
+        );
+        assert_eq!(
+            registry
+                .find_keybinding("Ctrl+N", Some("terminal"))
+                .map(|b| b.command.as_str()),
+            Some("terminal.split")
+        );
         assert_eq!(registry.find_keybinding("Ctrl+N", None), None);
     }
 }

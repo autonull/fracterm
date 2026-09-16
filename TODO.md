@@ -7,7 +7,7 @@ regression guardrails this plan must respect are in Development Guardrails
 below. Prefer finishing a phase before starting the next. Unfinished items
 carry forward in-place, so this file is always the single resume point.
 
-**Current state (2026-09-16): all gates green** — `cargo build`, 142 tests
+**Current state (2026-09-16): all gates green** — `cargo build`, 147 tests
 passing, `cargo clippy --all-targets -- -D warnings` clean,
 `cargo fmt --check` clean. Fish startup fixed (~1s prompt via terminal-query
 replies); caret/title/modes live-verified on :0. Binary runs on-display (X :0, 1280x720 Luscombe);
@@ -124,8 +124,19 @@ target AND `animating=false`; ANIMATED moves set target AND
       (live: fish `~ - fish` title appears; falls back to `fracterm`).
 - [ ] Line wrapping edge cases; resize propagation verify (`echo $COLUMNS`
       after handle-resize).
-- [ ] Mouse event forwarding to the child (mode tracked, forwarding pending);
-      bracketed-paste wrapping helper exists, clipboard/middle-click paste
+- [x] Mouse event forwarding to the child (session 2026-09-16):
+  - [x] Per-mode tracking (`?1000` clicks, `?1002` drags, `?1003` bare
+        motion; SGR `?1006` flag) via `MouseMode::set_mode`.
+  - [x] `MouseMode::encode`: SGR (`ESC[<Cb;Cx;Cy M/m`, 1-based) and legacy
+        X10 (`ESC[M` +32, clamped to 255) with shift/alt/ctrl/motion bits;
+        `wants` gates press/release/wheel/motion per mode.
+  - [x] Window wiring: unshifted press on a reporting terminal goes to its
+        PTY (focus + select follow, `forwarding` owns the mouse until left
+        release); drag motion reports under 1002/1003; release report ends
+        it. Shift-click forces host select/move; resize handle always wins.
+  - [ ] Wheel still zooms (host nav); forwarding wheel to the child (e.g.
+        vim/less scroll) is a follow-up needing a scroll-vs-zoom decision.
+- [ ] Bracketed-paste wrapping helper exists, clipboard/middle-click paste
       path pending.
 - [ ] OSC 8 hyperlinks, OSC 52 clipboard (permission-gated).
 - [ ] Unicode: graphemes, emoji, Nerd Fonts, ambiguous-width config (wide
@@ -141,6 +152,8 @@ target AND `animating=false`; ANIMATED moves set target AND
 - [x] `Return`/Ctrl+chords execute (verified `echo` round-trips repeatedly).
 - [ ] Move-drag follows cursor (diff screenshots); drag corner → node grows,
       new columns appear; click empty canvas → border clears.
+- [ ] Mouse forward live: `vim` click-moves cursor, tmux selects pane,
+      drag reports under `?1002`, Shift-click still moves the node.
 - [ ] Post-resize SIGWINCH: handle-resize then `echo $COLUMNS`.
 - [ ] Side-by-side (non-wrap) `n`-spawn on a wider viewport.
 

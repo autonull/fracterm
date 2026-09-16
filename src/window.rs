@@ -104,6 +104,17 @@ struct CanvasState {
     last_cursor: (f64, f64),
     /// Current physical viewport size
     viewport_size: (f32, f32),
+    /// Terminal child currently owning the mouse (xterm 1000+ active and
+    /// the press had no Shift): motion/release go to its PTY, not to
+    /// canvas drags. Cleared on left release.
+    forwarding: Option<ForwardMouse>,
+}
+
+/// A terminal child that owns the mouse until left-button release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ForwardMouse {
+    surface: SurfaceId,
+    button: crate::vt::MouseButton,
 }
 
 impl CanvasState {
@@ -139,6 +150,7 @@ impl CanvasState {
             drag: DragState::None,
             last_cursor: (0.0, 0.0),
             viewport_size: (1280.0, 720.0),
+            forwarding: None,
         }
     }
 
@@ -225,6 +237,36 @@ impl CanvasState {
             }
         }
         None
+    }
+
+    /// Write bytes to one session's PTY (mouse reports, query replies).
+    fn write_to_surface(&mut self, surface: SurfaceId, bytes: &[u8]) {
+        if let Some(sess) = self.terms.iter().find(|s| s.surface == surface) {
+            let _ = sess.pty.write(bytes);
+        }
+    }
+
+    /// Screen px -> clamped 0-based terminal cell for session `idx`.
+    /// Returns `None` only when the session or its node is gone.
+    fn mouse_cell_for(&self, idx: usize, sx: f64, sy: f64) -> Option<(u32, u32)> {
+        let sess = self.terms.get(idx)?;
+        let node = self.app.state.workspace.get_node(sess.node)?;
+        let cam = self.app.state.workspace.camera();
+        Some(screen_to_cell(
+            sx,
+            sy,
+            cam.x,
+            cam.y,
+            cam.zoom,
+            node.transform.x,
+            node.transform.y,
+            GRID_PAD_X,
+            self.header_h(),
+            self.grid_cell.0,
+            self.grid_cell.1,
+            sess.engine.term.grid.cols,
+            sess.engine.term.grid.rows,
+        ))
     }
 
     /// Apply an arrange function's placements to the workspace nodes.
@@ -932,6 +974,37 @@ impl ApplicationHandler for CanvasState {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let new_cursor = (position.x, position.y);
+                // A terminal child owning the mouse gets motion reports
+                // (1002/1003 drag encoding), never canvas drags.
+                if let Some(fwd) = self.forwarding {
+                    let pending = self
+                        .terms
+                        .iter()
+                        .position(|s| s.surface == fwd.surface)
+                        .and_then(|i| {
+                            let (col, row) = self.mouse_cell_for(i, new_cursor.0, new_cursor.1)?;
+                            let st = self.modifiers.state();
+                            self.terms[i]
+                                .engine
+                                .mouse_mode
+                                .encode(&crate::vt::MouseReport {
+                                    button: fwd.button,
+                                    col,
+                                    row,
+                                    shift: st.shift_key(),
+                                    alt: st.alt_key(),
+                                    ctrl: st.control_key(),
+                                    release: false,
+                                    motion: true,
+                                    dragging: true,
+                                })
+                        });
+                    if let Some(bytes) = pending {
+                        self.write_to_surface(fwd.surface, &bytes);
+                    }
+                    self.last_cursor = new_cursor;
+                    return;
+                }
                 let cam = self.app.state.workspace.camera().clone();
                 let zoom = cam.zoom;
                 match self.drag {
@@ -1066,6 +1139,57 @@ impl ApplicationHandler for CanvasState {
                                 n.transform.y,
                             )
                         });
+                        // Child mouse forwarding (xterm 1000+): an unshifted
+                        // press on a reporting terminal goes to its PTY
+                        // instead of starting a Move-drag. Shift forces host
+                        // behavior; the resize handle (checked above) wins.
+                        let forward_press: Option<(crate::NodeId, SurfaceId, Vec<u8>)> =
+                            if self.modifiers.state().shift_key() {
+                                None
+                            } else if let Some((id, Some(surface), mode, _, _)) = &hit {
+                                if mode.as_str() != "terminal" {
+                                    None
+                                } else {
+                                    self.terms
+                                        .iter()
+                                        .position(|s| s.surface == *surface)
+                                        .and_then(|i| {
+                                            let (col, row) = self.mouse_cell_for(
+                                                i,
+                                                self.last_cursor.0,
+                                                self.last_cursor.1,
+                                            )?;
+                                            let st = self.modifiers.state();
+                                            let bytes = self.terms[i].engine.mouse_mode.encode(
+                                                &crate::vt::MouseReport {
+                                                    button: crate::vt::MouseButton::Left,
+                                                    col,
+                                                    row,
+                                                    shift: false,
+                                                    alt: st.alt_key(),
+                                                    ctrl: st.control_key(),
+                                                    release: false,
+                                                    motion: false,
+                                                    dragging: false,
+                                                },
+                                            )?;
+                                            Some((*id, *surface, bytes))
+                                        })
+                                }
+                            } else {
+                                None
+                            };
+                        if let Some((id, surface, bytes)) = forward_press {
+                            self.write_to_surface(surface, &bytes);
+                            self.selected = Some(id);
+                            self.focused_term = Some(surface);
+                            self.term_focus = true;
+                            self.forwarding = Some(ForwardMouse {
+                                surface,
+                                button: crate::vt::MouseButton::Left,
+                            });
+                            return;
+                        }
                         match hit {
                             Some((id, surface, mode, nx, ny)) => {
                                 self.selected = Some(id);
@@ -1095,8 +1219,40 @@ impl ApplicationHandler for CanvasState {
                         }
                     }
                 }
-                (ElementState::Released, MouseButton::Left)
-                | (ElementState::Released, MouseButton::Middle) => {
+                (ElementState::Released, MouseButton::Left) => {
+                    // End child mouse ownership with a release report.
+                    if let Some(fwd) = self.forwarding {
+                        let pending = self
+                            .terms
+                            .iter()
+                            .position(|s| s.surface == fwd.surface)
+                            .and_then(|i| {
+                                let (col, row) =
+                                    self.mouse_cell_for(i, self.last_cursor.0, self.last_cursor.1)?;
+                                let st = self.modifiers.state();
+                                self.terms[i]
+                                    .engine
+                                    .mouse_mode
+                                    .encode(&crate::vt::MouseReport {
+                                        button: fwd.button,
+                                        col,
+                                        row,
+                                        shift: st.shift_key(),
+                                        alt: st.alt_key(),
+                                        ctrl: st.control_key(),
+                                        release: true,
+                                        motion: false,
+                                        dragging: false,
+                                    })
+                            });
+                        if let Some(bytes) = pending {
+                            self.write_to_surface(fwd.surface, &bytes);
+                        }
+                        self.forwarding = None;
+                    }
+                    self.drag = DragState::None;
+                }
+                (ElementState::Released, MouseButton::Middle) => {
                     self.drag = DragState::None;
                 }
                 _ => {}
@@ -1292,6 +1448,35 @@ impl ApplicationHandler for CanvasState {
     }
 }
 
+/// Screen px -> 0-based terminal cell, clamped into the grid (clicks on
+/// padding/header report the edge cell). Pure: unit-tested.
+#[allow(clippy::too_many_arguments)]
+fn screen_to_cell(
+    sx: f64,
+    sy: f64,
+    cam_x: f64,
+    cam_y: f64,
+    zoom: f64,
+    node_x: f64,
+    node_y: f64,
+    pad_x: f64,
+    header_h: f64,
+    cell_w: f64,
+    line_h: f64,
+    cols: u32,
+    rows: u32,
+) -> (u32, u32) {
+    let zoom = zoom.max(0.05);
+    let gx = (cam_x + sx / zoom) - node_x - pad_x;
+    let gy = (cam_y + sy / zoom) - node_y - header_h;
+    let col = (gx / cell_w.max(1.0)).floor().max(0.0) as u32;
+    let row = (gy / line_h.max(1.0)).floor().max(0.0) as u32;
+    (
+        col.min(cols.saturating_sub(1)),
+        row.min(rows.saturating_sub(1)),
+    )
+}
+
 /// Ctrl+key -> ASCII control code (Ctrl+C = 0x03). Pure: unit-tested.
 fn control_code(ch: char) -> Option<u8> {
     if ch.is_ascii_alphabetic() {
@@ -1392,5 +1577,26 @@ mod tests {
         assert_eq!(engine.term.grid.get(0, 1).unwrap().character, 'i');
         let enter = named_key_sequence(&Key::Named(NamedKey::Enter)).unwrap();
         assert_eq!(enter, b"\r");
+    }
+
+    #[test]
+    fn test_screen_to_cell_clamps_into_grid() {
+        // Node at origin, camera at origin zoom 1, 9px cells, 8px pad,
+        // 38px header, 80x24 grid.
+        let cell = |sx: f64, sy: f64| {
+            screen_to_cell(
+                sx, sy, 0.0, 0.0, 1.0, 0.0, 0.0, 8.0, 38.0, 9.0, 18.0, 80, 24,
+            )
+        };
+        assert_eq!(cell(8.0, 38.0), (0, 0));
+        assert_eq!(cell(17.0, 56.0), (1, 1));
+        // Padding/header clamp to the edge cell; far points to the last.
+        assert_eq!(cell(0.0, 0.0), (0, 0));
+        assert_eq!(cell(5000.0, 5000.0), (79, 23));
+        // Camera offset shifts the mapping.
+        let shifted = screen_to_cell(
+            8.0, 38.0, 90.0, 0.0, 1.0, 0.0, 0.0, 8.0, 38.0, 9.0, 18.0, 80, 24,
+        );
+        assert_eq!(shifted, (10, 0));
     }
 }

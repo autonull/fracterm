@@ -90,8 +90,9 @@ impl CursorStyle {
 }
 
 /// Mouse reporting modes requested by the child (xterm 1000/1002/1003 +
-/// SGR 1006). Tracked so the host can forward events; forwarding itself
-/// is still pending (TODO P3).
+/// SGR 1006). 1000 = clicks, 1002 = +button drags, 1003 = +bare motion.
+/// The host forwards events via [`MouseMode::encode`]; Shift-click bypasses
+/// forwarding so window management stays reachable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MouseMode {
     /// Any of 1000/1002/1003 active: clicks (and maybe drags/motion) go to
@@ -99,6 +100,156 @@ pub struct MouseMode {
     pub report: bool,
     /// SGR (1006) extended coordinates; otherwise legacy X10 encoding.
     pub sgr: bool,
+    /// Button-drag motion wanted (1002, or implied by 1003).
+    pub drag: bool,
+    /// Bare (no-button) motion wanted (1003).
+    pub any_motion: bool,
+    p1000: bool,
+    p1002: bool,
+    p1003: bool,
+}
+
+impl MouseMode {
+    fn recompute(&mut self) {
+        self.report = self.p1000 || self.p1002 || self.p1003;
+        self.drag = self.p1002 || self.p1003;
+        self.any_motion = self.p1003;
+    }
+
+    /// Record a DECSET (`CSI ? Pm h`) / DECRST (`CSI ? Pm l`) mouse mode.
+    /// Unknown modes are ignored; other DEC modes are handled elsewhere.
+    pub fn set_mode(&mut self, mode: u16, set: bool) {
+        match mode {
+            1000 => self.p1000 = set,
+            1002 => self.p1002 = set,
+            1003 => self.p1003 = set,
+            _ => return,
+        }
+        self.recompute();
+    }
+
+    /// Whether this event reaches the child. Presses, releases, and wheel
+    /// go whenever reporting is on; motion needs 1002 (dragging) or 1003.
+    pub fn wants(&self, report: &MouseReport) -> bool {
+        if !self.report {
+            return false;
+        }
+        match report.button {
+            MouseButton::WheelUp | MouseButton::WheelDown => true,
+            _ if report.release => true,
+            _ if report.motion => {
+                if report.dragging {
+                    self.drag
+                } else {
+                    self.any_motion
+                }
+            }
+            _ => true,
+        }
+    }
+
+    /// Encode a mouse event for the child (`None` when [`wants`] is false):
+    /// SGR (`CSI < Cb ; Cx ; Cy M/m`, 1-based cells) with ?1006, otherwise
+    /// legacy X10 (`ESC [ M Cb Cx Cy`, +32 offsets clamped to 255).
+    pub fn encode(&self, report: &MouseReport) -> Option<Vec<u8>> {
+        if !self.wants(report) {
+            return None;
+        }
+        let mut cb: u32 = match report.button {
+            MouseButton::Left => {
+                if report.release {
+                    3
+                } else {
+                    0
+                }
+            }
+            MouseButton::Middle => {
+                if report.release {
+                    3
+                } else {
+                    1
+                }
+            }
+            MouseButton::Right => {
+                if report.release {
+                    3
+                } else {
+                    2
+                }
+            }
+            MouseButton::WheelUp => 64,
+            MouseButton::WheelDown => 65,
+        };
+        if report.shift {
+            cb += 4;
+        }
+        if report.alt {
+            cb += 8;
+        }
+        if report.ctrl {
+            cb += 16;
+        }
+        if report.motion {
+            cb += 32;
+        }
+        if self.sgr {
+            let kind = if report.release { 'm' } else { 'M' };
+            Some(format!("\x1b[<{cb};{};{}{kind}", report.col + 1, report.row + 1).into_bytes())
+        } else {
+            let byte = |v: u32| v.min(223) as u8 + 32;
+            Some(vec![
+                0x1b,
+                b'[',
+                b'M',
+                byte(cb),
+                byte(report.col + 1),
+                byte(report.row + 1),
+            ])
+        }
+    }
+}
+
+/// Which button a forwarded mouse event concerns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+}
+
+/// One host-side mouse event, with 0-based cell coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseReport {
+    pub button: MouseButton,
+    pub col: u32,
+    pub row: u32,
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+    /// Button release (wheel ignores this: it has no release).
+    pub release: bool,
+    /// Motion event; `dragging` says a button is held.
+    pub motion: bool,
+    pub dragging: bool,
+}
+
+impl MouseReport {
+    /// Button press without modifiers.
+    pub fn press(button: MouseButton, col: u32, row: u32) -> Self {
+        Self {
+            button,
+            col,
+            row,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            release: false,
+            motion: false,
+            dragging: false,
+        }
+    }
 }
 
 /// `vte::Perform` implementation driving a [`Terminal`] grid.
@@ -471,7 +622,7 @@ impl vte::Perform for VtEngine {
                             25 => self.cursor_visible = set,
                             1049 => self.set_alt_screen(set),
                             2004 => self.bracketed_paste = set,
-                            1000 | 1002 | 1003 => self.mouse_mode.report = set,
+                            1000 | 1002 | 1003 => self.mouse_mode.set_mode(mode, set),
                             1006 => self.mouse_mode.sgr = set,
                             _ => {}
                         }
@@ -756,8 +907,93 @@ mod tests {
         e.feed(b"\x1b[?1000h\x1b[?1006h");
         assert!(e.mouse_mode.report);
         assert!(e.mouse_mode.sgr);
-        e.feed(b"\x1b[?1000l");
+        assert!(!e.mouse_mode.drag);
+        e.feed(b"\x1b[?1002h");
+        assert!(e.mouse_mode.drag);
+        assert!(!e.mouse_mode.any_motion);
+        e.feed(b"\x1b[?1002l\x1b[?1000l");
         assert!(!e.mouse_mode.report);
+        // 1003 implies drag; resetting 1003 clears both.
+        e.feed(b"\x1b[?1003h");
+        assert!(e.mouse_mode.report && e.mouse_mode.drag && e.mouse_mode.any_motion);
+        e.feed(b"\x1b[?1003l");
+        assert!(!e.mouse_mode.report && !e.mouse_mode.drag);
+    }
+
+    fn sgr_mouse() -> MouseMode {
+        let mut m = MouseMode::default();
+        m.set_mode(1000, true);
+        m.set_mode(1006, false);
+        m.sgr = true;
+        m
+    }
+
+    #[test]
+    fn test_mouse_sgr_press_release_wheel() {
+        let m = sgr_mouse();
+        assert_eq!(
+            m.encode(&MouseReport::press(MouseButton::Left, 4, 9)),
+            Some(b"\x1b[<0;5;10M".to_vec())
+        );
+        let mut rel = MouseReport::press(MouseButton::Left, 4, 9);
+        rel.release = true;
+        assert_eq!(m.encode(&rel), Some(b"\x1b[<3;5;10m".to_vec()));
+        assert_eq!(
+            m.encode(&MouseReport::press(MouseButton::WheelUp, 0, 0)),
+            Some(b"\x1b[<64;1;1M".to_vec())
+        );
+        assert_eq!(
+            m.encode(&MouseReport::press(MouseButton::Right, 79, 23)),
+            Some(b"\x1b[<2;80;24M".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_mouse_modifiers_and_motion_bits() {
+        let mut m = sgr_mouse();
+        m.set_mode(1002, true);
+        let mut r = MouseReport::press(MouseButton::Left, 0, 0);
+        r.shift = true;
+        r.ctrl = true;
+        assert_eq!(m.encode(&r), Some(b"\x1b[<20;1;1M".to_vec()));
+        // Drag motion adds 32 and needs 1002.
+        let drag = MouseReport {
+            motion: true,
+            dragging: true,
+            ..MouseReport::press(MouseButton::Left, 1, 1)
+        };
+        assert_eq!(m.encode(&drag), Some(b"\x1b[<32;2;2M".to_vec()));
+        // Bare hover needs 1003.
+        let hover = MouseReport {
+            motion: true,
+            dragging: false,
+            ..MouseReport::press(MouseButton::Left, 1, 1)
+        };
+        assert_eq!(m.encode(&hover), None);
+        m.set_mode(1003, true);
+        assert_eq!(m.encode(&hover), Some(b"\x1b[<32;2;2M".to_vec()));
+    }
+
+    #[test]
+    fn test_mouse_gated_when_reporting_off() {
+        let m = MouseMode::default();
+        assert_eq!(m.encode(&MouseReport::press(MouseButton::Left, 0, 0)), None);
+    }
+
+    #[test]
+    fn test_mouse_legacy_x10_clamps() {
+        let mut m = MouseMode::default();
+        m.set_mode(1000, true);
+        assert!(!m.sgr);
+        assert_eq!(
+            m.encode(&MouseReport::press(MouseButton::Left, 0, 0)),
+            Some(vec![0x1b, b'[', b'M', 32, 33, 33])
+        );
+        // Far coordinates saturate at 255 instead of wrapping.
+        assert_eq!(
+            m.encode(&MouseReport::press(MouseButton::Left, 300, 300)),
+            Some(vec![0x1b, b'[', b'M', 32, 255, 255])
+        );
     }
 
     #[test]

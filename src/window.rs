@@ -482,6 +482,73 @@ impl CanvasState {
         self.terms.iter_mut().find(|s| s.surface == id)
     }
 
+    /// Close a terminal node: drop its PTY session (the child sees SIGHUP),
+    /// remove the node, and clear every reference to both. Returns false
+    /// when `node_id` has no live session.
+    fn close_terminal_node(&mut self, node_id: crate::NodeId) -> bool {
+        let Some(pos) = self.terms.iter().position(|s| s.node == node_id) else {
+            return false;
+        };
+        let sess = self.terms.remove(pos);
+        self.app.state.workspace.remove_node(node_id);
+        if self.selected == Some(node_id) {
+            self.selected = None;
+        }
+        if self.focused_term == Some(sess.surface) {
+            self.focused_term = None;
+            self.term_focus = false;
+        }
+        if self.forwarding.map(|f| f.surface) == Some(sess.surface) {
+            self.forwarding = None;
+        }
+        true
+    }
+
+    /// Close the selected node: full session close for terminals, plain
+    /// node removal for projections/widgets. Returns false with nothing
+    /// selected.
+    fn close_selected(&mut self) -> bool {
+        let Some(id) = self.selected else {
+            return false;
+        };
+        if self.close_terminal_node(id) {
+            return true;
+        }
+        self.app.state.workspace.remove_node(id);
+        self.selected = None;
+        true
+    }
+
+    /// Resize a terminal node to an exact grid: node size follows from
+    /// measured cells, then grid + PTY follow via SIGWINCH. Clamped 2..=256
+    /// like drag resize. Returns false when `node_id` has no live session.
+    fn resize_terminal_grid(&mut self, node_id: crate::NodeId, cols: u32, rows: u32) -> bool {
+        if !self.terms.iter().any(|s| s.node == node_id) {
+            return false;
+        }
+        let (cols, rows) = (cols.clamp(2, 256), rows.clamp(2, 256));
+        let (w, h) = self.terminal_node_size(cols, rows);
+        if let Some(node) = self.app.state.workspace.get_node_mut(node_id) {
+            node.size = (w, h);
+        }
+        self.sync_session_grid(node_id);
+        true
+    }
+
+    /// Step the selected terminal's grid by whole cells (border/menu grid
+    /// control without pixel dragging). Returns false with no session.
+    fn step_selected_grid(&mut self, dcols: i32, drows: i32) -> bool {
+        let Some(id) = self.selected else {
+            return false;
+        };
+        let Some(sess) = self.terms.iter().find(|s| s.node == id) else {
+            return false;
+        };
+        let cols = (sess.engine.term.grid.cols as i32 + dcols).clamp(2, 256) as u32;
+        let rows = (sess.engine.term.grid.rows as i32 + drows).clamp(2, 256) as u32;
+        self.resize_terminal_grid(id, cols, rows)
+    }
+
     fn draw_frame(&mut self) {
         let (Some(surface), Some(context), Some(gl)) =
             (&self.gl_surface, &self.gl_context, &self.gl)
@@ -591,6 +658,7 @@ impl CanvasState {
             }
             // Resize handle: filled accent square at the selected node's
             // bottom-right corner, 12 screen px in world units.
+            // Close button: same size at the top-right corner.
             if let Some(sel) = selected {
                 if let Some(node) = self.app.state.workspace.get_node(sel) {
                     let handle = 12.0 / cam.zoom.max(0.05);
@@ -602,6 +670,9 @@ impl CanvasState {
                         handle,
                         (0.35, 0.7, 1.0, 1.0),
                     );
+                    let (cx, cy, cs, _) =
+                        close_button_rect(node.transform.x, node.transform.y, w, cam.zoom);
+                    renderer.push_overlay_rect(cx, cy, cs, cs, (0.9, 0.35, 0.35, 1.0));
                 }
             }
 
@@ -1143,6 +1214,17 @@ impl ApplicationHandler for CanvasState {
                         cam.x + self.last_cursor.0 / cam.zoom,
                         cam.y + self.last_cursor.1 / cam.zoom,
                     );
+                    // Selected node's close button wins over everything.
+                    if let Some(sel) = self.selected {
+                        if let Some(n) = self.app.state.workspace.get_node(sel) {
+                            let (cx, cy, cs, _) =
+                                close_button_rect(n.transform.x, n.transform.y, n.size.0, cam.zoom);
+                            if wx >= cx && wx <= cx + cs && wy >= cy && wy <= cy + cs {
+                                self.close_selected();
+                                return;
+                            }
+                        }
+                    }
                     let handle_hit = match self.selected {
                         Some(sel) => self
                             .app
@@ -1442,6 +1524,23 @@ impl ApplicationHandler for CanvasState {
                                 eprintln!("terminal limit reached");
                             }
                         }
+                        Key::Character(c) if c == "x" => {
+                            // Close the selected node (terminal sessions
+                            // end; empty canvas pans with left-drag again).
+                            self.close_selected();
+                        }
+                        Key::Character(c) if c == "[" => {
+                            self.step_selected_grid(-1, 0);
+                        }
+                        Key::Character(c) if c == "]" => {
+                            self.step_selected_grid(1, 0);
+                        }
+                        Key::Character(c) if c == "-" => {
+                            self.step_selected_grid(0, -1);
+                        }
+                        Key::Character(c) if c == "=" => {
+                            self.step_selected_grid(0, 1);
+                        }
                         Key::Character(c) if c == "0" => {
                             // `0` restores slot bm0 when one was saved,
                             // otherwise it zooms to workspace fit.
@@ -1534,6 +1633,13 @@ fn read_clipboard(primary: bool) -> Option<String> {
     } else {
         cb.get_text().ok()
     }
+}
+
+/// Close-button rect (world units) at a node's top-right corner, 12
+/// screen px square like the resize handle. Pure: unit-tested.
+fn close_button_rect(node_x: f64, node_y: f64, node_w: f64, zoom: f64) -> (f64, f64, f64, f64) {
+    let s = 12.0 / zoom.max(0.05);
+    (node_x + node_w.max(1.0) - s, node_y, s, s)
 }
 
 /// Screen px -> 0-based terminal cell, clamped into the grid (clicks on
@@ -1686,5 +1792,48 @@ mod tests {
             8.0, 38.0, 90.0, 0.0, 1.0, 0.0, 0.0, 8.0, 38.0, 9.0, 18.0, 80, 24,
         );
         assert_eq!(shifted, (10, 0));
+    }
+
+    #[test]
+    fn test_close_button_rect_geometry() {
+        // 12 screen px at zoom 2 -> 6 world px, top-right corner.
+        let (x, y, s, _) = close_button_rect(100.0, 50.0, 400.0, 2.0);
+        assert_eq!((x, y, s), (494.0, 50.0, 6.0));
+    }
+
+    #[test]
+    fn test_spawn_resize_close_bookkeeping() {
+        let mut st = CanvasState::new(App::new(crate::config::Config::new()));
+        st.spawn_terminal_node(80, 24, (0.0, 0.0)).unwrap();
+        assert_eq!(st.terms.len(), 1);
+        let node = st.terms[0].node;
+        st.selected = Some(node);
+        assert_eq!(
+            (
+                st.terms[0].engine.term.grid.cols,
+                st.terms[0].engine.term.grid.rows
+            ),
+            (80, 24)
+        );
+        assert!(st.resize_terminal_grid(node, 100, 30));
+        assert_eq!(
+            (
+                st.terms[0].engine.term.grid.cols,
+                st.terms[0].engine.term.grid.rows
+            ),
+            (100, 30)
+        );
+        let (w, h) = st.terminal_node_size(100, 30);
+        let n = st.app.state.workspace.get_node(node).unwrap();
+        assert!((n.size.0 - w).abs() < 1e-9 && (n.size.1 - h).abs() < 1e-9);
+        assert!(st.step_selected_grid(-1, 0));
+        assert_eq!(st.terms[0].engine.term.grid.cols, 99);
+        assert!(st.close_selected());
+        assert!(st.terms.is_empty());
+        assert!(st.app.state.workspace.get_node(node).is_none());
+        assert_eq!(st.selected, None);
+        assert_eq!(st.focused_term, None);
+        assert!(!st.close_selected());
+        assert!(!st.resize_terminal_grid(node, 80, 24));
     }
 }

@@ -108,6 +108,9 @@ struct CanvasState {
     /// the press had no Shift): motion/release go to its PTY, not to
     /// canvas drags. Cleared on left release.
     forwarding: Option<ForwardMouse>,
+    /// Middle-button press anchor: still a potential click (primary paste
+    /// on release) until the cursor moves past the pan threshold.
+    middle_down: Option<(f64, f64)>,
 }
 
 /// A terminal child that owns the mouse until left-button release.
@@ -151,6 +154,7 @@ impl CanvasState {
             last_cursor: (0.0, 0.0),
             viewport_size: (1280.0, 720.0),
             forwarding: None,
+            middle_down: None,
         }
     }
 
@@ -243,6 +247,27 @@ impl CanvasState {
     fn write_to_surface(&mut self, surface: SurfaceId, bytes: &[u8]) {
         if let Some(sess) = self.terms.iter().find(|s| s.surface == surface) {
             let _ = sess.pty.write(bytes);
+        }
+    }
+
+    /// Paste text into one session, framed for bracketed paste (?2004)
+    /// when the child asked for it.
+    fn paste_text_into(&mut self, surface: SurfaceId, text: &str) {
+        let bytes = self
+            .terms
+            .iter()
+            .find(|s| s.surface == surface)
+            .map(|s| s.engine.bracket_paste(text));
+        if let Some(bytes) = bytes {
+            self.write_to_surface(surface, &bytes);
+        }
+    }
+
+    /// Paste clipboard (`primary == false`) or X11 primary selection text
+    /// into one session. Clipboard failures (headless, empty) are no-ops.
+    fn paste_clipboard_into(&mut self, surface: SurfaceId, primary: bool) {
+        if let Some(text) = read_clipboard(primary) {
+            self.paste_text_into(surface, &text);
         }
     }
 
@@ -1005,6 +1030,22 @@ impl ApplicationHandler for CanvasState {
                     self.last_cursor = new_cursor;
                     return;
                 }
+                // Deferred middle pan: start panning only past the click
+                // threshold, so middle-click stays a primary paste.
+                if let Some(anchor) = self.middle_down {
+                    let dx = new_cursor.0 - anchor.0;
+                    let dy = new_cursor.1 - anchor.1;
+                    if dx.hypot(dy) > 5.0 {
+                        self.middle_down = None;
+                        self.drag = DragState::Pan {
+                            ax: anchor.0,
+                            ay: anchor.1,
+                        };
+                    } else {
+                        self.last_cursor = new_cursor;
+                        return;
+                    }
+                }
                 let cam = self.app.state.workspace.camera().clone();
                 let zoom = cam.zoom;
                 match self.drag {
@@ -1090,10 +1131,10 @@ impl ApplicationHandler for CanvasState {
                     self.finish_right_click(event_loop);
                 }
                 (ElementState::Pressed, MouseButton::Middle) => {
-                    self.drag = DragState::Pan {
-                        ax: self.last_cursor.0,
-                        ay: self.last_cursor.1,
-                    };
+                    // Deferred pan: a release without drag pastes the
+                    // primary selection (X11); movement beyond the click
+                    // threshold becomes a pan in CursorMoved.
+                    self.middle_down = Some(self.last_cursor);
                 }
                 (ElementState::Pressed, MouseButton::Left) => {
                     // Copy hit data into owned values before mutating self.
@@ -1253,7 +1294,24 @@ impl ApplicationHandler for CanvasState {
                     self.drag = DragState::None;
                 }
                 (ElementState::Released, MouseButton::Middle) => {
-                    self.drag = DragState::None;
+                    if self.middle_down.take().is_some() {
+                        // Middle-click (no drag): paste primary at the
+                        // cursor session, if any.
+                        let cam = self.app.state.workspace.camera().clone();
+                        let (wx, wy) = (
+                            cam.x + self.last_cursor.0 / cam.zoom,
+                            cam.y + self.last_cursor.1 / cam.zoom,
+                        );
+                        if let Some(surface) = self
+                            .hit_node(wx, wy)
+                            .and_then(|n| n.surface_id())
+                            .filter(|s| self.terms.iter().any(|t| t.surface == *s))
+                        {
+                            self.paste_clipboard_into(surface, true);
+                        }
+                    } else {
+                        self.drag = DragState::None;
+                    }
                 }
                 _ => {}
             },
@@ -1411,6 +1469,21 @@ impl ApplicationHandler for CanvasState {
                     }
                 } else {
                     // Terminal input handling.
+                    let st = self.modifiers.state();
+                    // Paste: Ctrl+Shift+V or Shift+Insert (clipboard,
+                    // bracket-framed when the child asked for ?2004).
+                    let paste_key = (matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("v"))
+                        && st.control_key()
+                        && st.shift_key())
+                        || (event.logical_key == Key::Named(NamedKey::Insert) && st.shift_key());
+                    if paste_key {
+                        if self.term_focus {
+                            if let Some(surface) = self.focused_term {
+                                self.paste_clipboard_into(surface, false);
+                            }
+                        }
+                        return;
+                    }
                     let Some(text) = &event.text else {
                         // Named keys map to control sequences.
                         let seq = named_key_sequence(&event.logical_key);
@@ -1445,6 +1518,21 @@ impl ApplicationHandler for CanvasState {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+    }
+}
+
+/// Read clipboard (or X11 primary selection) text. `None` covers every
+/// failure mode — no display, empty, non-text — so callers treat it as
+/// a no-op (this is also why headless CI never pastes).
+fn read_clipboard(primary: bool) -> Option<String> {
+    let mut cb = arboard::Clipboard::new().ok()?;
+    if primary {
+        {
+            use arboard::{GetExtLinux, LinuxClipboardKind};
+            cb.get().clipboard(LinuxClipboardKind::Primary).text().ok()
+        }
+    } else {
+        cb.get_text().ok()
     }
 }
 

@@ -136,8 +136,17 @@ target AND `animating=false`; ANIMATED moves set target AND
         it. Shift-click forces host select/move; resize handle always wins.
   - [ ] Wheel still zooms (host nav); forwarding wheel to the child (e.g.
         vim/less scroll) is a follow-up needing a scroll-vs-zoom decision.
-- [ ] Bracketed-paste wrapping helper exists, clipboard/middle-click paste
-      path pending.
+- [x] Paste path (session 2026-09-16, live-verified on :0):
+  - [x] `arboard` clipboard read (+ X11 primary via `LinuxClipboardKind`);
+        failures (headless/empty) are no-ops.
+  - [x] Ctrl+Shift+V / Shift+Insert paste clipboard into the focused
+        terminal, framed by `bracket_paste` (?2004).
+  - [x] Middle-click (no drag) pastes primary at the cursor session;
+        movement past 5px becomes a pan as before.
+  - [x] Live: `PASTE789` via Ctrl+Shift+V and `MID123` via middle-click
+        landed in the prompt; Return executed the line; middle-drag pan
+        stayed responsive.
+- [ ] Copy side needs text selection (left-drag select still spec).
 - [ ] OSC 8 hyperlinks, OSC 52 clipboard (permission-gated).
 - [ ] Unicode: graphemes, emoji, Nerd Fonts, ambiguous-width config (wide
       chars + spacer cells done).

@@ -18,6 +18,7 @@ freetype-rs = "0.37"
 vte = "0.13"
 portable-pty = "0.8"
 unicode-width = "0.2"
+arboard = "3"
 regex = "1"
 rquickjs = { version = "0.9", features = ["bindgen"] }
 swc_common = "3"

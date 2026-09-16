@@ -1803,7 +1803,7 @@ partial), **spec** (design only; see TODO.md phase for landing it).
 | `src/canvas.rs` | GL context/capabilities, `RectRenderer` batching, `RenderTarget` FBOs, `RenderGraphExecutor` | §4.1–4.2 | live (PostProcess placeholder) |
 | `src/text.rs` | fontconfig discovery, FreeType rasterization, `Atlas`/`GlyphKey` cache, `TextRenderer`, zoom-size strategy | §4.3–4.4 | live (far-zoom layers pending) |
 | `src/rendering.rs` | Logical `RenderGraph` model (`RenderPass`, node config, glyph-atlas stub) | §4.1 | live |
-| `src/window.rs` | winit event loop + glutin surface; terminal sessions, drag state machine, child mouse forwarding (Shift bypass), keyboard encoding, draw frame | §5 | live |
+| `src/window.rs` | winit event loop + glutin surface; terminal sessions, drag state machine, child mouse forwarding (Shift bypass), clipboard/primary paste, keyboard encoding, draw frame | §5 | live |
 | `src/arrange.rs` | Pure layout math: tile/align/distribute/cascade, snapping, `place_beside`, grid metrics | §11 | live |
 | `src/app.rs` | `App`, `AppState`, `InteractionMode`, `CliArgs`; headless fallback loop | §5.1 | scaffold (loop is a stub) |
 | `src/config.rs` | `Config` tree: font/theme/camera/effects/input/terminal/hud/accessibility/profiles | §10 | scaffold (TS loading pending) |
@@ -1826,7 +1826,7 @@ Plugins enter via `script.rs` behind `ScriptHost`.
 |---|---|---|
 | Canvas, camera, pan/zoom | **live** | eased, cursor-anchored, bookmarked; drift-free |
 | Text rendering | **live** | atlas + subpixel + near/large zoom sizes; far-zoom layer textures pending |
-| Terminal (PTY/VT/grid) | **live** | SGR 16/256/24-bit, alt screen, scrollback, keyboard, mouse forwarding (press/drag/release, Shift bypass; wheel stays zoom); paste/OSC pending |
+| Terminal (PTY/VT/grid) | **live** | SGR 16/256/24-bit, alt screen, scrollback, keyboard, mouse forwarding (press/drag/release, Shift bypass; wheel stays zoom), paste (Ctrl+Shift+V / Shift+Insert clipboard, middle-click primary; ?2004-framed); selection-copy/OSC pending |
 | Projections | **live** | selectors + live/snapshot; presentation options pending |
 | Lens zoom + pin | **live** | all targets resolve (workspace-fit/object/rect/terminal-range/projection/reading); grid-precise range zoom via `terminal_range_rect` |
 | Script host + TS load | **live** | QuickJS + SWC; V8 behind trait pending |

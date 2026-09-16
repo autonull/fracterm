@@ -153,8 +153,8 @@ pub fn config_with_profile(profile_name: &str) -> Config {
         }
         "high-contrast" => {
             config.theme = ThemeConfig::default();
-            config.accessibility.high_contrast = true;
-            config.accessibility.font_size = 28;
+            config.accessibility.reading_mode.high_contrast = true;
+            config.accessibility.reading_mode.font_size = 28;
         }
         _ => {}
     }

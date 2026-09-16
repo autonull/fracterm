@@ -361,7 +361,7 @@ Headless font probe:
   first-PTY-bytes line. (Per-second stats + key logs removed as noise.)
 
 ## Done Log
-
+ 
 - Node components aligned to improved design (Transform, Style, Surface,
   Projection, InputBehavior, PluginBehavior; removed Focus/Behavior).
 - `ProjectionSurface` exposed as a Node component (live/snapshot + selector
@@ -370,3 +370,28 @@ Headless font probe:
 - `ZoomTarget` enum + object-target application (`apply_target`).
 - `Workspace::node_transform`.
 - `Cell` extended with underline/reverse/width + sensible defaults.
+ 
+---
+ 
+## Refactoring Session (2026-09-15) — Core Abstractions Complete
+ 
+**Major refactoring to prepare for TODO.md implementation:**
+ 
+- [x] **Command System** (`src/command.rs`): Typed commands with `CommandInputSchema` validation, `CommandRegistry` with keybinding integration, `CommandContext` for execution context, `CommandValue` for JSON-serializable params.
+- [x] **Plugin System** (`src/plugin.rs`): Typed SDK with `PluginManifest`, `PluginContext`, `WidgetRenderer` trait (display lists only), `WidgetEvent`/`WidgetRenderContext`, `UiBuilder` immediate-mode API, `Disposable` for cleanup, `PluginManager` with mutex-protected host.
+- [x] **TypeScript Config** (`src/config.rs`): `Config::load_from_ts()` with SWC transpilation, `eval_ts_config()` via QuickJS, profile support, XDG config directory resolution.
+- [x] **Input System** (`src/input.rs`): `InteractionMode` enum (Workspace/Terminal/Reading/Dashboard), `InputManager` routing to mode-specific handlers (`WorkspaceInputHandler`, `TerminalInputHandler`, `ReadingInputHandler`, `DashboardInputHandler`), `ContextMenuBuilder` with target-aware menus.
+- [x] **Widget Display List Pipeline** (`src/widget.rs`): `WidgetDisplayList`, `WidgetRegistry`, `render_widget_display_list()`, `collect_widget_display_lists()` bridging plugin display lists → canvas renderer.
+- [x] **Event System** (`src/event.rs`): `EventBus` with throttling (`subscribe_throttled`), permission-gated emission (`emit_for_plugin`), `EventHistory` for replay, `EventFilter` for selective subscription.
+- [x] **Layout Persistence**: Full `Serialize`/`Deserialize` on `Node`, `Transform`, `Theme`, `Color`, `ProjectionSurface`, `Permission`, `InputBehavior`, `PluginBehavior`, ID types. `Workspace::export_state`/`import_state` round-trips scene graph.
+- [x] **Reading Mode / Accessibility primitives**: `ReadingModeConfig` in config, `InteractionMode::Reading`, `ReadingInputHandler`, context menu items for reading actions.
+- [x] **World coordinates → f64**: `Transform{x,y}` now `f64`, `Node::size` now `(f64,f64)`, `Rect` now `f64`, `arrange.rs` functions return `f64` coords, `snap_to_edges` uses `f64` threshold. Eliminates sub-pixel aliasing at fractional zoom.
+ 
+**Tests**: 99 passing (was 83). Build clean, clippy clean (warnings only on unused vars).
+ 
+**Remaining for fresh context:**
+- On-display verification of P1–P5 exit criteria
+- P6: typed commands/events/widgets SDK completion, more web globals, `.d.ts` generation, V8 host
+- P7: alignment-guide rendering, multi-select drag reorder, layout auto-save
+- P8: reading lens reflow, high-contrast theme, reduce-motion
+- P9: command palette, XDG dirs, packaging

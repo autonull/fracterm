@@ -1,23 +1,24 @@
 //! Projection - a selected presentation of part of a surface.
 
 use super::*;
+use serde::{Deserialize, Serialize};
 
 /// Row range for projections
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RowRange {
     pub start: i32,
     pub end: i32,
 }
 
 /// Column range for projections
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnRange {
     pub start: i32,
     pub end: i32,
 }
 
 /// Filter specification for projections
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FilterSpec {
     /// Substring filter
     Substring {
@@ -34,7 +35,7 @@ pub enum FilterSpec {
 }
 
 /// Filter mode: extract or highlight
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FilterMode {
     /// Extract matching lines
     Extract,
@@ -43,7 +44,7 @@ pub enum FilterMode {
 }
 
 /// Projection selector for filtering and range selection
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectionSelector {
     /// Row range
     pub rows: Option<RowRange>,
@@ -128,7 +129,7 @@ impl ProjectionSelector {
 }
 
 /// Projection presentation options
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectionPresentation {
     /// Wrap lines
     pub wrap: bool,
@@ -175,7 +176,7 @@ impl ProjectionPresentation {
 }
 
 /// A projection surface is a node whose surface is a projection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectionSurface {
     /// Source surface ID
     pub source: SurfaceId,
@@ -194,7 +195,7 @@ pub struct ProjectionSurface {
 }
 
 /// Projection mode: live or snapshot
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProjectionMode {
     /// Live projection that updates with the source
     Live,

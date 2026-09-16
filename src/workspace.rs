@@ -163,6 +163,7 @@ impl SceneGraph {
 }
 
 /// The workspace is the infinite zoomable canvas containing nodes and a camera lens.
+#[derive(Debug)]
 pub struct Workspace {
     pub camera: CameraLens,
     pub scene: SceneGraph,
@@ -330,7 +331,7 @@ mod tests {
     #[test]
     fn test_scene_graph_add_node() {
         let mut sg = SceneGraph::new();
-        let node = Node::new(NodeId(1), 100, 200);
+        let node = Node::new(NodeId(1), 100.0, 200.0);
         sg.add_node(node);
         assert!(sg.contains(NodeId(1)));
         assert_eq!(sg.len(), 1);
@@ -340,9 +341,9 @@ mod tests {
     #[test]
     fn test_scene_graph_groups() {
         let mut sg = SceneGraph::new();
-        sg.add_node(Node::new(NodeId(1), 0, 0));
-        sg.add_node(Node::new(NodeId(2), 100, 100));
-        sg.add_node(Node::new(NodeId(3), 200, 200));
+        sg.add_node(Node::new(NodeId(1), 0.0, 0.0));
+        sg.add_node(Node::new(NodeId(2), 100.0, 100.0));
+        sg.add_node(Node::new(NodeId(3), 200.0, 200.0));
         sg.create_group(NodeId(100), vec![NodeId(1), NodeId(2)]);
         assert_eq!(sg.get_group_members(NodeId(100)).len(), 2);
         assert_eq!(sg.get_groups().len(), 1);
@@ -351,9 +352,9 @@ mod tests {
     #[test]
     fn test_scene_graph_z_order() {
         let mut sg = SceneGraph::new();
-        sg.add_node(Node::new(NodeId(1), 0, 0));
-        sg.add_node(Node::new(NodeId(2), 100, 100));
-        sg.add_node(Node::new(NodeId(3), 200, 200));
+        sg.add_node(Node::new(NodeId(1), 0.0, 0.0));
+        sg.add_node(Node::new(NodeId(2), 100.0, 100.0));
+        sg.add_node(Node::new(NodeId(3), 200.0, 200.0));
         sg.bring_to_front(NodeId(1));
         let order = sg.z_order();
         assert_eq!(order[order.len() - 1], NodeId(1));
@@ -362,8 +363,8 @@ mod tests {
     #[test]
     fn test_workspace_groups() {
         let mut ws = Workspace::new();
-        ws.add_node(Node::new(NodeId(1), 0, 0));
-        ws.add_node(Node::new(NodeId(2), 100, 100));
+        ws.add_node(Node::new(NodeId(1), 0.0, 0.0));
+        ws.add_node(Node::new(NodeId(2), 100.0, 100.0));
         ws.create_group(NodeId(100), vec![NodeId(1), NodeId(2)]);
         assert_eq!(ws.get_group_members(NodeId(100)).len(), 2);
     }
@@ -371,7 +372,7 @@ mod tests {
     #[test]
     fn test_workspace_export_state() {
         let mut ws = Workspace::new();
-        ws.add_node(Node::new(NodeId(1), 0, 0));
+        ws.add_node(Node::new(NodeId(1), 0.0, 0.0));
         let state = ws.export_state();
         assert_eq!(state["version"], 1);
         assert_eq!(state["nodes"], 1);

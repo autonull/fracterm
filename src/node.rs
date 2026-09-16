@@ -3,9 +3,10 @@
 //! Nodes have components: Transform, Style, Focus, Input, Surface, Behavior, Permissions.
 
 use super::*;
+use serde::{Deserialize, Serialize};
 
 /// Input behavior for a node, describing how it handles input events.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputBehavior {
     /// The interaction mode name (workspace, terminal, reading, dashboard)
     pub mode: String,
@@ -58,7 +59,7 @@ impl Default for InputBehavior {
 }
 
 /// Plugin behavior for a node, describing lifecycle hooks from plugins.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PluginBehavior {
     /// The plugin ID that owns this node, if any
     pub plugin_id: Option<String>,
@@ -94,14 +95,14 @@ impl PluginBehavior {
 }
 
 /// Components that a node can have
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     /// The unique ID of this node
     pub id: NodeId,
     /// The transform component (position, scale, rotation)
     pub transform: Transform,
     /// Node size in world pixels (width, height)
-    pub size: (i32, i32),
+    pub size: (f64, f64),
     /// The style component (colors, fonts)
     pub style: Theme,
     /// The input behavior component
@@ -120,11 +121,11 @@ pub struct Node {
 
 impl Node {
     /// Create a new node with default values
-    pub fn new(id: NodeId, x: i32, y: i32) -> Self {
+    pub fn new(id: NodeId, x: f64, y: f64) -> Self {
         Self {
             id,
             transform: Transform::new(x, y),
-            size: (480, 320),
+            size: (480.0, 320.0),
             style: Theme::default(),
             input: InputBehavior::default(),
             surface_id: None,

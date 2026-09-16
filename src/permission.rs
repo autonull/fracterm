@@ -1,7 +1,9 @@
 //! Permission - capability-based security system for plugins.
 
+use serde::{Deserialize, Serialize};
+
 /// Scope for a permission
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PermissionScope {
     /// All instances of this permission
     All,
@@ -18,7 +20,7 @@ pub enum PermissionScope {
 }
 
 /// Permission for accessing resources
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Permission {
     /// Permission type (e.g., "workspace.read", "terminal.create")
     pub permission_type: String,

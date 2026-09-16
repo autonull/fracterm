@@ -1,14 +1,14 @@
 //! Transform - position, scale, and rotation for nodes.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// A transform representing position, scale, and rotation of a node.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Transform {
-    /// Position (x, y) in pixels
-    pub x: i32,
-    /// Position (y) in pixels
-    pub y: i32,
+    /// Position (x, y) in world pixels (float for sub-pixel precision)
+    pub x: f64,
+    pub y: f64,
     /// Scale factor (multiplier)
     pub scale: f64,
     /// Rotation angle in radians
@@ -17,7 +17,7 @@ pub struct Transform {
 
 impl Transform {
     /// Create a new transform at origin with unit scale and zero rotation
-    pub fn new(x: i32, y: i32) -> Self {
+    pub fn new(x: f64, y: f64) -> Self {
         Self {
             x,
             y,
@@ -27,7 +27,7 @@ impl Transform {
     }
 
     /// Create a transform at given coordinates
-    pub fn at(x: i32, y: i32) -> Self {
+    pub fn at(x: f64, y: f64) -> Self {
         Self {
             x,
             y,
@@ -37,7 +37,7 @@ impl Transform {
     }
 
     /// Apply a translation to the transform
-    pub fn translate(&mut self, dx: i32, dy: i32) {
+    pub fn translate(&mut self, dx: f64, dy: f64) {
         self.x += dx;
         self.y += dy;
     }
@@ -58,7 +58,7 @@ impl Transform {
     }
 
     /// Get the bounds of the transformed area
-    pub fn bounds(&self) -> (i32, i32) {
+    pub fn bounds(&self) -> (f64, f64) {
         (self.x, self.y)
     }
 }

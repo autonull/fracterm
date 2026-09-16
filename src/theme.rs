@@ -1,9 +1,10 @@
 //! Theme - theming for the Fracterm workspace.
 
 use crate::surface::Color;
+use serde::{Deserialize, Serialize};
 
 /// Color theme for the workspace
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Theme {
     /// Background color
     pub background: Color,

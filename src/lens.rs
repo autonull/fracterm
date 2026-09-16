@@ -1,6 +1,7 @@
 //! Lens - a way of viewing a surface or projection.
 
 use super::*;
+use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 
 /// CameraLens is the camera's view of the workspace.
@@ -111,12 +112,12 @@ pub enum ZoomTarget {
 }
 
 /// A rectangular region
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rect {
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 /// A grid range for terminal selection

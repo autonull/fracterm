@@ -170,10 +170,10 @@ impl CanvasState {
             let x1 = cam.x + anchor.0.max(sx) / cam.zoom;
             let y1 = cam.y + anchor.1.max(sy) / cam.zoom;
             let rect = crate::lens::Rect {
-                x: x0 as i32,
-                y: y0 as i32,
-                width: (x1 - x0).max(1.0) as u32,
-                height: (y1 - y0).max(1.0) as u32,
+                x: x0,
+                y: y0,
+                width: (x1 - x0).max(1.0),
+                height: (y1 - y0).max(1.0),
             };
             let (vw, vh) = self.viewport_size;
             self.app
@@ -210,9 +210,9 @@ impl CanvasState {
         for id in ids.iter().rev() {
             if let Some(node) = self.app.state.workspace.get_node(*id) {
                 let (w, h) = node.size;
-                let w = w.max(1) as f64;
-                let h = h.max(1) as f64;
-                let (nx, ny) = (node.transform.x as f64, node.transform.y as f64);
+                let w = w.max(1.0);
+                let h = h.max(1.0);
+                let (nx, ny) = (node.transform.x, node.transform.y);
                 if wx >= nx && wx <= nx + w && wy >= ny && wy <= ny + h {
                     return Some(node);
                 }
@@ -224,7 +224,7 @@ impl CanvasState {
     /// Apply an arrange function's placements to the workspace nodes.
     fn apply_arrange(
         &mut self,
-        f: impl Fn(&[&crate::Node], usize) -> Vec<(crate::NodeId, i32, i32)>,
+        f: impl Fn(&[&crate::Node], usize) -> Vec<(crate::NodeId, f64, f64)>,
         arg: usize,
     ) {
         let owned: Vec<crate::Node> = self
@@ -250,10 +250,10 @@ impl CanvasState {
         let cam = self.app.state.workspace.camera().clone();
         let (vw, vh) = self.viewport_size;
         let rect = crate::lens::Rect {
-            x: cam.x as i32,
-            y: cam.y as i32,
-            width: (vw as f64 / cam.zoom) as u32,
-            height: (vh as f64 / cam.zoom) as u32,
+            x: cam.x,
+            y: cam.y,
+            width: vw as f64 / cam.zoom,
+            height: vh as f64 / cam.zoom,
         };
         let next_id = crate::NodeId(
             self.app
@@ -279,7 +279,7 @@ impl CanvasState {
             selector,
             crate::ProjectionMode::Snapshot,
         );
-        let mut node = crate::Node::new(next_id, rect.x + rect.width as i32 + 40, rect.y);
+        let mut node = crate::Node::new(next_id, rect.x + rect.width + 40.0, rect.y);
         node.set_surface(crate::SurfaceId(1));
         node.projection = Some(proj);
         node.transform.scale = 1.0;
@@ -318,10 +318,10 @@ impl CanvasState {
         let mut x1 = f64::NEG_INFINITY;
         let mut y1 = f64::NEG_INFINITY;
         for n in nodes {
-            x0 = x0.min(n.transform.x as f64);
-            y0 = y0.min(n.transform.y as f64);
-            x1 = x1.max(n.transform.x as f64 + n.size.0.max(1) as f64);
-            y1 = y1.max(n.transform.y as f64 + n.size.1.max(1) as f64);
+            x0 = x0.min(n.transform.x);
+            y0 = y0.min(n.transform.y);
+            x1 = x1.max(n.transform.x + n.size.0.max(1.0));
+            y1 = y1.max(n.transform.y + n.size.1.max(1.0));
         }
         let (vw, vh) = (self.viewport_size.0 as f64, self.viewport_size.1 as f64);
         let bw = (x1 - x0 + 2.0 * DASH_MARGIN).max(1.0);
@@ -340,10 +340,10 @@ impl CanvasState {
     }
 
     /// Terminal node pixel size for a grid: measured cells + header + pads.
-    fn terminal_node_size(&self, cols: u32, rows: u32) -> (i32, i32) {
+    fn terminal_node_size(&self, cols: u32, rows: u32) -> (f64, f64) {
         let (cell_w, line_h) = self.grid_cell;
-        let w = (cols as f64 * cell_w + 2.0 * GRID_PAD_X).round() as i32;
-        let h = (self.header_h() + rows as f64 * line_h + GRID_PAD_BOTTOM).round() as i32;
+        let w = cols as f64 * cell_w + 2.0 * GRID_PAD_X;
+        let h = self.header_h() + rows as f64 * line_h + GRID_PAD_BOTTOM;
         (w, h)
     }
 
@@ -357,7 +357,7 @@ impl CanvasState {
             .state
             .workspace
             .get_node(node_id)
-            .map(|n| (n.size.0.max(1) as f64, n.size.1.max(1) as f64))
+            .map(|n| (n.size.0.max(1.0), n.size.1.max(1.0)))
         else {
             return;
         };
@@ -379,7 +379,7 @@ impl CanvasState {
     }
 
     /// Spawn a terminal node at `pos` and register its PTY session.
-    fn spawn_terminal_node(&mut self, cols: u32, rows: u32, pos: (i32, i32)) -> Result<(), String> {
+    fn spawn_terminal_node(&mut self, cols: u32, rows: u32, pos: (f64, f64)) -> Result<(), String> {
         let pty = PtySession::spawn(cols as u16, rows as u16, None)?;
         let surface = SurfaceId(self.next_surface_id);
         self.next_surface_id += 1;
@@ -462,8 +462,8 @@ impl CanvasState {
             for node in self.app.state.workspace.all_nodes() {
                 let bg = node.style.background;
                 let (w, h) = node.size;
-                let width = w.max(1) as f64;
-                let height = h.max(1) as f64;
+                let width = w.max(1.0);
+                let height = h.max(1.0);
                 renderer.push_rect(
                     node.transform.x as f64,
                     node.transform.y as f64,
@@ -507,7 +507,7 @@ impl CanvasState {
             if let Some(sel) = selected {
                 if let Some(node) = self.app.state.workspace.get_node(sel) {
                     let handle = 12.0 / cam.zoom.max(0.05);
-                    let (w, h) = (node.size.0.max(1) as f64, node.size.1.max(1) as f64);
+                    let (w, h) = (node.size.0.max(1.0), node.size.1.max(1.0));
                     renderer.push_overlay_rect(
                         node.transform.x as f64 + w - handle,
                         node.transform.y as f64 + h - handle,
@@ -757,8 +757,8 @@ impl ApplicationHandler for CanvasState {
             GRID_ROWS,
         );
         let (term_w, term_h) = self.terminal_node_size(cols, rows);
-        let tx = ((width as f64 - term_w as f64) / 2.0).round() as i32;
-        let ty = ((height as f64 - term_h as f64) / 2.0).round() as i32;
+        let tx = (width as f64 - term_w) / 2.0;
+        let ty = (height as f64 - term_h) / 2.0;
         self.viewport_size = (width as f32, height as f32);
         // Terminal session (P3): bash in a PTY sized to the window.
         match self.spawn_terminal_node(cols, rows, (tx, ty)) {
@@ -769,8 +769,8 @@ impl ApplicationHandler for CanvasState {
             let rect = crate::lens::Rect {
                 x: tx,
                 y: ty,
-                width: term_w.max(1) as u32,
-                height: term_h.max(1) as u32,
+                width: term_w.max(1.0),
+                height: term_h.max(1.0),
             };
             let (fx, fy, fz) = {
                 let cam = self.app.state.workspace.camera_mut();
@@ -872,7 +872,7 @@ impl ApplicationHandler for CanvasState {
                     }
                     DragState::Move { node, dx, dy } => {
                         let (wx, wy) = (cam.x + new_cursor.0 / zoom, cam.y + new_cursor.1 / zoom);
-                        let (nx, ny) = ((wx + dx).round() as i32, (wy + dy).round() as i32);
+                        let (nx, ny) = (wx + dx, wy + dy);
                         // Snap the moved rect to nearby edges (8 world px).
                         let tmp = self.app.state.workspace.get_node(node).map(|n| {
                             let mut c = n.clone();
@@ -892,7 +892,7 @@ impl ApplicationHandler for CanvasState {
                         let (fx, fy) = match tmp {
                             Some(ref t) => {
                                 let refs: Vec<&crate::Node> = others.iter().collect();
-                                let g = crate::arrange::snap_to_edges(t, &refs, 8);
+                                let g = crate::arrange::snap_to_edges(t, &refs, 8.0);
                                 if g.distance.is_finite() {
                                     (g.x, g.y)
                                 } else {
@@ -922,10 +922,10 @@ impl ApplicationHandler for CanvasState {
                             (p, (min_w, min_h))
                         };
                         if let Some((nx, ny)) = pos {
-                            let nw = (wx - nx).max(min.0) as i32;
-                            let nh = (wy - ny).max(min.1) as i32;
+                            let nw = (wx - nx).max(min.0);
+                            let nh = (wy - ny).max(min.1);
                             if let Some(n) = self.app.state.workspace.get_node_mut(node) {
-                                n.size = (nw.max(1), nh.max(1));
+                                n.size = (nw.max(1.0), nh.max(1.0));
                             }
                             self.sync_session_grid(node);
                         }
@@ -962,10 +962,10 @@ impl ApplicationHandler for CanvasState {
                             .get_node(sel)
                             .map(|n| {
                                 crate::arrange::resize_handle_hit(
-                                    n.transform.x as f64,
-                                    n.transform.y as f64,
-                                    n.size.0.max(1) as f64,
-                                    n.size.1.max(1) as f64,
+                                    n.transform.x,
+                                    n.transform.y,
+                                    n.size.0.max(1.0),
+                                    n.size.1.max(1.0),
                                     cam.x,
                                     cam.y,
                                     cam.zoom,
@@ -1107,8 +1107,8 @@ impl ApplicationHandler for CanvasState {
                                 self.app.state.workspace.all_nodes().first().map(|n| n.id)
                             {
                                 if let Some(n) = self.app.state.workspace.get_node_mut(first) {
-                                    n.transform.x = DASH_MARGIN as i32;
-                                    n.transform.y = DASH_MARGIN as i32;
+                                    n.transform.x = DASH_MARGIN as f64;
+                                    n.transform.y = DASH_MARGIN as f64;
                                 }
                             }
                             self.apply_arrange(
@@ -1141,8 +1141,8 @@ impl ApplicationHandler for CanvasState {
                                         })
                                     })
                                     .unwrap_or((
-                                        DASH_MARGIN as i32,
-                                        DASH_MARGIN as i32,
+                                        DASH_MARGIN as f64,
+                                        DASH_MARGIN as f64,
                                         size.0,
                                         size.1,
                                     ));

@@ -273,6 +273,86 @@ impl Default for WidgetRegistry {
     }
 }
 
+/// One declarative widget timer: `run` mutates state at most once per
+/// `every_ms` (driven by `LiveWidget::tick`, which the frame loop calls).
+pub struct WidgetTimer<S> {
+    pub every_ms: u64,
+    pub run: WidgetTimerFn<S>,
+}
+
+/// State constructor for a declarative widget.
+pub type WidgetInit<S> = Box<dyn Fn() -> S + Send + Sync>;
+/// Timer body for a declarative widget: mutates state.
+pub type WidgetTimerFn<S> = Box<dyn Fn(&mut S) + Send + Sync>;
+/// View function for a declarative widget: emits display-list commands.
+pub type WidgetViewFn<S> = Box<dyn Fn(&S, &mut UiBuilder, &WidgetRenderContext) + Send + Sync>;
+
+/// Declarative widget definition mirroring `defineWidget` in
+/// `fracterm/widget`: a state constructor, interval timers, and a view
+/// function emitting display-list commands. Widgets never touch OpenGL.
+pub struct WidgetDefinition<S> {
+    pub id: String,
+    pub title: String,
+    pub default_size: (u32, u32),
+    pub init: WidgetInit<S>,
+    pub timers: Vec<WidgetTimer<S>>,
+    pub view: WidgetViewFn<S>,
+}
+
+/// Live declarative widget: owns state, fires due timers on `tick`, and
+/// renders through `WidgetRenderer` as display lists.
+pub struct LiveWidget<S> {
+    def: WidgetDefinition<S>,
+    state: S,
+    last_tick_ms: Vec<u64>,
+}
+
+impl<S> LiveWidget<S> {
+    pub fn new(def: WidgetDefinition<S>) -> Self {
+        let state = (def.init)();
+        let last_tick_ms = vec![0; def.timers.len()];
+        Self {
+            def,
+            state,
+            last_tick_ms,
+        }
+    }
+
+    /// Fire timers due at `now_ms` (monotonic). Each timer fires at most
+    /// once per tick; clock jumps backwards never fire.
+    pub fn tick(&mut self, now_ms: u64) {
+        for (i, timer) in self.def.timers.iter().enumerate() {
+            let every = timer.every_ms.max(1);
+            if now_ms.saturating_sub(self.last_tick_ms[i]) >= every {
+                (timer.run)(&mut self.state);
+                self.last_tick_ms[i] = now_ms;
+            }
+        }
+    }
+
+    pub fn state(&self) -> &S {
+        &self.state
+    }
+
+    pub fn render_into(&self, ctx: &WidgetRenderContext, ui: &mut UiBuilder) {
+        (self.def.view)(&self.state, ui, ctx);
+    }
+}
+
+impl<S: Send + Sync> WidgetRenderer for LiveWidget<S> {
+    fn render(&self, ctx: &WidgetRenderContext, ui: &mut UiBuilder) {
+        self.render_into(ctx, ui);
+    }
+
+    fn handle_event(&self, _event: &WidgetEvent) -> bool {
+        false
+    }
+
+    fn size(&self) -> (u32, u32) {
+        self.def.default_size
+    }
+}
+
 use std::collections::HashMap;
 
 #[cfg(test)]
@@ -302,5 +382,74 @@ mod tests {
         let registry = WidgetRegistry::new();
         // Can't easily test without a real renderer implementation
         assert!(registry.get("nonexistent").is_none());
+    }
+
+    fn counter_widget() -> LiveWidget<u32> {
+        LiveWidget::new(WidgetDefinition {
+            id: "example.counter".to_string(),
+            title: "Counter".to_string(),
+            default_size: (320, 140),
+            init: Box::new(|| 0),
+            timers: vec![WidgetTimer {
+                every_ms: 1000,
+                run: Box::new(|n: &mut u32| *n += 1),
+            }],
+            view: Box::new(|n: &u32, ui: &mut UiBuilder, _ctx: &WidgetRenderContext| {
+                ui.clear(Color::from_hex("#101018"));
+                ui.rect(0.0, 0.0, 10.0, 10.0, Color::from_hex("#e8e8f0"));
+                let _ = n;
+            }),
+        })
+    }
+
+    #[test]
+    fn test_declarative_widget_timers_fire_on_interval() {
+        let mut w = counter_widget();
+        assert_eq!(*w.state(), 0);
+        w.tick(0);
+        w.tick(999);
+        assert_eq!(*w.state(), 0);
+        w.tick(1000);
+        assert_eq!(*w.state(), 1);
+        w.tick(1500);
+        assert_eq!(*w.state(), 1);
+        w.tick(2000);
+        assert_eq!(*w.state(), 2);
+    }
+
+    #[test]
+    fn test_declarative_widget_renderer_contract() {
+        let w = counter_widget();
+        assert_eq!(w.size(), (320, 140));
+        assert!(!w.handle_event(&WidgetEvent::FocusGained));
+        let theme = Theme::default();
+        let ctx = WidgetRenderContext {
+            widget_id: "example.counter".to_string(),
+            bounds: (0.0, 0.0, 320.0, 140.0),
+            theme: &theme,
+            scale: 1.0,
+            camera_x: 0.0,
+            camera_y: 0.0,
+            camera_zoom: 1.0,
+        };
+        let mut ui = UiBuilder::new();
+        w.render(&ctx, &mut ui);
+        assert_eq!(ui.take_commands().len(), 2);
+    }
+
+    #[test]
+    fn test_registry_collects_declarative_widget() {
+        let mut ws = Workspace::new();
+        let mut node = Node::new(NodeId(3), 10.0, 20.0);
+        node.size = (320.0, 140.0);
+        node.plugin = PluginBehavior::with_widget("example.plugin", "example.counter");
+        ws.add_node(node);
+        let mut renderers: HashMap<String, Box<dyn WidgetRenderer>> = HashMap::new();
+        renderers.insert("example.counter".to_string(), Box::new(counter_widget()));
+        let lists =
+            collect_widget_display_lists(&ws, &renderers, &Theme::default(), 1.0, 0.0, 0.0, 1.0);
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].widget_id, "example.counter");
+        assert_eq!(lists[0].commands.len(), 2);
     }
 }

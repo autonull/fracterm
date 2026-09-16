@@ -1812,6 +1812,7 @@ partial), **spec** (design only; see TODO.md phase for landing it).
 | `src/command.rs` | `Command`, typed `CommandInput` params | §17 | scaffold |
 | `src/permission.rs` | `Permission`, `PermissionScope`, `PermissionContext` | §15 | live |
 | `src/plugin.rs` | `Plugin` trait, `Widget`, `V8Host` stub, `PluginSDK`, settings validation + `settings_ui_rows` descriptors | §21 | scaffold |
+| `src/widget.rs` | `WidgetDisplayList` pipeline + `WidgetRegistry`; declarative `WidgetDefinition`/`LiveWidget` (state/timers/view → display lists) | §21 | live (host-side; GL render path spec) |
 | `src/script.rs` | `ScriptHost` trait, `PluginManifest`, `QuickJsScriptHost` (rquickjs), SWC `transpile_ts`, web-globals polyfill (§14) + `poll_timers`/`poll_all_timers` frame drain | §13, §9.1, §14 | live (QuickJS; V8 spec'd) |
 
 Pipeline: `window.rs` pumps winit events → mutates `Workspace`/`Camera`

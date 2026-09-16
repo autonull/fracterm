@@ -61,7 +61,8 @@ pub use terminal::{
 pub use theme::Theme;
 pub use transform::Transform;
 pub use widget::{
-    collect_widget_display_lists, render_widget_display_list, WidgetDisplayList, WidgetRegistry,
+    collect_widget_display_lists, render_widget_display_list, LiveWidget, WidgetDefinition,
+    WidgetDisplayList, WidgetInit, WidgetRegistry, WidgetTimer, WidgetTimerFn, WidgetViewFn,
 };
 pub use workspace::{SceneGraph, Workspace};
 

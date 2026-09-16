@@ -7,7 +7,7 @@ regression guardrails this plan must respect are in Development Guardrails
 below. Prefer finishing a phase before starting the next. Unfinished items
 carry forward in-place, so this file is always the single resume point.
 
-**Current state (2026-09-16): all gates green** — `cargo build`, 139 tests
+**Current state (2026-09-16): all gates green** — `cargo build`, 142 tests
 passing, `cargo clippy --all-targets -- -D warnings` clean,
 `cargo fmt --check` clean. Fish startup fixed (~1s prompt via terminal-query
 replies); caret/title/modes live-verified on :0. Binary runs on-display (X :0, 1280x720 Luscombe);
@@ -202,7 +202,10 @@ target AND `animating=false`; ANIMATED moves set target AND
       `emit_for_plugin` honors the same windows).
 - [x] Command input type checking (`check_param_type`: string/number/
       boolean/array/object/any; unknown type names pass leniently).
-- [ ] Declarative widgets SDK surface.
+- [x] Declarative widgets SDK surface (`WidgetDefinition`: state init +
+      interval timers + view fn; `LiveWidget` owns state, `tick(now_ms)`
+      fires due timers, renders display lists via `WidgetRenderer`;
+      registry end-to-end collection tested).
 - [x] Setting validation (`SettingSchema::validate_value`: type, numeric
       min/max, string enum; `resolve_settings` fills defaults, rejects
       unknown keys and invalid values/defaults).

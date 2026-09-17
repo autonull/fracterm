@@ -195,7 +195,7 @@ pub struct ProjectionSurface {
 }
 
 /// Projection mode: live or snapshot
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProjectionMode {
     /// Live projection that updates with the source
     Live,

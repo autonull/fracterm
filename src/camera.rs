@@ -226,6 +226,15 @@ impl Camera {
         self.animating = false;
     }
 
+    /// Snap to the animated target immediately (reduce-motion path: every
+    /// animated move lands instantly instead of easing).
+    pub fn snap_to_targets(&mut self) {
+        self.x = self.target_x;
+        self.y = self.target_y;
+        self.zoom = self.target_zoom;
+        self.animating = false;
+    }
+
     /// Smoothing rate (1/s) for animated moves: converges ~99% in 0.33s.
     /// Fast enough to feel instant, slow enough to read as motion.
     pub const SMOOTH_RATE: f64 = 14.0;
@@ -342,6 +351,18 @@ mod tests {
         assert!(!cam.animating);
         assert_eq!((cam.target_x, cam.target_y), (cam.x, cam.y));
         assert_eq!(cam.target_zoom, cam.zoom);
+    }
+
+    #[test]
+    fn test_snap_to_targets_lands_instantly() {
+        let mut cam = Camera::new();
+        cam.target_x = 100.0;
+        cam.target_y = 50.0;
+        cam.target_zoom = 2.0;
+        cam.animating = true;
+        cam.snap_to_targets();
+        assert!(!cam.animating);
+        assert_eq!((cam.x, cam.y, cam.zoom), (100.0, 50.0, 2.0));
     }
 
     #[test]

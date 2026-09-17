@@ -639,6 +639,87 @@ impl TextRenderer {
         })
     }
 
+    /// Rasterize, atlas-cache, and queue one glyph, returning the screen-
+    /// space pen advance (`None` when rasterization failed and the pen
+    /// must not move).
+    ///
+    /// # Safety
+    /// `gl` must be a valid, current OpenGL context.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn push_char(
+        &mut self,
+        gl: &glow::Context,
+        atlas: &mut Atlas,
+        fonts: &mut FontSystem,
+        font_id: u32,
+        pen: (f64, f64),
+        screen_px: u32,
+        ch: char,
+        color: (f32, f32, f32, f32),
+    ) -> Option<f64> {
+        let (pen_x, pen_y) = pen;
+        let subpixel = SubpixelBucket::from_fraction(pen_x.fract());
+        let (supply_id, glyph_id, bm) = fonts.rasterize(font_id, ch, screen_px, subpixel)?;
+        // Empty glyphs (no coverage) still advance the pen.
+        if bm.width == 0 || bm.height == 0 || bm.data.is_empty() {
+            return Some(bm.advance as f64 / 64.0);
+        }
+        let key = GlyphKey {
+            font_id: supply_id,
+            glyph_id,
+            pixel_size: screen_px,
+            subpixel,
+            style: StyleFlags::default(),
+            color_mode: ColorMode::Mono,
+        };
+        let (ax, ay, aw, ah) = match atlas.get(&key) {
+            Some(p) => p,
+            None => atlas.insert(gl, key, &bm),
+        };
+        let x0 = pen_x + bm.left as f64;
+        let y0 = pen_y - bm.top as f64;
+        let (w, h) = (bm.width as f64, bm.height as f64);
+        self.verts.extend_from_slice(&glyph_quad(
+            x0 as f32,
+            y0 as f32,
+            w as f32,
+            h as f32,
+            ax as f32,
+            ay as f32,
+            (ax + aw) as f32,
+            (ay + ah) as f32,
+            color,
+        ));
+        Some(bm.advance as f64 / 64.0)
+    }
+
+    /// Rasterize, atlas-cache, and queue one glyph for drawing. `pen` is
+    /// the screen-space pen origin (caller maps world -> screen once);
+    /// `screen_px` is the precomputed on-screen pixel size
+    /// (`choose_pixel_size`), so callers drawing grids hoist it per node
+    /// instead of recomputing per cell. No allocation: the per-cell
+    /// `char.to_string()` + `queue_string` path cost ~2000 allocs/frame.
+    ///
+    /// # Safety
+    /// `gl` must be a valid, current OpenGL context.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn queue_char_at(
+        &mut self,
+        gl: &glow::Context,
+        atlas: &mut Atlas,
+        fonts: &mut FontSystem,
+        font_id: u32,
+        pen: (f64, f64),
+        screen_px: u32,
+        ch: char,
+        color: (f32, f32, f32, f32),
+    ) {
+        if ch == ' ' {
+            return;
+        }
+        self.push_char(gl, atlas, fonts, font_id, pen, screen_px, ch, color);
+    }
+
     /// Rasterize, atlas-cache, and queue a string for drawing. `world` is
     /// the world-space pen origin; glyphs are rasterized at their on-screen
     /// pixel size (`choose_pixel_size`), so they stay crisp while zooming.
@@ -667,43 +748,18 @@ impl TextRenderer {
                 pen_x += screen_px as f64 * 0.55;
                 continue;
             }
-            let subpixel = SubpixelBucket::from_fraction(pen_x.fract());
-            let Some((supply_id, glyph_id, bm)) = fonts.rasterize(font_id, ch, screen_px, subpixel)
-            else {
-                continue;
-            };
-            // Empty glyphs (no coverage) still advance the pen.
-            if bm.width == 0 || bm.height == 0 || bm.data.is_empty() {
-                pen_x += bm.advance as f64 / 64.0;
-                continue;
-            }
-            let key = GlyphKey {
-                font_id: supply_id,
-                glyph_id,
-                pixel_size: screen_px,
-                subpixel,
-                style: StyleFlags::default(),
-                color_mode: ColorMode::Mono,
-            };
-            let (ax, ay, aw, ah) = match atlas.get(&key) {
-                Some(p) => p,
-                None => atlas.insert(gl, key, &bm),
-            };
-            let x0 = pen_x + bm.left as f64;
-            let y0 = pen_y - bm.top as f64;
-            let (w, h) = (bm.width as f64, bm.height as f64);
-            self.verts.extend_from_slice(&glyph_quad(
-                x0 as f32,
-                y0 as f32,
-                w as f32,
-                h as f32,
-                ax as f32,
-                ay as f32,
-                (ax + aw) as f32,
-                (ay + ah) as f32,
+            if let Some(adv) = self.push_char(
+                gl,
+                atlas,
+                fonts,
+                font_id,
+                (pen_x, pen_y),
+                screen_px,
+                ch,
                 color,
-            ));
-            pen_x += bm.advance as f64 / 64.0;
+            ) {
+                pen_x += adv;
+            }
         }
     }
 

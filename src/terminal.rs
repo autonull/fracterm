@@ -1,5 +1,7 @@
 //! Terminal engine - PTY-based terminal with grid, parser, and input handling.
 
+use std::collections::VecDeque;
+
 use crate::surface::Color;
 use crate::SurfaceId;
 
@@ -77,14 +79,17 @@ pub struct TerminalGrid {
     pub rows: u32,
     pub cols: u32,
     pub cells: Vec<Vec<TerminalCell>>,
-    pub scrollback: Vec<Vec<TerminalCell>>,
+    /// Capped at `scrollback_lines`; a `VecDeque` so evicting the oldest
+    /// line is O(1) — `Vec::remove(0)` memmoved up to 10k rows per line
+    /// during heavy output.
+    pub scrollback: VecDeque<Vec<TerminalCell>>,
 }
 
 impl TerminalGrid {
     pub fn new(rows: u32, cols: u32) -> Self {
         Self {
             cells: vec![vec![TerminalCell::default(); cols as usize]; rows as usize],
-            scrollback: Vec::new(),
+            scrollback: VecDeque::new(),
             rows,
             cols,
         }
@@ -155,10 +160,62 @@ impl Terminal {
     }
 
     pub fn scroll(&mut self, lines: i32) {
-        self.scroll_offset = (self.scroll_offset + lines).max(0);
+        let max = self.grid.scrollback.len() as i32;
+        self.scroll_offset = (self.scroll_offset + lines).clamp(0, max);
     }
 
-    pub fn scrollback_content(&self) -> &[Vec<TerminalCell>] {
+    pub fn reset_scroll(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    pub fn visible_line(&self, display_row: u32) -> Option<&[TerminalCell]> {
+        let rows = self.grid.rows as usize;
+        let sb = self.grid.scrollback.len();
+        let off = (self.scroll_offset as usize).min(sb);
+        let idx = sb - off + display_row as usize;
+        if idx < sb {
+            Some(&self.grid.scrollback[idx])
+        } else {
+            self.grid
+                .cells
+                .get(idx - sb)
+                .map(|v| v.as_slice())
+                .filter(|_| (display_row as usize) < rows)
+        }
+    }
+
+    pub fn selected_text(&self, a: (u32, u32), b: (u32, u32)) -> String {
+        let ((c0, r0), (c1, r1)) = if (a.1, a.0) <= (b.1, b.0) {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let mut out = String::new();
+        for r in r0..=r1.min(self.grid.rows.saturating_sub(1)) {
+            let c_start = if r == r0 { c0 } else { 0 };
+            let c_end = if r == r1 {
+                c1
+            } else {
+                self.grid.cols.saturating_sub(1)
+            };
+            let mut line = String::new();
+            for c in c_start..=c_end.min(self.grid.cols.saturating_sub(1)) {
+                if let Some(cell) = self.grid.get(r, c) {
+                    if cell.width == 0 {
+                        continue;
+                    }
+                    line.push(cell.character);
+                }
+            }
+            out.push_str(line.trim_end());
+            if r != r1 {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    pub fn scrollback_content(&self) -> &VecDeque<Vec<TerminalCell>> {
         &self.grid.scrollback
     }
 
@@ -189,9 +246,9 @@ impl Terminal {
             if self.cursor_row >= self.grid.rows {
                 if self.grid.rows > 0 {
                     let first_row = self.grid.cells.remove(0);
-                    self.grid.scrollback.push(first_row);
+                    self.grid.scrollback.push_back(first_row);
                     if self.grid.scrollback.len() > self.config.scrollback_lines {
-                        self.grid.scrollback.remove(0);
+                        self.grid.scrollback.pop_front();
                     }
                     self.grid
                         .cells
@@ -365,6 +422,20 @@ mod tests {
         assert!(source.is_active());
         let text = source.read();
         assert!(text.is_some());
+    }
+
+    #[test]
+    fn test_scrollback_cap_evicts_oldest_first() {
+        let mut term = Terminal::new(SurfaceId(1), 2, 4);
+        term.config.scrollback_lines = 3;
+        // 2-row grid: each newline past the bottom scrolls one line.
+        for ch in ['a', 'b', 'c', 'd', 'e', 'f', 'g'] {
+            term.write(&format!("{ch}\n"));
+        }
+        assert_eq!(term.grid.scrollback.len(), 3);
+        // Oldest retained line holds 'd', newest 'f': front-to-back order.
+        assert_eq!(term.grid.scrollback[0][0].character, 'd');
+        assert_eq!(term.grid.scrollback[2][0].character, 'f');
     }
 
     #[test]

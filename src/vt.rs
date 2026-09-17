@@ -209,6 +209,57 @@ impl MouseMode {
     }
 }
 
+/// Minimal strict base64 decode for OSC 52 payloads. Rejects anything
+/// outside the standard alphabet; padding (`=`, max 2) only in the final
+/// chunk. Pure: unit-tested.
+fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
+    if input.is_empty() {
+        return Some(Vec::new());
+    }
+    if !input.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let chunks: Vec<&[u8]> = input.chunks(4).collect();
+    for (ci, chunk) in chunks.iter().enumerate() {
+        let last = ci + 1 == chunks.len();
+        let mut sextets = [0u8; 4];
+        let mut pad = 0u8;
+        for (i, &b) in chunk.iter().enumerate() {
+            if pad > 0 && b != b'=' {
+                return None;
+            }
+            sextets[i] = match b {
+                b'A'..=b'Z' => b - b'A',
+                b'a'..=b'z' => b - b'a' + 26,
+                b'0'..=b'9' => b - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' if last && i >= 2 => {
+                    pad += 1;
+                    0
+                }
+                _ => return None,
+            };
+        }
+        if pad > 2 {
+            return None;
+        }
+        let n = u32::from(sextets[0]) << 18
+            | u32::from(sextets[1]) << 12
+            | u32::from(sextets[2]) << 6
+            | u32::from(sextets[3]);
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Which button a forwarded mouse event concerns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseButton {
@@ -267,6 +318,10 @@ pub struct VtEngine {
     /// Reply bytes owed to the child (e.g. Device Attributes answers).
     /// Drained by the window loop and written back to the PTY.
     pending_reply: Vec<u8>,
+    /// Clipboard text offered by the child (OSC 52): `(primary, text)`.
+    /// Drained by the window loop into the host clipboard. `?` queries
+    /// are ignored — we never read the clipboard back out.
+    pending_clipboard: Option<(bool, String)>,
     /// DCS sequence being collected (`dcs_hook` → `dcs_put`* → `unhook`).
     dcs_action: Option<char>,
     dcs_plus: bool,
@@ -294,6 +349,7 @@ impl VtEngine {
             title: String::new(),
             saved_cursor: None,
             pending_reply: Vec::new(),
+            pending_clipboard: None,
             dcs_action: None,
             dcs_plus: false,
             dcs_payload: Vec::new(),
@@ -323,6 +379,11 @@ impl VtEngine {
     /// Take bytes the terminal owes the child process.
     pub fn take_reply(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending_reply)
+    }
+
+    /// Take clipboard text the child offered via OSC 52, if any.
+    pub fn take_clipboard(&mut self) -> Option<(bool, String)> {
+        self.pending_clipboard.take()
     }
 
     /// Feed raw PTY output through the parser.
@@ -355,9 +416,9 @@ impl VtEngine {
         let cols = self.term.grid.cols as usize;
         for _ in 0..n {
             let first = self.term.grid.cells.remove(0);
-            self.term.grid.scrollback.push(first);
+            self.term.grid.scrollback.push_back(first);
             if self.term.grid.scrollback.len() > self.term.config.scrollback_lines {
-                self.term.grid.scrollback.remove(0);
+                self.term.grid.scrollback.pop_front();
             }
             self.term
                 .grid
@@ -692,6 +753,19 @@ impl vte::Perform for VtEngine {
                 // default background so the child never waits on a timeout.
                 self.pending_reply
                     .extend_from_slice(b"\x1b]11;rgb:0b0b/0d0d/1212\x1b\\");
+            } else if first == b"52" && params.len() > 2 {
+                // OSC 52 clipboard write (`OSC 52 ; Pc ; Pd ST`): base64
+                // payload into the host clipboard (`p` = primary selection,
+                // anything else = clipboard). Queries (`Pd == ?`) and
+                // oversized payloads are ignored; the child can only write.
+                let data = params[2];
+                if data != b"?" && data.len() <= 1_000_000 {
+                    if let Some(bytes) = decode_base64(data) {
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        let primary = params[1] == b"p";
+                        self.pending_clipboard = Some((primary, text));
+                    }
+                }
             }
         }
     }
@@ -1045,6 +1119,35 @@ mod tests {
         assert_eq!(e.title, "my-title");
         e.feed(b"\x1b]0;root-title\x1b\\");
         assert_eq!(e.title, "root-title");
+    }
+
+    #[test]
+    fn test_decode_base64_vectors() {
+        assert_eq!(decode_base64(b"").unwrap(), b"");
+        assert_eq!(decode_base64(b"aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(decode_base64(b"aGVsbG8sIHdvcmxk").unwrap(), b"hello, world");
+        assert_eq!(decode_base64(b"QUI=").unwrap(), b"AB");
+        assert!(decode_base64(b"abc").is_none());
+        assert!(decode_base64(b"***=").is_none());
+        assert!(decode_base64(b"AB=C").is_none());
+        assert!(decode_base64(b"=====").is_none());
+    }
+
+    #[test]
+    fn test_osc52_clipboard_offer() {
+        // `printf '\e]52;c;aGVsbG8=\a'` — clipboard write of "hello".
+        let mut e = engine(20, 5);
+        e.feed(b"\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(e.take_clipboard(), Some((false, "hello".to_string())));
+        assert_eq!(e.take_clipboard(), None);
+        // `p` targets the primary selection.
+        e.feed(b"\x1b]52;p;d29ybGQ=\x1b\\");
+        assert_eq!(e.take_clipboard(), Some((true, "world".to_string())));
+        // Queries and garbage are ignored, never read back.
+        e.feed(b"\x1b]52;c;?\x07");
+        assert_eq!(e.take_clipboard(), None);
+        e.feed(b"\x1b]52;c;***=\x07");
+        assert_eq!(e.take_clipboard(), None);
     }
 
     #[test]

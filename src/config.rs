@@ -332,6 +332,25 @@ impl Config {
         Self::config_dir().join("fracterm.config.ts")
     }
 
+    /// Get the data directory path (layouts, saved state)
+    pub fn data_dir() -> PathBuf {
+        if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
+            PathBuf::from(data_home).join("fracterm")
+        } else if let Ok(home) = std::env::var("HOME") {
+            PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("fracterm")
+        } else {
+            PathBuf::from("/tmp/fracterm")
+        }
+    }
+
+    /// Get the default saved-layout path
+    pub fn layout_path() -> PathBuf {
+        Self::data_dir().join("layout.json")
+    }
+
     /// Load configuration from TypeScript file
     pub fn load_from_ts(path: &PathBuf) -> Result<Self, String> {
         let source = std::fs::read_to_string(path)

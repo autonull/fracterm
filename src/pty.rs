@@ -82,9 +82,24 @@ impl PtySession {
 
     /// Drain pending output bytes from the reader thread.
     pub fn take_output(&self) -> Vec<u8> {
+        self.take_output_capped(usize::MAX)
+    }
+
+    /// Drain at most `max` pending bytes; any excess stays queued for the
+    /// next frame. A `cat` of a huge file must not turn one frame into a
+    /// multi-megabyte VT parse stall — the frame loop caps its feed and
+    /// the remainder flows through over following frames, in order.
+    pub fn take_output_capped(&self, max: usize) -> Vec<u8> {
         self.output
             .lock()
-            .map(|mut b| std::mem::take(&mut *b))
+            .map(|mut b| {
+                if b.len() <= max {
+                    std::mem::take(&mut *b)
+                } else {
+                    let rest = b.split_off(max);
+                    std::mem::replace(&mut *b, rest)
+                }
+            })
             .unwrap_or_default()
     }
 
@@ -147,6 +162,34 @@ mod tests {
         let text = String::from_utf8_lossy(&got);
         assert!(text.contains("fracterm-pty-test"), "output was: {text:?}");
         let _ = pty.write(b"\n");
+    }
+
+    #[test]
+    fn test_take_output_capped_preserves_order() {
+        if !std::path::Path::new("/bin/cat").exists() {
+            return;
+        }
+        let pty = PtySession::spawn(80, 24, Some("/bin/cat")).unwrap();
+        let _ = pty.write(b"abcdefghij\n");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut got = Vec::new();
+        while std::time::Instant::now() < deadline {
+            // Tiny cap forces multi-frame reassembly; leftover must stay
+            // queued in order, never dropped or reordered.
+            got.extend(pty.take_output_capped(3));
+            if got.windows(10).any(|w| w == b"abcdefghij") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // Drain whatever the cap left behind and check the full stream.
+        got.extend(pty.take_output());
+        let text = String::from_utf8_lossy(&got);
+        assert!(text.contains("abcdefghij"), "output was: {text:?}");
+        // Chunks arrived in stream order: first bytes precede later ones.
+        let a = text.find('a').unwrap();
+        let j = text.find('j').unwrap();
+        assert!(a < j);
     }
 
     #[test]

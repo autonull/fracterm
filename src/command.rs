@@ -466,6 +466,233 @@ impl Default for CommandRegistry {
     }
 }
 
+/// Single source of truth for every built-in action id.
+///
+/// The window palette, context menus, key dispatch, and help text all
+/// resolve through these ids (design invariant: every action is a
+/// command, not an ad-hoc key handler). Plugins, tests, and a future CLI
+/// see the same ids via [`register_builtin_commands`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinCommand {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub category: &'static str,
+    pub key: &'static str,
+}
+
+/// All built-in command ids with their palette title, category, and
+/// primary workspace-mode key hint ("" when only reachable by digit,
+/// palette, or menu).
+pub fn builtin_commands() -> Vec<BuiltinCommand> {
+    vec![
+        BuiltinCommand {
+            id: "terminal.new",
+            title: "New Terminal",
+            category: "Terminal",
+            key: "n",
+        },
+        BuiltinCommand {
+            id: "terminal.varied",
+            title: "Spawn Varied Terminal",
+            category: "Terminal",
+            key: "N",
+        },
+        BuiltinCommand {
+            id: "terminal.close",
+            title: "Close Selected",
+            category: "Terminal",
+            key: "x",
+        },
+        BuiltinCommand {
+            id: "terminal.copy",
+            title: "Copy Selection",
+            category: "Terminal",
+            key: "Ctrl+Shift+C",
+        },
+        BuiltinCommand {
+            id: "layout.tileH",
+            title: "Tile Horizontally",
+            category: "Arrange",
+            key: "h",
+        },
+        BuiltinCommand {
+            id: "layout.tileV",
+            title: "Tile Vertically",
+            category: "Arrange",
+            key: "v",
+        },
+        BuiltinCommand {
+            id: "layout.tileGrid",
+            title: "Tile Grid",
+            category: "Arrange",
+            key: "t",
+        },
+        BuiltinCommand {
+            id: "layout.cascade",
+            title: "Cascade Diagonal",
+            category: "Arrange",
+            key: "C",
+        },
+        BuiltinCommand {
+            id: "layout.orbit",
+            title: "Orbit Circle",
+            category: "Arrange",
+            key: "O",
+        },
+        BuiltinCommand {
+            id: "layout.focus",
+            title: "Focus Selected Center",
+            category: "Arrange",
+            key: "F",
+        },
+        BuiltinCommand {
+            id: "layout.dashboard",
+            title: "Dashboard 2-up + Fit",
+            category: "Arrange",
+            key: "d",
+        },
+        BuiltinCommand {
+            id: "layout.save",
+            title: "Save Layout",
+            category: "Arrange",
+            key: "S",
+        },
+        BuiltinCommand {
+            id: "layout.restore",
+            title: "Restore Layout",
+            category: "Arrange",
+            key: "",
+        },
+        BuiltinCommand {
+            id: "view.reduceMotion",
+            title: "Toggle Reduce Motion",
+            category: "View",
+            key: "",
+        },
+        BuiltinCommand {
+            id: "layout.alignLeft",
+            title: "Align Left",
+            category: "Arrange",
+            key: "a",
+        },
+        BuiltinCommand {
+            id: "camera.fit",
+            title: "Fit Dashboard",
+            category: "Camera",
+            key: "f",
+        },
+        BuiltinCommand {
+            id: "camera.workspaceFit",
+            title: "Zoom to Workspace Fit",
+            category: "Camera",
+            key: "0",
+        },
+        BuiltinCommand {
+            id: "camera.bookmarkSave",
+            title: "Save Bookmark",
+            category: "Camera",
+            key: "b",
+        },
+        BuiltinCommand {
+            id: "camera.bookmarkRestore",
+            title: "Restore Bookmark 1-9",
+            category: "Camera",
+            key: "1-9",
+        },
+        BuiltinCommand {
+            id: "view.pin",
+            title: "Pin Snapshot of Focused Terminal",
+            category: "View",
+            key: "p",
+        },
+        BuiltinCommand {
+            id: "view.pinLive",
+            title: "Pin Live View of Focused Terminal",
+            category: "View",
+            key: "P",
+        },
+        BuiltinCommand {
+            id: "style.fontBigger",
+            title: "Selected: Font Bigger",
+            category: "Style",
+            key: ".",
+        },
+        BuiltinCommand {
+            id: "style.fontSmaller",
+            title: "Selected: Font Smaller",
+            category: "Style",
+            key: ",",
+        },
+        BuiltinCommand {
+            id: "style.opacity",
+            title: "Selected: Cycle Opacity",
+            category: "Style",
+            key: "o",
+        },
+        BuiltinCommand {
+            id: "style.tint",
+            title: "Selected: Cycle Tint",
+            category: "Style",
+            key: "c",
+        },
+        BuiltinCommand {
+            id: "help.open",
+            title: "Help / Keys",
+            category: "Help",
+            key: "?",
+        },
+    ]
+}
+
+/// Key (workspace mode) to built-in command id, for single-character keys.
+/// Multi-key bindings (palette, copy) and digit restores are handled at
+/// the call site; this covers the `c == "..."` dispatch arms.
+pub fn command_for_key(key: &str) -> Option<&'static str> {
+    match key {
+        "n" => Some("terminal.new"),
+        "N" => Some("terminal.varied"),
+        "x" => Some("terminal.close"),
+        "h" => Some("layout.tileH"),
+        "v" => Some("layout.tileV"),
+        "t" => Some("layout.tileGrid"),
+        "C" => Some("layout.cascade"),
+        "O" => Some("layout.orbit"),
+        "F" => Some("layout.focus"),
+        "d" => Some("layout.dashboard"),
+        "S" => Some("layout.save"),
+        "a" => Some("layout.alignLeft"),
+        "f" => Some("camera.fit"),
+        "0" => Some("camera.workspaceFit"),
+        "b" => Some("camera.bookmarkSave"),
+        "p" => Some("view.pin"),
+        "P" => Some("view.pinLive"),
+        "." => Some("style.fontBigger"),
+        "," => Some("style.fontSmaller"),
+        "o" => Some("style.opacity"),
+        "c" => Some("style.tint"),
+        "?" => Some("help.open"),
+        _ => None,
+    }
+}
+
+/// Register every built-in id into a registry so palette rows, plugins,
+/// tests, and a future CLI resolve the same ids. Handlers validate empty
+/// input and report success; real execution lives in the window layer,
+/// which dispatches by these ids.
+pub fn register_builtin_commands(registry: &mut CommandRegistry) {
+    for spec in builtin_commands() {
+        let title = spec.title;
+        let category = spec.category;
+        registry.register(Command::new(
+            CommandId(0),
+            spec.id,
+            title,
+            category,
+            move |_ctx, _input| Ok(CommandResult::ok(format!("{title} dispatched"))),
+        ));
+    }
+}
+
 /// Plugin host trait for command execution context
 pub trait PluginHost: Send + Sync {
     fn execute_command(
@@ -586,6 +813,60 @@ mod tests {
         let mut input = HashMap::new();
         input.insert("custom".to_string(), "anything".into());
         assert!(schema.validate(&input).is_ok());
+    }
+
+    #[test]
+    fn test_builtin_catalog_ids_unique_and_registered() {
+        use std::collections::HashSet;
+        let specs = builtin_commands();
+        let ids: HashSet<_> = specs.iter().map(|s| s.id).collect();
+        assert_eq!(ids.len(), specs.len(), "duplicate builtin command id");
+        let mut registry = CommandRegistry::new();
+        register_builtin_commands(&mut registry);
+        for spec in &specs {
+            assert!(registry.get(spec.id).is_some(), "missing {}", spec.id);
+        }
+        assert_eq!(registry.list().len(), specs.len());
+    }
+
+    #[test]
+    fn test_command_for_key_covers_single_char_dispatch() {
+        for key in [
+            "n", "N", "x", "h", "v", "t", "C", "O", "F", "d", "a", "f", "0", "b", "p", "P", ".",
+            ",", "o", "c", "?", "S",
+        ] {
+            let id = command_for_key(key).unwrap_or_else(|| panic!("no command for key {key}"));
+            assert!(builtin_commands().iter().any(|s| s.id == id));
+        }
+        assert_eq!(command_for_key("q"), None);
+    }
+
+    #[test]
+    fn test_builtin_command_executes() {
+        let mut registry = CommandRegistry::new();
+        register_builtin_commands(&mut registry);
+        let ctx = CommandContext::new(
+            Arc::new(Workspace::new()),
+            Arc::new(EventBus::new()),
+            Arc::new(()),
+            Config::default(),
+        );
+        let result = registry
+            .execute("layout.tileH", ctx, HashMap::new())
+            .unwrap();
+        assert!(result.success);
+        assert!(registry
+            .execute(
+                "nope.missing",
+                CommandContext::new(
+                    Arc::new(Workspace::new()),
+                    Arc::new(EventBus::new()),
+                    Arc::new(()),
+                    Config::default(),
+                ),
+                HashMap::new()
+            )
+            .is_err());
     }
 
     #[test]

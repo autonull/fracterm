@@ -15,6 +15,7 @@ pub mod permission;
 pub mod plugin;
 pub mod projection;
 pub mod pty;
+pub mod regions;
 pub mod rendering;
 pub mod script;
 pub mod surface;
@@ -30,8 +31,9 @@ pub mod workspace;
 pub use app::{default_config, App, CliArgs};
 pub use camera::{Camera, CameraBookmark};
 pub use command::{
-    Command, CommandContext, CommandInputSchema, CommandRegistry, CommandResult, CommandValue,
-    InputParam, KeyBinding,
+    builtin_commands, command_for_key, register_builtin_commands, BuiltinCommand, Command,
+    CommandContext, CommandInputSchema, CommandRegistry, CommandResult, CommandValue, InputParam,
+    KeyBinding,
 };
 pub use config::Config;
 pub use event::{Event, EventBus, EventType};

@@ -248,6 +248,23 @@ pub fn dashboard_layout(
     ((tx, ty), (vx, vy))
 }
 
+/// Whether two rects overlap with nonzero area. Edge-touching counts as
+/// disjoint (nothing visible to draw). Used for viewport culling: nodes
+/// fully outside the visible world rect skip the text pass entirely.
+#[allow(clippy::too_many_arguments)]
+pub fn rects_intersect(
+    ax: f64,
+    ay: f64,
+    aw: f64,
+    ah: f64,
+    bx: f64,
+    by: f64,
+    bw: f64,
+    bh: f64,
+) -> bool {
+    ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by
+}
+
 /// Place a new node beside an anchor: try the right side first; if the
 /// new node would overflow the viewport width, wrap below the anchor.
 /// `anchor` is (x, y, w, h), `size` is (w, h), `view` is (w, h).
@@ -381,6 +398,73 @@ pub fn snap_to_edges(moving: &Node, others: &[&Node], threshold: f64) -> SnapGui
         y: my,
         distance: f64::INFINITY,
     })
+}
+
+pub fn cascade_from(nodes: &[&Node], step: f64) -> Vec<(NodeId, f64, f64)> {
+    if nodes.is_empty() {
+        return Vec::new();
+    }
+    let (ox, oy) = (nodes[0].transform.x, nodes[0].transform.y);
+    nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id, ox + i as f64 * step, oy + i as f64 * step))
+        .collect()
+}
+
+pub fn orbit(nodes: &[&Node], radius: f64) -> Vec<(NodeId, f64, f64)> {
+    if nodes.is_empty() {
+        return Vec::new();
+    }
+    if nodes.len() == 1 {
+        return vec![(nodes[0].id, nodes[0].transform.x, nodes[0].transform.y)];
+    }
+    let (cx, cy) = centroid(nodes);
+    let n = nodes.len() as f64;
+    nodes
+        .iter()
+        .enumerate()
+        .map(|(i, nd)| {
+            let a = 2.0 * std::f64::consts::PI * i as f64 / n;
+            let (w, h) = nd.size;
+            (
+                nd.id,
+                cx + radius * a.cos() - w / 2.0,
+                cy + radius * a.sin() - h / 2.0,
+            )
+        })
+        .collect()
+}
+
+pub fn focus_ring(nodes: &[&Node], focused: NodeId, radius: f64) -> Vec<(NodeId, f64, f64)> {
+    if nodes.is_empty() {
+        return Vec::new();
+    }
+    let (cx, cy) = centroid(nodes);
+    let others: Vec<&&Node> = nodes.iter().filter(|n| n.id != focused).collect();
+    let mut out = vec![(focused, cx, cy)];
+    let n = others.len() as f64;
+    for (i, nd) in others.iter().enumerate() {
+        let a = 2.0 * std::f64::consts::PI * i as f64 / n.max(1.0);
+        let (w, h) = nd.size;
+        out.push((
+            nd.id,
+            cx + radius * a.cos() - w / 2.0,
+            cy + radius * a.sin() - h / 2.0,
+        ));
+    }
+    out
+}
+
+fn centroid(nodes: &[&Node]) -> (f64, f64) {
+    let (sx, sy) = nodes.iter().fold((0.0, 0.0), |(ax, ay), n| {
+        (
+            ax + n.transform.x + n.size.0 / 2.0,
+            ay + n.transform.y + n.size.1 / 2.0,
+        )
+    });
+    let n = nodes.len() as f64;
+    (sx / n, sy / n)
 }
 
 #[cfg(test)]
@@ -597,6 +681,64 @@ mod tests {
         ));
         assert!(!resize_handle_hit(
             0.0, 0.0, 100.0, 100.0, 0.0, 0.0, 1.0, 50.0, 50.0, 10.0
+        ));
+    }
+
+    #[test]
+    fn test_cascade_from_steps_diagonally() {
+        let mut nodes = vec![
+            node(1, 10.0, 20.0, 50.0, 50.0),
+            node(2, 99.0, 99.0, 50.0, 50.0),
+        ];
+        let r = super::cascade_from(&refs(&mut nodes), 48.0);
+        assert_eq!(r[0], (NodeId(1), 10.0, 20.0));
+        assert_eq!(r[1], (NodeId(2), 58.0, 68.0));
+    }
+
+    #[test]
+    fn test_orbit_spreads_ring() {
+        let mut nodes = vec![
+            node(1, 0.0, 0.0, 100.0, 100.0),
+            node(2, 200.0, 0.0, 100.0, 100.0),
+        ];
+        let r = super::orbit(&refs(&mut nodes), 200.0);
+        assert_eq!(r.len(), 2);
+        assert!((r[0].1 - r[1].1).abs() > 100.0);
+    }
+
+    #[test]
+    fn test_focus_ring_keeps_focus_first() {
+        let mut nodes = vec![
+            node(1, 0.0, 0.0, 100.0, 100.0),
+            node(2, 300.0, 0.0, 100.0, 100.0),
+        ];
+        let r = super::focus_ring(&refs(&mut nodes), NodeId(2), 300.0);
+        assert_eq!(r[0].0, NodeId(2));
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn test_rects_intersect_culling() {
+        // Overlap and containment are visible.
+        assert!(super::rects_intersect(
+            0.0, 0.0, 10.0, 10.0, 5.0, 5.0, 10.0, 10.0
+        ));
+        assert!(super::rects_intersect(
+            0.0, 0.0, 100.0, 100.0, 10.0, 10.0, 5.0, 5.0
+        ));
+        // Fully outside on any side is culled.
+        assert!(!super::rects_intersect(
+            0.0, 0.0, 10.0, 10.0, 20.0, 0.0, 10.0, 10.0
+        ));
+        assert!(!super::rects_intersect(
+            0.0, 0.0, 10.0, 10.0, 0.0, 20.0, 10.0, 10.0
+        ));
+        assert!(!super::rects_intersect(
+            20.0, 20.0, 10.0, 10.0, 0.0, 0.0, 10.0, 10.0
+        ));
+        // Edge-touching has zero visible area: culled.
+        assert!(!super::rects_intersect(
+            0.0, 0.0, 10.0, 10.0, 10.0, 0.0, 10.0, 10.0
         ));
     }
 }

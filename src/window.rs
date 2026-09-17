@@ -1,7 +1,22 @@
 //! Windowed canvas runtime: winit event loop + glutin OpenGL context,
 //! camera pan/zoom input, resize and HiDPI handling (README M1).
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
+
+type CellPos = (u32, u32);
+type TextSelection = (SurfaceId, crate::NodeId, CellPos, CellPos);
+type SelectDrag = (SurfaceId, crate::NodeId, CellPos);
+type MenuItems = Vec<(String, String)>;
+type MenuSnap = Option<(f64, f64, MenuItems, usize)>;
+type ScrollBar = (f64, f64, f64, f64, f64, f64, f64, f64);
+
+struct MenuState {
+    x: f64,
+    y: f64,
+    items: MenuItems,
+    index: usize,
+}
 
 use glutin::context::{ContextApi, PossiblyCurrentContext};
 use glutin::display::GetGlDisplay;
@@ -108,9 +123,25 @@ struct CanvasState {
     /// the press had no Shift): motion/release go to its PTY, not to
     /// canvas drags. Cleared on left release.
     forwarding: Option<ForwardMouse>,
-    /// Middle-button press anchor: still a potential click (primary paste
-    /// on release) until the cursor moves past the pan threshold.
     middle_down: Option<(f64, f64)>,
+    selecting: Option<SelectDrag>,
+    selection: Option<TextSelection>,
+    font_scales: HashMap<crate::NodeId, f32>,
+    menu: Option<MenuState>,
+    palette_open: bool,
+    palette_query: String,
+    palette_index: usize,
+    /// Space held: left-drag pans even over a node. Full-bleed startup
+    /// leaves no empty canvas, so middle-drag was the only pan — space-pan
+    /// restores a one-handed pan anywhere. Only honored when no terminal
+    /// has keyboard focus (otherwise space types into the PTY).
+    space_down: bool,
+    /// Auto-zoom region cache: `detect_zoom_regions` scans the whole grid,
+    /// so it only re-runs when the selected terminal's content changed
+    /// (`dirty`) or the node/metrics moved. Key is (node, x, y, cw, lh).
+    region_cache_node: Option<crate::NodeId>,
+    region_cache_key: (u64, u64, u64, u64),
+    region_cache: Vec<(f64, f64, f64, f64)>,
 }
 
 /// A terminal child that owns the mouse until left-button release.
@@ -118,6 +149,43 @@ struct CanvasState {
 struct ForwardMouse {
     surface: SurfaceId,
     button: crate::vt::MouseButton,
+}
+
+/// Fuzzy subsequence score for palette filtering (`None` = no match).
+/// Both inputs must already be lowercased. Matches earn a base value
+/// plus bonuses for word-boundary hits (`tile` in `arrange.tile` after
+/// `.`) and consecutive runs, so `pinl` ranks `view.pinLive` above a
+/// scattered cross-word match.
+pub fn fuzzy_score(query: &str, target: &str) -> Option<u32> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let mut score = 0u32;
+    let mut qi = query.chars();
+    let mut need = qi.next()?;
+    let mut prev_match = false;
+    let mut prev_boundary = true;
+    for ch in target.chars() {
+        if ch == need {
+            score += 10;
+            if prev_boundary {
+                score += 15;
+            }
+            if prev_match {
+                score += 5;
+            }
+            prev_match = true;
+            prev_boundary = false;
+            match qi.next() {
+                Some(c) => need = c,
+                None => return Some(score),
+            }
+        } else {
+            prev_match = false;
+            prev_boundary = matches!(ch, '.' | '-' | '_' | '/' | ' ' | ':');
+        }
+    }
+    None
 }
 
 impl CanvasState {
@@ -155,6 +223,17 @@ impl CanvasState {
             viewport_size: (1280.0, 720.0),
             forwarding: None,
             middle_down: None,
+            selecting: None,
+            selection: None,
+            font_scales: HashMap::new(),
+            menu: None,
+            palette_open: false,
+            palette_query: String::new(),
+            palette_index: 0,
+            space_down: false,
+            region_cache_node: None,
+            region_cache_key: (0, 0, 0, 0),
+            region_cache: Vec::new(),
         }
     }
 
@@ -204,24 +283,27 @@ impl CanvasState {
                 .camera_mut()
                 .fit_rect(rect, vw as f64, vh as f64);
         } else if ctrl {
-            // Context menu stub: report the hit target.
             let (wx, wy) = (cam.x + sx / cam.zoom, cam.y + sy / cam.zoom);
-            if let Some(node) = self.hit_node(wx, wy) {
-                eprintln!("context menu target: node {}", node.id.0);
-            } else {
-                eprintln!("context menu target: workspace");
-            }
+            let node = self.hit_node(wx, wy).map(|n| n.id);
+            self.open_menu(wx, wy, node);
         } else {
-            // Autozoom to the object under the cursor.
             let (wx, wy) = (cam.x + sx / cam.zoom, cam.y + sy / cam.zoom);
             let hit = self.hit_node(wx, wy).map(|n| (n.id, n.transform, n.size));
             if let Some((nid, t, size)) = hit {
                 let (vw, vh) = self.viewport_size;
-                self.app
-                    .state
-                    .workspace
-                    .camera_mut()
-                    .zoom_to_node(nid, t, size, vw as f64, vh as f64);
+                if let Some(rect) = self.region_zoom_rect(nid, sx, sy) {
+                    self.app
+                        .state
+                        .workspace
+                        .camera_mut()
+                        .fit_rect(rect, vw as f64, vh as f64);
+                } else {
+                    self.app
+                        .state
+                        .workspace
+                        .camera_mut()
+                        .zoom_to_node(nid, t, size, vw as f64, vh as f64);
+                }
             }
         }
     }
@@ -318,15 +400,28 @@ impl CanvasState {
         }
     }
 
-    /// Pin the current viewport as a snapshot projection node ("Pin as View").
-    fn pin_current_view(&mut self) {
-        let cam = self.app.state.workspace.camera().clone();
-        let (vw, vh) = self.viewport_size;
-        let rect = crate::lens::Rect {
-            x: cam.x,
-            y: cam.y,
-            width: vw as f64 / cam.zoom,
-            height: vh as f64 / cam.zoom,
+    /// Pin the focused terminal as a projection node beside it ("Pin as View").
+    /// Snapshot freezes what you saw; live re-syncs from the source every
+    /// frame (follow tail) via the existing projection sync.
+    fn pin_view(&mut self, live: bool) {
+        let source = match self.focused_term {
+            Some(s) => s,
+            None => return,
+        };
+        let anchor = self
+            .terms
+            .iter()
+            .find(|t| t.surface == source)
+            .map(|t| t.node)
+            .and_then(|id| {
+                self.app
+                    .state
+                    .workspace
+                    .get_node(id)
+                    .map(|n| (n.transform.x, n.transform.y, n.size.0, n.size.1))
+            });
+        let Some((ax, ay, aw, _ah)) = anchor else {
+            return;
         };
         let next_id = crate::NodeId(
             self.app
@@ -344,21 +439,390 @@ impl CanvasState {
             columns: None,
             filter: None,
             search: None,
-            max_lines: Some(24),
-            follow: false,
+            max_lines: None,
+            follow: live,
         };
-        let proj = crate::ProjectionSurface::new(
-            crate::SurfaceId(1),
-            selector,
-            crate::ProjectionMode::Snapshot,
-        );
-        let mut node = crate::Node::new(next_id, rect.x + rect.width + 40.0, rect.y);
-        node.set_surface(crate::SurfaceId(1));
+        let term = match self.terms.iter().find(|t| t.surface == source) {
+            Some(t) => &t.engine.term,
+            None => return,
+        };
+        let mode = if live {
+            crate::ProjectionMode::Live
+        } else {
+            crate::ProjectionMode::Snapshot
+        };
+        let proj = crate::ProjectionSurface::from_terminal(term, selector, mode);
+        let (pw, ph) = (aw.max(200.0), 320.0);
+        let mut node = crate::Node::new(next_id, ax + aw + 40.0, ay);
+        node.size = (pw, ph);
+        node.set_surface(source);
         node.projection = Some(proj);
         node.transform.scale = 1.0;
-        let _ = rect;
         self.app.state.workspace.add_node(node);
-        eprintln!("pinned view as node {next_id:?}");
+        self.selected = Some(next_id);
+        let kind = if live { "live view" } else { "snapshot" };
+        eprintln!("pinned {kind} as node {next_id:?}");
+    }
+
+    /// Palette rows, sourced from the builtin command catalog so palette,
+    /// menus, keys, and help all resolve the same ids. The digit-restore
+    /// helper (`camera.bookmarkRestore`) is key-only and stays out.
+    ///
+    /// Rows are ranked by [`fuzzy_score`] so short queries (`tv`, `pinl`)
+    /// find their command without exact-substring typing.
+    fn palette_commands() -> Vec<(&'static str, &'static str)> {
+        crate::command::builtin_commands()
+            .into_iter()
+            .filter(|c| c.id != "camera.bookmarkRestore")
+            .map(|c| (c.id, c.title))
+            .collect()
+    }
+
+    fn palette_filtered(&self) -> Vec<(&'static str, &'static str)> {
+        let q = self.palette_query.to_lowercase();
+        if q.is_empty() {
+            return Self::palette_commands();
+        }
+        let mut scored: Vec<(u32, &'static str, &'static str)> = Self::palette_commands()
+            .into_iter()
+            .filter_map(|(id, title)| {
+                let a = fuzzy_score(&q, &id.to_lowercase());
+                let b = fuzzy_score(&q, &title.to_lowercase());
+                match (a, b) {
+                    (None, None) => None,
+                    (x, y) => Some((x.unwrap_or(0).max(y.unwrap_or(0)), id, title)),
+                }
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+        scored
+            .into_iter()
+            .map(|(_, id, title)| (id, title))
+            .collect()
+    }
+
+    fn run_palette_command(&mut self, id: &str) {
+        match id {
+            "terminal.new" => {
+                if self.terms.len() < 8 {
+                    let size = self.terminal_node_size(GRID_COLS, GRID_ROWS);
+                    let view = (self.viewport_size.0 as f64, self.viewport_size.1 as f64);
+                    let anchor = self
+                        .focused_term
+                        .and_then(|s| self.terms.iter().find(|t| t.surface == s))
+                        .map(|s| s.node)
+                        .or_else(|| self.terms.last().map(|s| s.node))
+                        .and_then(|nid| {
+                            self.app
+                                .state
+                                .workspace
+                                .get_node(nid)
+                                .map(|n| (n.transform.x, n.transform.y, n.size.0, n.size.1))
+                        })
+                        .unwrap_or((DASH_MARGIN, DASH_MARGIN, size.0, size.1));
+                    let pos = crate::arrange::place_beside(anchor, size, DASH_GAP, view);
+                    if let Err(e) = self.spawn_terminal_node(GRID_COLS, GRID_ROWS, pos) {
+                        eprintln!("failed to spawn terminal: {e}");
+                    }
+                } else {
+                    eprintln!("terminal limit reached");
+                }
+            }
+            "layout.tileH" => self.apply_arrange(
+                |ns, _| crate::arrange::tile_horizontally(ns, crate::arrange::DEFAULT_GAP),
+                0,
+            ),
+            "layout.tileV" => self.apply_arrange(
+                |ns, _| crate::arrange::tile_vertically(ns, crate::arrange::DEFAULT_GAP),
+                0,
+            ),
+            "layout.tileGrid" => self.apply_arrange(
+                |ns, _| crate::arrange::tile_grid(ns, 3, crate::arrange::DEFAULT_GAP),
+                0,
+            ),
+            "camera.fit" => self.fit_dashboard(false),
+            "camera.workspaceFit" => self
+                .app
+                .state
+                .workspace
+                .camera_mut()
+                .zoom_to_workspace_fit(),
+            "view.pin" => self.pin_view(false),
+            "view.pinLive" => self.pin_view(true),
+            "camera.bookmarkSave" => {
+                let name = self.app.state.workspace.camera_mut().save_next_bookmark();
+                eprintln!("bookmark {name} saved");
+            }
+            "layout.dashboard" => {
+                if let Some(first) = self.app.state.workspace.all_nodes().first().map(|n| n.id) {
+                    if let Some(n) = self.app.state.workspace.get_node_mut(first) {
+                        n.transform.x = DASH_MARGIN;
+                        n.transform.y = DASH_MARGIN;
+                    }
+                }
+                self.apply_arrange(
+                    |ns, _| crate::arrange::tile_grid(ns, 2, crate::arrange::DEFAULT_GAP),
+                    0,
+                );
+                self.fit_dashboard(false);
+            }
+            "layout.save" => self.save_layout(),
+            "layout.restore" => self.restore_layout(),
+            "view.reduceMotion" => {
+                let on = !self.app.state.config.accessibility.reduce_motion;
+                self.app.state.config.accessibility.reduce_motion = on;
+                eprintln!("reduce motion {}", if on { "on" } else { "off" });
+            }
+            "terminal.close" => {
+                self.close_selected();
+            }
+            "terminal.copy" => self.copy_selection_to_clipboard(false),
+            "terminal.varied" => self.spawn_varied_terminal(),
+            "style.fontBigger" => self.adjust_selected_font(0.15),
+            "style.fontSmaller" => self.adjust_selected_font(-0.15),
+            "style.opacity" => self.cycle_selected_opacity(),
+            "style.tint" => self.cycle_selected_tint(),
+            "layout.cascade" => {
+                self.apply_arrange(|ns, _| crate::arrange::cascade_from(ns, 48.0), 0)
+            }
+            "layout.alignLeft" => self.apply_arrange(
+                |ns, _| crate::arrange::align(ns, crate::arrange::Edge::Left),
+                0,
+            ),
+            "layout.orbit" => self.apply_arrange(|ns, _| crate::arrange::orbit(ns, 420.0), 0),
+            "layout.focus" => {
+                if let Some(id) = self.selected {
+                    let owned: Vec<crate::Node> = self
+                        .app
+                        .state
+                        .workspace
+                        .all_nodes()
+                        .iter()
+                        .map(|n| (*n).clone())
+                        .collect();
+                    let refs: Vec<&crate::Node> = owned.iter().collect();
+                    for (nid, x, y) in crate::arrange::focus_ring(&refs, id, 460.0) {
+                        if let Some(n) = self.app.state.workspace.get_node_mut(nid) {
+                            n.transform.x = x;
+                            n.transform.y = y;
+                        }
+                    }
+                }
+            }
+            "help.open" => {
+                let mut parts: Vec<String> = crate::command::builtin_commands()
+                    .into_iter()
+                    .map(|c| {
+                        if c.key.is_empty() {
+                            format!("{} ({})", c.title, c.id)
+                        } else {
+                            format!("{}: {}", c.key, c.title)
+                        }
+                    })
+                    .collect();
+                parts.push("Ctrl+K / :: palette".to_string());
+                eprintln!("keys: {}", parts.join(", "));
+            }
+            _ => {}
+        }
+    }
+
+    fn spawn_varied_terminal(&mut self) {
+        if self.terms.len() >= 8 {
+            return;
+        }
+        const PRESETS: [(u32, u32); 4] = [(80, 24), (100, 32), (60, 16), (120, 28)];
+        let (cols, rows) = PRESETS[self.terms.len() % PRESETS.len()];
+        let size = self.terminal_node_size(cols, rows);
+        let view = (self.viewport_size.0 as f64, self.viewport_size.1 as f64);
+        let anchor = self
+            .focused_term
+            .and_then(|s| self.terms.iter().find(|t| t.surface == s))
+            .map(|s| s.node)
+            .or_else(|| self.terms.last().map(|s| s.node))
+            .and_then(|nid| {
+                self.app
+                    .state
+                    .workspace
+                    .get_node(nid)
+                    .map(|n| (n.transform.x, n.transform.y, n.size.0, n.size.1))
+            })
+            .unwrap_or((DASH_MARGIN, DASH_MARGIN, size.0, size.1));
+        let pos = crate::arrange::place_beside(anchor, size, DASH_GAP, view);
+        if self.spawn_terminal_node(cols, rows, pos).is_ok() {
+            if let Some(sess) = self.terms.last() {
+                let nid = sess.node;
+                let scale = match PRESETS[(self.terms.len() - 1) % PRESETS.len()] {
+                    (60, _) => 0.8,
+                    (100, _) => 1.0,
+                    (120, _) => 1.25,
+                    _ => 1.0,
+                };
+                self.font_scales.insert(nid, scale);
+            }
+        }
+    }
+
+    fn adjust_selected_font(&mut self, delta: f32) {
+        if let Some(id) = self.selected {
+            let cur = self.font_scales.get(&id).copied().unwrap_or(1.0);
+            self.font_scales.insert(id, (cur + delta).clamp(0.7, 2.5));
+        }
+    }
+
+    fn cycle_selected_opacity(&mut self) {
+        if let Some(id) = self.selected {
+            if let Some(n) = self.app.state.workspace.get_node_mut(id) {
+                const STEPS: [u8; 4] = [255, 235, 205, 170];
+                let cur = n.style.background.a;
+                let next = STEPS.iter().find(|a| **a < cur).copied().unwrap_or(255);
+                n.style.background.a = next;
+            }
+        }
+    }
+
+    fn cycle_selected_tint(&mut self) {
+        if let Some(id) = self.selected {
+            if let Some(n) = self.app.state.workspace.get_node_mut(id) {
+                const TINTS: [&str; 4] = ["#0b0d12", "#0d1410", "#101322", "#1a1214"];
+                let cur = (
+                    n.style.background.r,
+                    n.style.background.g,
+                    n.style.background.b,
+                );
+                let idx = TINTS
+                    .iter()
+                    .position(|h| {
+                        let c = crate::surface::Color::from_hex(h);
+                        (c.r, c.g, c.b) == cur
+                    })
+                    .map(|i| i + 1)
+                    .unwrap_or(1)
+                    % TINTS.len();
+                n.style.background.a = n.style.background.a.max(170);
+                let rgb = crate::surface::Color::from_hex(TINTS[idx]);
+                n.style.background.r = rgb.r;
+                n.style.background.g = rgb.g;
+                n.style.background.b = rgb.b;
+            }
+        }
+    }
+
+    fn menu_items_for(&self, node: Option<crate::NodeId>) -> MenuItems {
+        let kind = node
+            .and_then(|id| self.app.state.workspace.get_node(id))
+            .map(|n| {
+                if n.projection.is_some() {
+                    "projection"
+                } else if n.surface_id().is_some() {
+                    "terminal"
+                } else {
+                    "workspace"
+                }
+            })
+            .unwrap_or("workspace");
+        let ids: &[&str] = match kind {
+            "terminal" => &[
+                "terminal.copy",
+                "view.pin",
+                "view.pinLive",
+                "style.fontBigger",
+                "style.fontSmaller",
+                "style.opacity",
+                "style.tint",
+                "layout.focus",
+                "terminal.close",
+            ],
+            "projection" => &["layout.focus", "terminal.close"],
+            _ => &[
+                "terminal.new",
+                "terminal.varied",
+                "layout.tileH",
+                "layout.tileV",
+                "layout.tileGrid",
+                "layout.cascade",
+                "layout.orbit",
+                "layout.focus",
+                "layout.save",
+                "layout.restore",
+                "view.reduceMotion",
+                "camera.fit",
+                "help.open",
+            ],
+        };
+        Self::palette_commands()
+            .into_iter()
+            .filter(|(id, _)| ids.contains(id))
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
+    fn open_menu(&mut self, x: f64, y: f64, node: Option<crate::NodeId>) {
+        let items = self.menu_items_for(node);
+        if items.is_empty() {
+            return;
+        }
+        self.menu = Some(MenuState {
+            x,
+            y,
+            items,
+            index: 0,
+        });
+    }
+
+    fn region_zoom_rect(&self, node: crate::NodeId, sx: f64, sy: f64) -> Option<crate::lens::Rect> {
+        let sess = self.terms.iter().find(|s| s.node == node)?;
+        let grid = &sess.engine.term.grid;
+        let regions = crate::regions::detect_zoom_regions(grid);
+        if regions.is_empty() {
+            return None;
+        }
+        let cam = self.app.state.workspace.camera();
+        let node_pos = self
+            .app
+            .state
+            .workspace
+            .get_node(node)
+            .map(|n| (n.transform.x, n.transform.y))?;
+        let (cell_w, line_h) = self.grid_cell;
+        let header = self.header_h();
+        let (col, row) = screen_to_cell(
+            sx, sy, cam.x, cam.y, cam.zoom, node_pos.0, node_pos.1, GRID_PAD_X, header, cell_w,
+            line_h, grid.cols, grid.rows,
+        );
+        let hit = regions.iter().find(|r| r.contains(col, row))?;
+        let (ox, oy) = crate::arrange::grid_cell_origin(
+            node_pos.0, node_pos.1, GRID_PAD_X, header, cell_w, line_h, hit.col, hit.row,
+        );
+        Some(crate::lens::Rect {
+            x: ox,
+            y: oy,
+            width: (hit.cols as f64 * cell_w).max(1.0),
+            height: (hit.rows as f64 * line_h).max(1.0),
+        })
+    }
+
+    fn copy_selection_to_clipboard(&mut self, primary: bool) {
+        let Some((surface, _, a, b)) = self.selection else {
+            return;
+        };
+        let text = self
+            .terms
+            .iter()
+            .find(|t| t.surface == surface)
+            .map(|t| t.engine.term.selected_text(a, b))
+            .unwrap_or_default();
+        if text.is_empty() {
+            return;
+        }
+        if primary {
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                use arboard::{LinuxClipboardKind, SetExtLinux};
+                let _ = cb.set().clipboard(LinuxClipboardKind::Primary).text(text);
+            }
+        } else if let Ok(mut cb) = arboard::Clipboard::new() {
+            let _ = cb.set_text(text);
+        }
     }
 
     /// Header height above the grid: label row + clear padding so the
@@ -519,6 +983,137 @@ impl CanvasState {
         true
     }
 
+    /// Save the whole scene (nodes, groups, camera, bookmarks) to the
+    /// XDG layout path. Terminal content is arrangement-only by design:
+    /// shells re-spawn fresh on restore.
+    fn save_layout(&mut self) {
+        let path = crate::config::Config::layout_path();
+        match self.save_layout_to(&path) {
+            Ok(n) => eprintln!("layout saved ({} nodes) to {}", n, path.display()),
+            Err(e) => eprintln!("layout save failed: {e}"),
+        }
+    }
+
+    fn save_layout_to(&mut self, path: &std::path::Path) -> Result<usize, String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let n = self.app.state.workspace.all_nodes().len();
+        self.app
+            .state
+            .workspace
+            .save_to_file(path)
+            .map_err(|e| e.to_string())?;
+        Ok(n)
+    }
+
+    /// Restore the scene from the XDG layout path: live sessions are
+    /// dropped (children see SIGHUP) and every restored terminal node gets
+    /// a fresh PTY, with projection sources remapped onto the new surfaces.
+    fn restore_layout(&mut self) {
+        let path = crate::config::Config::layout_path();
+        match self.restore_layout_from(&path) {
+            Ok(n) => eprintln!("layout restored ({} sessions) from {}", n, path.display()),
+            Err(e) => eprintln!("layout restore failed: {e}"),
+        }
+    }
+
+    fn restore_layout_from(&mut self, path: &std::path::Path) -> Result<usize, String> {
+        self.terms.clear();
+        self.focused_term = None;
+        self.term_focus = false;
+        self.forwarding = None;
+        self.selecting = None;
+        self.selection = None;
+        self.app
+            .state
+            .workspace
+            .load_from_file(path)
+            .map_err(|e| e.to_string())?;
+        // Terminal nodes (surface, no projection) get fresh sessions; the
+        // remap table rewires projection sources onto the new surfaces.
+        let terminals: Vec<(crate::NodeId, f64, f64, SurfaceId)> = self
+            .app
+            .state
+            .workspace
+            .all_nodes()
+            .iter()
+            .filter(|n| n.surface_id().is_some() && n.projection.is_none())
+            .map(|n| (n.id, n.size.0, n.size.1, n.surface_id().unwrap()))
+            .collect();
+        let (cell_w, line_h) = self.grid_cell;
+        let header_h = self.header_h();
+        let mut remap: std::collections::HashMap<SurfaceId, SurfaceId> =
+            std::collections::HashMap::new();
+        let mut failed: Vec<crate::NodeId> = Vec::new();
+        for (node_id, nw, nh, old_surface) in terminals {
+            let (cols, rows) = crate::arrange::terminal_grid_size(
+                nw.max(1.0),
+                nh.max(1.0),
+                cell_w,
+                line_h,
+                header_h,
+                GRID_PAD_X,
+                GRID_PAD_BOTTOM,
+            );
+            let surface = SurfaceId(self.next_surface_id);
+            self.next_surface_id += 1;
+            match PtySession::spawn(cols as u16, rows as u16, None) {
+                Ok(pty) => {
+                    let engine = VtEngine::new(Terminal::new(surface, rows, cols));
+                    if let Some(node) = self.app.state.workspace.get_node_mut(node_id) {
+                        node.set_surface(surface);
+                    }
+                    remap.insert(old_surface, surface);
+                    self.terms.push(TermSession {
+                        surface,
+                        node: node_id,
+                        engine,
+                        pty,
+                    });
+                }
+                Err(_) => failed.push(node_id),
+            }
+        }
+        for dead in failed {
+            self.app.state.workspace.remove_node(dead);
+        }
+        // Rewire projections; sources that match no revived session keep
+        // their (now dangling) id and simply render stale content.
+        let mut max_surface = self.next_surface_id;
+        for node in self.app.state.workspace.scene.all_nodes_mut() {
+            if let Some(s) = node.surface_id() {
+                max_surface = max_surface.max(s.0 + 1);
+            }
+            if let Some(proj) = node.projection.as_mut() {
+                if let Some(&fresh) = remap.get(&proj.source) {
+                    proj.source = fresh;
+                }
+                max_surface = max_surface.max(proj.source.0 + 1);
+            }
+        }
+        self.next_surface_id = max_surface;
+        let max_node = self
+            .app
+            .state
+            .workspace
+            .node_ids()
+            .iter()
+            .map(|n| n.0)
+            .max()
+            .unwrap_or(0);
+        self.next_node_id = max_node + 1;
+        if let Some(first) = self.terms.first() {
+            self.focused_term = Some(first.surface);
+        }
+        if let Some(sel) = self.selected {
+            if self.app.state.workspace.get_node(sel).is_none() {
+                self.selected = None;
+            }
+        }
+        Ok(self.terms.len())
+    }
+
     /// Resize a terminal node to an exact grid: node size follows from
     /// measured cells, then grid + PTY follow via SIGWINCH. Clamped 2..=256
     /// like drag resize. Returns false when `node_id` has no live session.
@@ -559,10 +1154,17 @@ impl CanvasState {
         let dt = self.last_frame.elapsed().as_secs_f64().max(0.001);
         self.last_frame = std::time::Instant::now();
         self.app.state.workspace.camera_mut().update(dt.min(0.1));
+        // Reduce motion: every animated move lands instantly instead of
+        // easing (config `accessibility.reduce_motion`, live-toggleable).
+        if self.app.state.config.accessibility.reduce_motion {
+            self.app.state.workspace.camera_mut().snap_to_targets();
+        }
 
         // Drain PTY output into each VT engine and sync live projections.
+        // Bounded per frame (128KB/session): a huge dump flows through
+        // over frames instead of stalling one.
         for sess in &mut self.terms {
-            let bytes = sess.pty.take_output();
+            let bytes = sess.pty.take_output_capped(128 * 1024);
             if !bytes.is_empty() {
                 if self.diag_pty_bytes == 0 {
                     let sample: String = bytes
@@ -574,12 +1176,20 @@ impl CanvasState {
                 }
                 self.diag_pty_bytes += bytes.len() as u64;
                 sess.engine.feed(&bytes);
+                sess.engine.term.reset_scroll();
             }
             // Answer terminal queries (DA etc.): the child may hold all
             // output until we reply.
             let reply = sess.engine.take_reply();
             if !reply.is_empty() {
                 let _ = sess.pty.write(&reply);
+            }
+            // OSC 52 clipboard offers: the child (the user's own shell)
+            // writes host clipboard/primary. Headless/empty is a no-op.
+            if let Some((primary, text)) = sess.engine.take_clipboard() {
+                if !text.is_empty() {
+                    write_clipboard(primary, &text);
+                }
             }
         }
         // OSC window title: the focused session's title wins, else the
@@ -597,6 +1207,9 @@ impl CanvasState {
             self.last_title = want_title;
         }
         for sess in &self.terms {
+            if !sess.engine.term.dirty {
+                continue;
+            }
             for node in self.app.state.workspace.scene.all_nodes_mut() {
                 if let Some(proj) = &mut node.projection {
                     if proj.source == sess.surface {
@@ -606,6 +1219,99 @@ impl CanvasState {
             }
         }
 
+        let palette_open = self.palette_open;
+        let palette_query = self.palette_query.clone();
+        let palette_index = self.palette_index;
+        // The catalog is filtered only while open: every frame otherwise
+        // paid filter + String clones for a hidden popup. Single
+        // implementation via `palette_filtered` (fuzzy-ranked).
+        let palette_items: Vec<(String, String)> = if palette_open {
+            self.palette_filtered()
+                .into_iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Auto-zoom cues re-run the grid scan only when the selected
+        // terminal's content changed or the node/metrics moved; idle
+        // frames reuse the cached world rects. The `dirty` flag clears
+        // below, after this frame's consumers ran.
+        let region_cues: Vec<(f64, f64, f64, f64)> = match self.selected {
+            Some(id) => {
+                let idx = self.terms.iter().position(|s| s.node == id);
+                let pos = self
+                    .app
+                    .state
+                    .workspace
+                    .get_node(id)
+                    .map(|n| (n.transform.x, n.transform.y));
+                let (cw, lh) = self.grid_cell;
+                match (idx, pos) {
+                    (Some(i), Some((nx, ny))) => {
+                        let key = (nx.to_bits(), ny.to_bits(), cw.to_bits(), lh.to_bits());
+                        let dirty = self.terms[i].engine.term.dirty;
+                        if !dirty
+                            && self.region_cache_node == Some(id)
+                            && self.region_cache_key == key
+                        {
+                            self.region_cache.clone()
+                        } else {
+                            let regions = crate::regions::detect_zoom_regions(
+                                &self.terms[i].engine.term.grid,
+                            );
+                            let header = self.header_h();
+                            let cues: Vec<(f64, f64, f64, f64)> = regions
+                                .into_iter()
+                                .map(|r| {
+                                    let (ox, oy) = crate::arrange::grid_cell_origin(
+                                        nx, ny, GRID_PAD_X, header, cw, lh, r.col, r.row,
+                                    );
+                                    (ox, oy, r.cols as f64 * cw, r.rows as f64 * lh)
+                                })
+                                .collect();
+                            self.region_cache_node = Some(id);
+                            self.region_cache_key = key;
+                            self.region_cache = cues.clone();
+                            cues
+                        }
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            None => Vec::new(),
+        };
+        for sess in &mut self.terms {
+            sess.engine.term.dirty = false;
+        }
+        let scrollbars: Vec<ScrollBar> = {
+            let zoom = self.app.state.workspace.camera().zoom.max(0.05);
+            let mut out = Vec::new();
+            for sess in &self.terms {
+                let sb = sess.engine.term.grid.scrollback.len();
+                if sb == 0 {
+                    continue;
+                }
+                let Some(n) = self.app.state.workspace.get_node(sess.node) else {
+                    continue;
+                };
+                let tw = 6.0 / zoom;
+                let tx = n.transform.x + n.size.0.max(1.0) - tw - 3.0 / zoom;
+                let ty = n.transform.y + self.header_h();
+                let th = (n.size.1 - self.header_h() - GRID_PAD_BOTTOM).max(1.0);
+                let rows = sess.engine.term.grid.rows.max(1) as f64;
+                let frac = rows / (rows + sb as f64);
+                let hh = (th * frac).max(12.0 / zoom);
+                let off = (sess.engine.term.scroll_offset as f64).min(sb as f64);
+                let hy = ty + (th - hh) * (1.0 - off / (sb as f64).max(1.0));
+                out.push((tx, ty, tw, th, tx, hy, tw, hh));
+            }
+            out
+        };
+        let menu_snap: MenuSnap = self
+            .menu
+            .as_ref()
+            .map(|m| (m.x, m.y, m.items.clone(), m.index));
         if let (Some(renderer), Some(graph)) = (&mut self.renderer, &self.graph) {
             let cam = self.app.state.workspace.camera();
             renderer.set_camera(cam.x, cam.y, cam.zoom);
@@ -673,6 +1379,16 @@ impl CanvasState {
                     let (cx, cy, cs, _) =
                         close_button_rect(node.transform.x, node.transform.y, w, cam.zoom);
                     renderer.push_overlay_rect(cx, cy, cs, cs, (0.9, 0.35, 0.35, 1.0));
+                    let (mx, my, ms) =
+                        menu_button_rect(node.transform.x, node.transform.y, cam.zoom);
+                    renderer.push_overlay_rect(mx, my, ms, ms, (0.35, 0.7, 1.0, 1.0));
+                    for (rx, ry, rw, rh) in &region_cues {
+                        renderer.push_border(*rx, *ry, *rw, *rh, 1.5, (0.4, 0.8, 1.0, 0.9));
+                    }
+                    for (tx, ty, tw, th, hx, hy, hw, hh) in &scrollbars {
+                        renderer.push_overlay_rect(*tx, *ty, *tw, *th, (0.2, 0.22, 0.28, 0.8));
+                        renderer.push_overlay_rect(*hx, *hy, *hw, *hh, (0.5, 0.65, 0.9, 0.9));
+                    }
                 }
             }
 
@@ -701,46 +1417,135 @@ impl CanvasState {
                         let (vw, vh) = (self.viewport_size.0, self.viewport_size.1);
                         let _ = (vw, vh);
                         // Terminal grids: one glyph per non-blank cell, set in
-                        // measured cells under each session's node.
+                        // measured cells under each session's node. Per-cell
+                        // `queue_char_at` (no String alloc) with the pixel
+                        // size hoisted per node; rows borrow short-lived so
+                        // no per-frame line clone is needed.
                         let (cell_w, line_h) = self.grid_cell;
                         let header_h = line_h + 20.0;
+                        let (camx, camy, zoom) = (cam.x, cam.y, cam.zoom);
+                        // Visible world rect: terminals (then cells) fully
+                        // outside it skip queueing entirely. Matters once
+                        // dashboards hold many nodes or zoom deep.
+                        let vzoom = zoom.max(0.05);
+                        let (vx0, vy0) = (camx, camy);
+                        let (vx1, vy1) = (
+                            camx + self.viewport_size.0 as f64 / vzoom,
+                            camy + self.viewport_size.1 as f64 / vzoom,
+                        );
                         for i in 0..self.terms.len() {
-                            let (nx, ny) = self
+                            let (nx, ny, nw, nh, surf, rows, cols, scale) = self
                                 .app
                                 .state
                                 .workspace
                                 .get_node(self.terms[i].node)
-                                .map(|n| (n.transform.x, n.transform.y))
-                                .unwrap_or((0.0, 0.0));
-                            let rows = self.terms[i].engine.term.grid.rows;
-                            let cols = self.terms[i].engine.term.grid.cols;
+                                .map(|n| {
+                                    (
+                                        n.transform.x,
+                                        n.transform.y,
+                                        n.size.0.max(1.0),
+                                        n.size.1.max(1.0),
+                                        self.terms[i].surface,
+                                        self.terms[i].engine.term.grid.rows,
+                                        self.terms[i].engine.term.grid.cols,
+                                        self.font_scales
+                                            .get(&self.terms[i].node)
+                                            .copied()
+                                            .unwrap_or(1.0),
+                                    )
+                                })
+                                .unwrap_or((0.0, 0.0, 1.0, 1.0, self.terms[i].surface, 0, 0, 1.0));
+                            if !crate::arrange::rects_intersect(
+                                nx,
+                                ny,
+                                nw,
+                                nh,
+                                vx0,
+                                vy0,
+                                vx1 - vx0,
+                                vy1 - vy0,
+                            ) {
+                                continue;
+                            }
+                            // On-screen raster size, once per node: every
+                            // cell shares this terminal's zoom + font scale.
+                            let screen_px = crate::text::choose_pixel_size(
+                                (GRID_PX as f32 * scale) as u32,
+                                zoom,
+                            );
+                            let sel_range: Option<((u32, u32), (u32, u32))> = self
+                                .selection
+                                .filter(|(ss, _, _, _)| *ss == surf)
+                                .map(|(_, _, a, b)| {
+                                    if (a.1, a.0) <= (b.1, b.0) {
+                                        (a, b)
+                                    } else {
+                                        (b, a)
+                                    }
+                                });
+                            if let Some(((r0, c0), (r1, c1))) = sel_range {
+                                let sc = crate::surface::Color::from_hex(
+                                    &self.app.state.config.theme.selection,
+                                );
+                                let rgba = (
+                                    sc.r as f32 / 255.0,
+                                    sc.g as f32 / 255.0,
+                                    sc.b as f32 / 255.0,
+                                    0.85,
+                                );
+                                for r in r0..=r1.min(rows.saturating_sub(1)) {
+                                    let cs = if r == r0 { c0 } else { 0 };
+                                    let ce = if r == r1 { c1 } else { cols.saturating_sub(1) };
+                                    let (ox, oy) = crate::arrange::grid_cell_origin(
+                                        nx, ny, GRID_PAD_X, header_h, cell_w, line_h, cs, r,
+                                    );
+                                    renderer.push_overlay_rect(
+                                        ox,
+                                        oy,
+                                        (ce - cs + 1) as f64 * cell_w,
+                                        line_h,
+                                        rgba,
+                                    );
+                                }
+                            }
                             for r in 0..rows {
                                 for c in 0..cols {
-                                    let Some(cell) = self.terms[i].engine.term.grid.get(r, c)
-                                    else {
+                                    let cell = self.terms[i]
+                                        .engine
+                                        .term
+                                        .visible_line(r)
+                                        .and_then(|l| l.get(c as usize))
+                                        .map(|cell| (cell.character, cell.fg, cell.width));
+                                    let Some((ch, fg, w)) = cell else {
                                         continue;
                                     };
-                                    if cell.character == ' ' || cell.width == 0 {
+                                    if ch == ' ' || w == 0 {
                                         continue;
                                     }
-                                    let ch = cell.character.to_string();
+                                    let (ox, oy) = crate::arrange::grid_cell_origin(
+                                        nx, ny, GRID_PAD_X, header_h, cell_w, line_h, c, r,
+                                    );
+                                    if ox < vx0 - cell_w
+                                        || ox > vx1
+                                        || oy < vy0 - line_h
+                                        || oy > vy1
+                                    {
+                                        continue;
+                                    }
                                     let color = (
-                                        cell.fg.r as f32 / 255.0,
-                                        cell.fg.g as f32 / 255.0,
-                                        cell.fg.b as f32 / 255.0,
+                                        fg.r as f32 / 255.0,
+                                        fg.g as f32 / 255.0,
+                                        fg.b as f32 / 255.0,
                                         1.0,
                                     );
-                                    text.queue_string(
+                                    text.queue_char_at(
                                         gl,
                                         atlas,
                                         fonts,
                                         fid,
-                                        crate::arrange::grid_cell_origin(
-                                            nx, ny, GRID_PAD_X, header_h, cell_w, line_h, c, r,
-                                        ),
-                                        (cam.x, cam.y, cam.zoom),
-                                        GRID_PX,
-                                        &ch,
+                                        ((ox - camx) * zoom, (oy - camy) * zoom),
+                                        screen_px,
+                                        ch,
                                         color,
                                     );
                                 }
@@ -801,6 +1606,50 @@ impl CanvasState {
                             };
                             renderer.push_overlay_rect(cx, cy, cw, ch, cursor_rgba);
                         }
+                        for i in 0..self.terms.len() {
+                            let (nx, ny, nid, cols, rows, off, scale) =
+                                match self.app.state.workspace.get_node(self.terms[i].node).map(
+                                    |n| {
+                                        (
+                                            n.transform.x,
+                                            n.transform.y,
+                                            n.id,
+                                            self.terms[i].engine.term.grid.cols,
+                                            self.terms[i].engine.term.grid.rows,
+                                            self.terms[i].engine.term.scroll_offset,
+                                            self.font_scales
+                                                .get(&self.terms[i].node)
+                                                .copied()
+                                                .unwrap_or(1.0),
+                                        )
+                                    },
+                                ) {
+                                    Some(v) => v,
+                                    None => continue,
+                                };
+                            let _ = nid;
+                            let mut label = format!("{cols}x{rows} @{scale:.2}");
+                            if off > 0 {
+                                label.push_str(&format!(" +{off}"));
+                            }
+                            if !self.terms[i].engine.term.grid.scrollback.is_empty() {
+                                label.push_str(&format!(
+                                    " sb{}",
+                                    self.terms[i].engine.term.grid.scrollback.len()
+                                ));
+                            }
+                            text.queue_string(
+                                gl,
+                                atlas,
+                                fonts,
+                                fid,
+                                (nx + 8.0, ny + 5.0),
+                                (cam.x, cam.y, cam.zoom),
+                                11,
+                                &label,
+                                (0.55, 0.62, 0.72, 1.0),
+                            );
+                        }
                         // Projection nodes: render their content lines.
                         for node in self.app.state.workspace.all_nodes() {
                             let Some(proj) = &node.projection else {
@@ -823,6 +1672,76 @@ impl CanvasState {
                                     12,
                                     line,
                                     (0.55, 0.85, 0.65, 1.0),
+                                );
+                            }
+                        }
+                        if palette_open {
+                            let items = &palette_items;
+                            let sel = palette_index.min(items.len().saturating_sub(1));
+                            let vw = self.viewport_size.0 as f64;
+                            let vh = self.viewport_size.1 as f64;
+                            let bw = 460.0f64;
+                            let bh = (items.len().min(8) as f64 * 22.0 + 52.0).max(52.0);
+                            let bx = cam.x + (vw / cam.zoom - bw) / 2.0;
+                            let by = cam.y + (vh / cam.zoom - bh) / 2.0;
+                            renderer.push_overlay_rect(bx, by, bw, bh, (0.07, 0.08, 0.11, 0.96));
+                            renderer.push_border(bx, by, bw, bh, 1.5, (0.35, 0.7, 1.0, 1.0));
+                            let prompt = format!("> {}", palette_query);
+                            text.queue_string(
+                                gl,
+                                atlas,
+                                fonts,
+                                fid,
+                                (bx + 12.0, by + 10.0),
+                                (cam.x, cam.y, cam.zoom),
+                                GRID_PX,
+                                &prompt,
+                                (0.9, 0.93, 1.0, 1.0),
+                            );
+                            for (i, (_id, title)) in items.iter().take(8).enumerate() {
+                                let row = format!("{} {}", if i == sel { ">" } else { " " }, title);
+                                let col = if i == sel {
+                                    (0.55, 0.85, 1.0, 1.0)
+                                } else {
+                                    (0.75, 0.78, 0.85, 1.0)
+                                };
+                                text.queue_string(
+                                    gl,
+                                    atlas,
+                                    fonts,
+                                    fid,
+                                    (bx + 12.0, by + 32.0 + i as f64 * 22.0),
+                                    (cam.x, cam.y, cam.zoom),
+                                    12,
+                                    &row,
+                                    col,
+                                );
+                            }
+                        }
+                        if let Some((mx, my, items, sel)) = &menu_snap {
+                            let mw = 300.0f64;
+                            let ih = 22.0f64;
+                            let mh = (items.len() as f64 * ih + 20.0).max(20.0);
+                            renderer.push_overlay_rect(*mx, *my, mw, mh, (0.07, 0.08, 0.11, 0.97));
+                            renderer.push_border(*mx, *my, mw, mh, 1.5, (0.35, 0.7, 1.0, 1.0));
+                            for (i, (_, title)) in items.iter().enumerate() {
+                                let row =
+                                    format!("{} {}", if i == *sel { ">" } else { " " }, title);
+                                let col = if i == *sel {
+                                    (0.55, 0.85, 1.0, 1.0)
+                                } else {
+                                    (0.75, 0.78, 0.85, 1.0)
+                                };
+                                text.queue_string(
+                                    gl,
+                                    atlas,
+                                    fonts,
+                                    fid,
+                                    (mx + 12.0, my + 10.0 + i as f64 * ih),
+                                    (cam.x, cam.y, cam.zoom),
+                                    12,
+                                    &row,
+                                    col,
                                 );
                             }
                         }
@@ -1117,6 +2036,15 @@ impl ApplicationHandler for CanvasState {
                         return;
                     }
                 }
+                if let Some((surface, node, anchor)) = self.selecting {
+                    if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
+                        if let Some(cell) = self.mouse_cell_for(idx, new_cursor.0, new_cursor.1) {
+                            self.selection = Some((surface, node, anchor, (cell.0, cell.1)));
+                        }
+                    }
+                    self.last_cursor = new_cursor;
+                    return;
+                }
                 let cam = self.app.state.workspace.camera().clone();
                 let zoom = cam.zoom;
                 match self.drag {
@@ -1214,6 +2142,41 @@ impl ApplicationHandler for CanvasState {
                         cam.x + self.last_cursor.0 / cam.zoom,
                         cam.y + self.last_cursor.1 / cam.zoom,
                     );
+                    if self.menu.is_some() {
+                        let (mx, my) = (wx, wy);
+                        let (mmx, mmy, mitems, _) = self
+                            .menu
+                            .as_ref()
+                            .map(|m| (m.x, m.y, m.items.clone(), m.index))
+                            .unwrap();
+                        let mw = 300.0f64;
+                        let ih = 22.0f64;
+                        let mh = mitems.len() as f64 * ih + 20.0;
+                        self.menu = None;
+                        if mx >= mmx
+                            && mx <= mmx + mw
+                            && my >= mmy
+                            && my <= mmy + mh
+                            && my >= mmy + 10.0
+                        {
+                            let idx = ((my - mmy - 10.0) / ih) as usize;
+                            if let Some((id, _)) = mitems.get(idx) {
+                                let owned = id.clone();
+                                self.run_palette_command(&owned);
+                            }
+                            return;
+                        }
+                    }
+                    if let Some(sel) = self.selected {
+                        if let Some(n) = self.app.state.workspace.get_node(sel) {
+                            let (mbx, mby, mbs) =
+                                menu_button_rect(n.transform.x, n.transform.y, cam.zoom);
+                            if wx >= mbx && wx <= mbx + mbs && wy >= mby && wy <= mby + mbs {
+                                self.open_menu(n.transform.x, n.transform.y, Some(sel));
+                                return;
+                            }
+                        }
+                    }
                     // Selected node's close button wins over everything.
                     if let Some(sel) = self.selected {
                         if let Some(n) = self.app.state.workspace.get_node(sel) {
@@ -1265,9 +2228,13 @@ impl ApplicationHandler for CanvasState {
                         // Child mouse forwarding (xterm 1000+): an unshifted
                         // press on a reporting terminal goes to its PTY
                         // instead of starting a Move-drag. Shift forces host
-                        // behavior; the resize handle (checked above) wins.
+                        // behavior; Alt forces a host move-drag (spec §5.1);
+                        // space forces a host pan (see below). The resize
+                        // handle (checked above) always wins.
+                        let mst = self.modifiers.state();
+                        let space_pan = self.space_down && !self.term_focus;
                         let forward_press: Option<(crate::NodeId, SurfaceId, Vec<u8>)> =
-                            if self.modifiers.state().shift_key() {
+                            if mst.shift_key() || mst.alt_key() || space_pan {
                                 None
                             } else if let Some((id, Some(surface), mode, _, _)) = &hit {
                                 if mode.as_str() != "terminal" {
@@ -1312,6 +2279,40 @@ impl ApplicationHandler for CanvasState {
                                 button: crate::vt::MouseButton::Left,
                             });
                             return;
+                        }
+                        if space_pan {
+                            // Space-drag pans even when grabbed on a node:
+                            // full-bleed startup leaves no empty canvas for
+                            // a plain pan-grab, and middle-drag is not
+                            // discoverable. Selection/focus stay untouched.
+                            self.drag = DragState::Pan {
+                                ax: self.last_cursor.0,
+                                ay: self.last_cursor.1,
+                            };
+                            return;
+                        }
+                        if self.modifiers.state().shift_key() {
+                            if let Some((id, Some(surface), mode, _, _)) = &hit {
+                                if mode.as_str() == "terminal" {
+                                    if let Some(idx) =
+                                        self.terms.iter().position(|t| t.surface == *surface)
+                                    {
+                                        if let Some(cell) = self.mouse_cell_for(
+                                            idx,
+                                            self.last_cursor.0,
+                                            self.last_cursor.1,
+                                        ) {
+                                            self.selecting =
+                                                Some((*surface, *id, (cell.0, cell.1)));
+                                            self.selection = None;
+                                            self.selected = Some(*id);
+                                            self.focused_term = Some(*surface);
+                                            self.term_focus = true;
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         match hit {
                             Some((id, surface, mode, nx, ny)) => {
@@ -1373,6 +2374,26 @@ impl ApplicationHandler for CanvasState {
                         }
                         self.forwarding = None;
                     }
+                    if let Some((surface, _node, a)) = self.selecting.take() {
+                        if let Some(sel) = self.selection {
+                            let text = self
+                                .terms
+                                .iter()
+                                .find(|t| t.surface == surface)
+                                .map(|t| t.engine.term.selected_text(a, sel.3))
+                                .unwrap_or_default();
+                            if !text.is_empty() {
+                                if let Ok(mut cb) = arboard::Clipboard::new() {
+                                    let _ = cb.set_text(text.clone());
+                                }
+                                if let Ok(mut cb) = arboard::Clipboard::new() {
+                                    use arboard::{LinuxClipboardKind, SetExtLinux};
+                                    let _ =
+                                        cb.set().clipboard(LinuxClipboardKind::Primary).text(text);
+                                }
+                            }
+                        }
+                    }
                     self.drag = DragState::None;
                 }
                 (ElementState::Released, MouseButton::Middle) => {
@@ -1402,12 +2423,110 @@ impl ApplicationHandler for CanvasState {
                 is_synthetic: _,
                 ..
             } => {
+                // Space doubles as a pan modifier (space-drag pans even
+                // over a node). Track it on press AND release, before the
+                // release early-return: typing still works because the
+                // flag is only honored when no terminal has focus.
+                if event.logical_key
+                    == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Space)
+                {
+                    self.space_down = event.state == ElementState::Pressed;
+                }
                 // Releases carry no text and must never write to the PTY
                 // (otherwise Enter/Backspace fire twice: press + release).
                 if event.state != ElementState::Pressed {
                     return;
                 }
                 let modifiers = self.modifiers;
+                let st = modifiers.state();
+                if st.control_key()
+                    && matches!(&event.logical_key, winit::keyboard::Key::Character(c) if c.eq_ignore_ascii_case("k"))
+                {
+                    self.palette_open = !self.palette_open;
+                    self.palette_query.clear();
+                    self.palette_index = 0;
+                    return;
+                }
+                if self.menu.is_some() {
+                    use winit::keyboard::{Key, NamedKey};
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            self.menu = None;
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            if let Some(m) = self.menu.take() {
+                                if let Some((id, _)) = m.items.get(m.index) {
+                                    let owned = id.clone();
+                                    self.run_palette_command(&owned);
+                                }
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            if let Some(m) = self.menu.as_mut() {
+                                m.index = m.index.saturating_sub(1);
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            if let Some(m) = self.menu.as_mut() {
+                                let n = m.items.len().saturating_sub(1);
+                                m.index = (m.index + 1).min(n);
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                if self.palette_open {
+                    use winit::keyboard::{Key, NamedKey};
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            self.palette_open = false;
+                            self.palette_query.clear();
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            let items = self.palette_filtered();
+                            if let Some((id, _)) = items.get(self.palette_index).copied() {
+                                self.palette_open = false;
+                                self.palette_query.clear();
+                                self.palette_index = 0;
+                                let owned = id.to_string();
+                                self.run_palette_command(&owned);
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            self.palette_index = self.palette_index.saturating_sub(1);
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            let n = self.palette_filtered().len().saturating_sub(1);
+                            self.palette_index = (self.palette_index + 1).min(n);
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            self.palette_query.pop();
+                            self.palette_index = 0;
+                        }
+                        Key::Character(ch)
+                            if event.text.as_ref().is_some_and(|t| !t.is_empty()) =>
+                        {
+                            let t = event.text.clone().unwrap_or_default();
+                            for ch in t.chars() {
+                                if !ch.is_control() {
+                                    self.palette_query.push(ch);
+                                }
+                            }
+                            let _ = ch;
+                            self.palette_index = 0;
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                if st.control_key()
+                    && st.shift_key()
+                    && matches!(&event.logical_key, winit::keyboard::Key::Character(c) if c.eq_ignore_ascii_case("c"))
+                {
+                    self.copy_selection_to_clipboard(false);
+                    return;
+                }
                 use winit::keyboard::{Key, NamedKey};
                 // Esc always drops back to workspace control.
                 if self.term_focus && event.logical_key == Key::Named(NamedKey::Escape) {
@@ -1418,44 +2537,25 @@ impl ApplicationHandler for CanvasState {
                 if !self.term_focus {
                     match &event.logical_key {
                         Key::Character(c) if c == "p" => {
-                            self.pin_current_view();
+                            self.run_palette_command("view.pin");
+                        }
+                        Key::Character(c) if c == "P" => {
+                            self.run_palette_command("view.pinLive");
                         }
                         Key::Character(c) if c == "t" => {
-                            self.apply_arrange(
-                                |ns, _| {
-                                    crate::arrange::tile_grid(ns, 3, crate::arrange::DEFAULT_GAP)
-                                },
-                                0,
-                            );
+                            self.run_palette_command("layout.tileGrid");
                         }
                         Key::Character(c) if c == "h" => {
-                            self.apply_arrange(
-                                |ns, _| {
-                                    crate::arrange::tile_horizontally(
-                                        ns,
-                                        crate::arrange::DEFAULT_GAP,
-                                    )
-                                },
-                                0,
-                            );
+                            self.run_palette_command("layout.tileH");
                         }
                         Key::Character(c) if c == "v" => {
-                            self.apply_arrange(
-                                |ns, _| {
-                                    crate::arrange::tile_vertically(ns, crate::arrange::DEFAULT_GAP)
-                                },
-                                0,
-                            );
+                            self.run_palette_command("layout.tileV");
                         }
                         Key::Character(c) if c == "a" => {
-                            self.apply_arrange(
-                                |ns, _| crate::arrange::align(ns, crate::arrange::Edge::Left),
-                                0,
-                            );
+                            self.run_palette_command("layout.alignLeft");
                         }
                         Key::Character(c) if c == "b" => {
-                            let name = self.app.state.workspace.camera_mut().save_next_bookmark();
-                            eprintln!("bookmark {name} saved");
+                            self.run_palette_command("camera.bookmarkSave");
                         }
                         Key::Character(c)
                             if c.len() == 1
@@ -1475,59 +2575,16 @@ impl ApplicationHandler for CanvasState {
                             }
                         }
                         Key::Character(c) if c == "d" => {
-                            // Dashboard: anchor at the margin, tile 2-up, fit.
-                            if let Some(first) =
-                                self.app.state.workspace.all_nodes().first().map(|n| n.id)
-                            {
-                                if let Some(n) = self.app.state.workspace.get_node_mut(first) {
-                                    n.transform.x = DASH_MARGIN;
-                                    n.transform.y = DASH_MARGIN;
-                                }
-                            }
-                            self.apply_arrange(
-                                |ns, _| {
-                                    crate::arrange::tile_grid(ns, 2, crate::arrange::DEFAULT_GAP)
-                                },
-                                0,
-                            );
-                            self.fit_dashboard(false);
+                            self.run_palette_command("layout.dashboard");
                         }
                         Key::Character(c) if c == "f" => {
-                            self.fit_dashboard(false);
+                            self.run_palette_command("camera.fit");
                         }
                         Key::Character(c) if c == "n" => {
-                            // New terminal beside the focused one (up to 8).
-                            if self.terms.len() < 8 {
-                                let size = self.terminal_node_size(GRID_COLS, GRID_ROWS);
-                                let view =
-                                    (self.viewport_size.0 as f64, self.viewport_size.1 as f64);
-                                // Anchor: focused session's node rect, else
-                                // the last terminal node.
-                                let anchor = self
-                                    .focused_term
-                                    .and_then(|s| self.terms.iter().find(|t| t.surface == s))
-                                    .map(|s| s.node)
-                                    .or_else(|| self.terms.last().map(|s| s.node))
-                                    .and_then(|id| {
-                                        self.app.state.workspace.get_node(id).map(|n| {
-                                            (n.transform.x, n.transform.y, n.size.0, n.size.1)
-                                        })
-                                    })
-                                    .unwrap_or((DASH_MARGIN, DASH_MARGIN, size.0, size.1));
-                                let pos =
-                                    crate::arrange::place_beside(anchor, size, DASH_GAP, view);
-                                if let Err(e) = self.spawn_terminal_node(GRID_COLS, GRID_ROWS, pos)
-                                {
-                                    eprintln!("failed to spawn terminal: {e}");
-                                }
-                            } else {
-                                eprintln!("terminal limit reached");
-                            }
+                            self.run_palette_command("terminal.new");
                         }
                         Key::Character(c) if c == "x" => {
-                            // Close the selected node (terminal sessions
-                            // end; empty canvas pans with left-drag again).
-                            self.close_selected();
+                            self.run_palette_command("terminal.close");
                         }
                         Key::Character(c) if c == "[" => {
                             self.step_selected_grid(-1, 0);
@@ -1540,6 +2597,41 @@ impl ApplicationHandler for CanvasState {
                         }
                         Key::Character(c) if c == "=" => {
                             self.step_selected_grid(0, 1);
+                        }
+                        Key::Character(c) if c == "C" => {
+                            self.run_palette_command("layout.cascade");
+                        }
+                        Key::Character(c) if c == "O" => {
+                            self.run_palette_command("layout.orbit");
+                        }
+                        Key::Character(c) if c == "F" => {
+                            self.run_palette_command("layout.focus");
+                        }
+                        Key::Character(c) if c == "N" => {
+                            self.run_palette_command("terminal.varied");
+                        }
+                        Key::Character(c) if c == "S" => {
+                            self.run_palette_command("layout.save");
+                        }
+                        Key::Character(c) if c == "," => {
+                            self.run_palette_command("style.fontSmaller");
+                        }
+                        Key::Character(c) if c == "." => {
+                            self.run_palette_command("style.fontBigger");
+                        }
+                        Key::Character(c) if c == "o" => {
+                            self.run_palette_command("style.opacity");
+                        }
+                        Key::Character(c) if c == "c" => {
+                            self.run_palette_command("style.tint");
+                        }
+                        Key::Character(c) if c == ":" => {
+                            self.palette_open = true;
+                            self.palette_query.clear();
+                            self.palette_index = 0;
+                        }
+                        Key::Character(c) if c == "?" => {
+                            self.run_palette_command("help.open");
                         }
                         Key::Character(c) if c == "0" => {
                             // `0` restores slot bm0 when one was saved,
@@ -1607,7 +2699,64 @@ impl ApplicationHandler for CanvasState {
                     MouseScrollDelta::LineDelta(_, dy) => dy as f64,
                     MouseScrollDelta::PixelDelta(p) => p.y / 40.0,
                 };
-                self.zoom_at_cursor(1.15f64.powf(lines));
+                let st = self.modifiers.state();
+                if st.control_key() {
+                    self.zoom_at_cursor(1.15f64.powf(lines));
+                } else if st.shift_key() {
+                    if let Some(id) = self.focused_term {
+                        if let Some(sess) = self.terms.iter_mut().find(|t| t.surface == id) {
+                            sess.engine.term.scroll(-lines.round() as i32 * 3);
+                        }
+                    }
+                } else {
+                    let cam = self.app.state.workspace.camera().clone();
+                    let (wx, wy) = (
+                        cam.x + self.last_cursor.0 / cam.zoom,
+                        cam.y + self.last_cursor.1 / cam.zoom,
+                    );
+                    let node = self.hit_node(wx, wy).map(|n| n.id);
+                    let sess_node =
+                        node.and_then(|id| self.terms.iter().position(|s| s.node == id));
+                    if let Some(i) = sess_node {
+                        // A reporting child owns the wheel (vim/less/tmux
+                        // scroll); otherwise it scrolls host scrollback.
+                        // Shift already branched above (host bypass, xterm
+                        // style); Ctrl+wheel always zooms.
+                        let forwarded = wheel_button(lines).and_then(|(button, count)| {
+                            let (col, row) =
+                                self.mouse_cell_for(i, self.last_cursor.0, self.last_cursor.1)?;
+                            let st = self.modifiers.state();
+                            let report = crate::vt::MouseReport {
+                                button,
+                                col,
+                                row,
+                                shift: false,
+                                alt: st.alt_key(),
+                                ctrl: false,
+                                release: false,
+                                motion: false,
+                                dragging: false,
+                            };
+                            if !self.terms.get(i)?.engine.mouse_mode.wants(&report) {
+                                return None;
+                            }
+                            let mut out = Vec::new();
+                            for _ in 0..count {
+                                out.extend(self.terms.get(i)?.engine.mouse_mode.encode(&report)?);
+                            }
+                            Some(out)
+                        });
+                        match forwarded {
+                            Some(bytes) => {
+                                let surface = self.terms[i].surface;
+                                self.write_to_surface(surface, &bytes);
+                            }
+                            None => self.terms[i].engine.term.scroll(-lines.round() as i32 * 3),
+                        }
+                    } else {
+                        self.zoom_at_cursor(1.15f64.powf(lines));
+                    }
+                }
             }
             _ => {}
         }
@@ -1635,11 +2784,45 @@ fn read_clipboard(primary: bool) -> Option<String> {
     }
 }
 
+/// Write text to the host clipboard (or X11 primary selection).
+/// Failures (headless, no display) are silent no-ops.
+fn write_clipboard(primary: bool, text: &str) {
+    if primary {
+        if let Ok(mut cb) = arboard::Clipboard::new() {
+            use arboard::{LinuxClipboardKind, SetExtLinux};
+            let _ = cb.set().clipboard(LinuxClipboardKind::Primary).text(text);
+        }
+    } else if let Ok(mut cb) = arboard::Clipboard::new() {
+        let _ = cb.set_text(text.to_string());
+    }
+}
+
 /// Close-button rect (world units) at a node's top-right corner, 12
 /// screen px square like the resize handle. Pure: unit-tested.
 fn close_button_rect(node_x: f64, node_y: f64, node_w: f64, zoom: f64) -> (f64, f64, f64, f64) {
     let s = 12.0 / zoom.max(0.05);
     (node_x + node_w.max(1.0) - s, node_y, s, s)
+}
+
+fn menu_button_rect(node_x: f64, node_y: f64, zoom: f64) -> (f64, f64, f64) {
+    let s = 12.0 / zoom.max(0.05);
+    (node_x, node_y, s)
+}
+
+/// Wheel delta (scroll lines, +up) -> child mouse button + repeat count.
+/// Positive scrolls up (button 64), negative down (65); sub-notch deltas
+/// are no-ops, floods clamp at 8 reports. Pure: unit-tested.
+fn wheel_button(lines: f64) -> Option<(crate::vt::MouseButton, u32)> {
+    let n = lines.abs().round() as u32;
+    if n == 0 {
+        return None;
+    }
+    let button = if lines > 0.0 {
+        crate::vt::MouseButton::WheelUp
+    } else {
+        crate::vt::MouseButton::WheelDown
+    };
+    Some((button, n.min(8)))
 }
 
 /// Screen px -> 0-based terminal cell, clamped into the grid (clicks on
@@ -1729,6 +2912,19 @@ mod tests {
     use winit::keyboard::{Key, NamedKey};
 
     #[test]
+    fn test_fuzzy_score_ranks_boundaries_first() {
+        assert!(fuzzy_score("", "anything").is_some());
+        assert!(fuzzy_score("xyz", "terminal.new").is_none());
+        // Exact subsequence in one word outranks a scattered match.
+        let tight = fuzzy_score("pinl", "view.pinlive").unwrap();
+        let loose = fuzzy_score("pinl", "hopscotch.inland").unwrap();
+        assert!(tight > loose);
+        // Case must already be folded by the caller convention: scoring
+        // itself is literal.
+        assert!(fuzzy_score("PIN", "pin").is_none());
+    }
+
+    #[test]
     fn test_control_codes() {
         assert_eq!(control_code('c'), Some(3));
         assert_eq!(control_code('C'), Some(3));
@@ -1799,6 +2995,88 @@ mod tests {
         // 12 screen px at zoom 2 -> 6 world px, top-right corner.
         let (x, y, s, _) = close_button_rect(100.0, 50.0, 400.0, 2.0);
         assert_eq!((x, y, s), (494.0, 50.0, 6.0));
+    }
+
+    #[test]
+    fn test_wheel_button_direction_and_clamp() {
+        use crate::vt::MouseButton::{WheelDown, WheelUp};
+        assert_eq!(wheel_button(0.0), None);
+        assert_eq!(wheel_button(0.4), None);
+        assert_eq!(wheel_button(1.0), Some((WheelUp, 1)));
+        assert_eq!(wheel_button(-2.0), Some((WheelDown, 2)));
+        assert_eq!(wheel_button(100.0), Some((WheelUp, 8)));
+        assert_eq!(wheel_button(-100.0), Some((WheelDown, 8)));
+    }
+
+    #[test]
+    fn test_menu_button_rect_geometry() {
+        let (x, y, s) = menu_button_rect(100.0, 50.0, 2.0);
+        assert_eq!((x, y, s), (100.0, 50.0, 6.0));
+    }
+
+    #[test]
+    fn test_palette_keys_menus_share_command_ids() {
+        use std::collections::HashSet;
+        let palette: Vec<_> = CanvasState::palette_commands();
+        let catalog = crate::command::builtin_commands();
+        let palette_ids: HashSet<_> = palette.iter().map(|(id, _)| *id).collect();
+        // Palette is the catalog minus the key-only digit-restore helper.
+        assert_eq!(palette.len(), catalog.len() - 1);
+        for spec in &catalog {
+            if spec.id == "camera.bookmarkRestore" {
+                assert!(!palette_ids.contains(spec.id));
+            } else {
+                assert!(palette_ids.contains(spec.id), "palette missing {}", spec.id);
+            }
+        }
+        // Every single-char key binding resolves to a palette command.
+        for key in [
+            "n", "N", "x", "h", "v", "t", "C", "O", "F", "d", "a", "f", "0", "b", "p", "P", ".",
+            ",", "o", "c", "?", "S",
+        ] {
+            let id = crate::command::command_for_key(key).unwrap();
+            assert!(palette_ids.contains(id), "key {key} -> {id} not in palette");
+        }
+    }
+
+    #[test]
+    fn test_save_restore_round_trip_respawns_sessions() {
+        use std::collections::HashSet;
+        let mut st = CanvasState::new(App::new(crate::config::Config::new()));
+        st.spawn_terminal_node(80, 24, (0.0, 0.0)).unwrap();
+        st.pin_view(true);
+        let path =
+            std::env::temp_dir().join(format!("fracterm-test-layout-{}.json", std::process::id()));
+        st.save_layout_to(&path).unwrap();
+        // Diverge, then restore: one terminal node revives one session.
+        st.spawn_terminal_node(80, 24, (900.0, 0.0)).unwrap();
+        assert_eq!(st.terms.len(), 2);
+        assert_eq!(st.restore_layout_from(&path).unwrap(), 1);
+        assert_eq!(st.terms.len(), 1);
+        let surfaces: HashSet<_> = st.terms.iter().map(|s| s.surface).collect();
+        for node in st.app.state.workspace.all_nodes() {
+            if let Some(proj) = &node.projection {
+                assert!(surfaces.contains(&proj.source));
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_pin_snapshot_vs_live_modes() {
+        let mut st = CanvasState::new(App::new(crate::config::Config::new()));
+        st.spawn_terminal_node(80, 24, (0.0, 0.0)).unwrap();
+        let before = st.app.state.workspace.all_nodes().len();
+        st.pin_view(false);
+        st.pin_view(true);
+        let nodes = st.app.state.workspace.all_nodes();
+        assert_eq!(nodes.len(), before + 2);
+        let modes: Vec<(crate::ProjectionMode, bool)> = nodes
+            .iter()
+            .filter_map(|n| n.projection.as_ref().map(|p| (p.mode, p.selector.follow)))
+            .collect();
+        assert!(modes.contains(&(crate::ProjectionMode::Snapshot, false)));
+        assert!(modes.contains(&(crate::ProjectionMode::Live, true)));
     }
 
     #[test]

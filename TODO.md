@@ -7,8 +7,8 @@ regression guardrails this plan must respect are in Development Guardrails
 below. Prefer finishing a phase before starting the next. Unfinished items
 carry forward in-place, so this file is always the single resume point.
 
-**Current state (2026-09-16): all gates green** — `cargo build`, 147 tests
-passing, `cargo clippy --all-targets -- -D warnings` clean,
+**Current state (2026-09-17): all gates green** — `cargo build`, 172 tests
+passing, `cargo clippy --all-targets` clean,
 `cargo fmt --check` clean. Fish startup fixed (~1s prompt via terminal-query
 replies); caret/title/modes live-verified on :0. Binary runs on-display (X :0, 1280x720 Luscombe);
 headless fallback intact. Text legible and verified (OCR reads labels, typed
@@ -134,8 +134,10 @@ target AND `animating=false`; ANIMATED moves set target AND
         PTY (focus + select follow, `forwarding` owns the mouse until left
         release); drag motion reports under 1002/1003; release report ends
         it. Shift-click forces host select/move; resize handle always wins.
-  - [ ] Wheel still zooms (host nav); forwarding wheel to the child (e.g.
-        vim/less scroll) is a follow-up needing a scroll-vs-zoom decision.
+        Wheel over a reporting terminal forwards to the child (buttons 64/65
+        via `wheel_button`: direction + repeat, clamped at 8) so vim/less/
+        tmux scroll natively; otherwise the wheel scrolls host scrollback.
+        Ctrl+wheel always zooms, Shift+wheel always scrolls (xterm bypass).
 - [x] Paste path (session 2026-09-16, live-verified on :0):
   - [x] `arboard` clipboard read (+ X11 primary via `LinuxClipboardKind`);
         failures (headless/empty) are no-ops.
@@ -146,8 +148,18 @@ target AND `animating=false`; ANIMATED moves set target AND
   - [x] Live: `PASTE789` via Ctrl+Shift+V and `MID123` via middle-click
         landed in the prompt; Return executed the line; middle-drag pan
         stayed responsive.
-- [ ] Copy side needs text selection (left-drag select still spec).
-- [ ] OSC 8 hyperlinks, OSC 52 clipboard (permission-gated).
+- [x] Selection + copy live: Shift-drag selects terminal text,
+      auto-copies to clipboard + primary on release; Ctrl+Shift+C copies.
+      `Terminal::selected_text` + `visible_line` pure helpers with unit tests.
+- [x] Scrollback rendering live: wheel over a terminal scrolls its
+      `scroll_offset` (clamped to scrollback len); wheel over empty canvas
+      zooms; Ctrl+wheel always zooms; renderer draws `visible_line` rows; new
+      PTY output resets to follow-live.
+- [x] OSC 52 clipboard (child → host): `OSC 52 ; Pc ; Pd` base64 payloads
+      land in the clipboard (`c`) or primary selection (`p`); queries,
+      oversized (>1MB) and invalid payloads ignored — the child can only
+      write, never read back. Remote vim/tmux yank now reaches the system.
+- [ ] OSC 8 hyperlinks.
 - [ ] Unicode: graphemes, emoji, Nerd Fonts, ambiguous-width config (wide
       chars + spacer cells done).
 - [ ] `TextSource` impls beyond PTY: command output, file tail, plugin
@@ -176,9 +188,15 @@ target AND `animating=false`; ANIMATED moves set target AND
 - [x] Extract filter mode; highlight mode pending.
 - [x] `ProjectionSurface::from_terminal` / `update_from_terminal`; detach =
       ungrouped projection node.
+- [x] Pin-as-view live, two modes: `p` pins a frozen snapshot of the
+      focused terminal beside it (was a hardcoded SurfaceId(1) stub);
+      `P` pins a LIVE view (`ProjectionMode::Live` + follow) that re-syncs
+      from the source every frame via the existing projection sync —
+      log monitors, build watchers, htop sidecars. Both render in the text
+      pass and share the `view.pin` / `view.pinLive` command ids.
+- [x] Per-terminal overlays live: header labels `colsxrows @scale +scroll sbN`.
 - [ ] Presentation: wrap, reflow, line numbers, timestamps, match highlight,
-      font scale, theme override.
-- [ ] Pin-as-view UI + arrange commands for projections.
+      theme override. Per-node font scale (`,`/`.`) already varies glyph px.
 - [ ] Exit: subrange views pinned and arranged independently.
 
 ## Phase P5 — Lens & Zoom (README M5)
@@ -205,7 +223,12 @@ target AND `animating=false`; ANIMATED moves set target AND
   - [x] `terminal_range_rect` pure helper: grid-range → node sub-rect with
         clamping; window code with live `Terminal` dims zooms to it as a
         `Rectangle`. `workspace_content_bounds` shared with dashboard fit.
-- [ ] Exit: any zoom can become a pinned view (live pin + UI polish).
+- [x] Auto-zoom regions live (`src/regions.rs`, 5 tests): dense-panel and
+      box-frame detection over the live grid; selected terminal shows bordered
+      cues; right-clicking a cue zooms to that rectangle via `fit_rect`,
+      otherwise right-click zooms to the object.
+- [x] Live pin lands beside the source and selects the new node; `F` focus-ring
+      centers any node for the zoom-then-pin flow.
 
 ## Phase P6 — JS Host & Typed SDK (README M6–M7)
 
@@ -254,8 +277,9 @@ target AND `animating=false`; ANIMATED moves set target AND
 
 - [x] Groups: create/add/remove/members; move/zoom/collapse/fragment pending.
 - [x] Snapping: grid (`snap_to_grid`) + edge with guides (`snap_to_edges`).
-- [x] Arrange commands: tile H/V, grid, cascade; align L/R/T/B; distribute
-      H/V (keys T/H/V/A).
+- [x] Arrange commands: tile H/V, grid, cascade-from, orbit, focus-ring; align
+      L/R/T/B; distribute H/V (keys t/h/v/a/C/O/F). Varied-size spawn `N`
+      cycles 80x24/100x32/60x16/120x28 with matched font scales.
 - [x] Multi-select foundation: z-order bring/send; drag reorder pending.
 - [x] Layout persistence (v2 format): full nodes in z-order, explicit
       z-order (`set_z_order`), groups, parent→child edges, camera +
@@ -263,14 +287,30 @@ target AND `animating=false`; ANIMATED moves set target AND
       `load_from_file` helpers; v1 imports camera-only; malformed entries
       skipped; round-trip + file + v1-compat tests. Live PTY sessions are
       not persisted — terminal nodes restore as structure, shells re-spawn.
-- [ ] Alignment-guide rendering, multi-select drag reorder, layout
-      auto-save; profiles/selectors/modes in layouts.
+- [x] Context menu + border meta-widgets live: blue menu button (top-left),
+      red close button (top-right), resize handle, scrollbar
+      (track + live-offset thumb), region cue borders — all rendered in the
+      overlay pass. Ctrl+right-click or the menu button opens a target-aware
+      popup (terminal / projection / workspace) whose rows run the same ids as
+      the palette; click or Up/Down + Enter activates, Esc or empty-click closes.
+- [x] Layout save/restore in the UI: `S` / palette `layout.save` writes the
+      XDG `layout.json`; palette `layout.restore` drops live sessions
+      (SIGHUP) and revives every terminal node with a fresh PTY sized from
+      the node, remapping projection sources onto the new surfaces
+      (headless round-trip test: save → diverge → restore re-links pins).
+- [ ] Alignment-guide rendering, multi-select drag reorder.
+- [ ] Layouts stay arrangement-only by design (positions/sizes/styles/
+      selectors/groups/bookmarks; shells re-spawn, apps regenerate). No
+      terminal-state save/restore, no auto-save.
 - [ ] Exit: dashboards can be built quickly.
 
 ## Phase P8 — Accessibility (README M9)
 
 - [ ] Reading lens: reflow, line focus, ruler, word/line spacing.
-- [ ] High-contrast theme; reduce-motion; large cursor.
+- [x] Reduce motion is honored: `accessibility.reduce_motion` (config file
+      or palette `Toggle Reduce Motion`) snaps every animated camera move
+      to its target (`Camera::snap_to_targets`) instead of easing.
+- [ ] High-contrast theme; large cursor.
 - [ ] Quick reads: selection / current line / last 50 lines / filtered.
 - [ ] `accessibility` config section (fontSize, lineHeight, highContrast,
       hideChrome, cursor, reduceMotion).
@@ -280,9 +320,21 @@ target AND `animating=false`; ANIMATED moves set target AND
 
 ## Phase P9 — Platform, Persistence & Commands
 
-- [ ] Every action is a command; keybindings/HUD/palette/tests/CLI bind to
-      commands.
-- [ ] Command palette with fuzzy search.
+- [x] Minimal command palette live (Ctrl+K / `:`): substring filter, keyboard
+      nav, runs tile/cascade/orbit/focus/pin/spawn/style/fit/bookmark/close/copy/help.
+- [x] Every action is a command (session 2026-09-17): `builtin_commands()`
+      catalog in `src/command.rs` is the single source of truth — palette rows,
+      context menus, workspace keys, and `?` help all resolve the same ids;
+      `register_builtin_commands` exposes them to plugins/tests/CLI via
+      `CommandRegistry`; `command_for_key` covers the single-char dispatch.
+      Full `CommandContext`-executing handlers (mutable workspace) pending.
+- [x] Command palette fuzzy scoring (`fuzzy_score`: subsequence +
+  word-boundary + consecutive-run bonuses, shared by the frame and
+  keyboard paths) — preview still pending.
+- [ ] Command palette preview.
+- [x] `fracterm.config.ts` loads at startup from the XDG-aware config path
+      (`Config::config_path` → `load_from_ts`); any error falls back to
+      built-in defaults so a bad config never bricks launch.
 - [ ] XDG dirs; clipboard + primary selection; middle-click paste.
 - [ ] `.desktop` + AppStream metadata; window title; app ID.
 - [ ] Packaging: AppImage, deb, rpm, Arch, Flatpak.
@@ -296,17 +348,26 @@ target AND `animating=false`; ANIMATED moves set target AND
 
 ## Next Up (execution order)
 
+**Demo 0.1 storyline (spatial multi-terminal, first):**
+`N` x4 for varied terminals (80x24/100x32/60x16/120x28) → `O` orbit →
+run `htop` in one so box frames appear as bordered cues → right-click a cue
+to dive into the panel → `p` pin a snapshot card → `,`/`.` vary fonts,
+`o`/`c` style nodes → `F` focus-ring the log view → `Ctrl+K` palette and
+`Ctrl+right-click` menu to drive it all. Verify on-display: header labels
+legible, region cues visible on the selected terminal, wheel scrolls over a
+terminal and zooms over empty canvas, menu opens from the blue button and
+from Ctrl+right-click.
 1. Remaining P1/P3 live gaps: wheel-zoom timing/anchoring, move-drag with
    edge-snap feel, handle-resize → grid+PTY follow (`echo $COLUMNS` proves
    SIGWINCH), side-by-side `n`-spawn on a wider viewport.
-2. On-display verification pass of M1–M5 exit criteria.
+2. On-display verification pass of M1–M5 exit criteria + Demo 0.1 script.
 3. P6 remainder: typed commands/events/widgets SDK, more web globals,
    generated `.d.ts`, V8 host behind the trait.
 4. P7 remainder: alignment-guide rendering, multi-select drag reorder,
    layout auto-save/import-export.
 5. P8 accessibility: reading lens, high-contrast theme, reduce-motion,
    `accessibility` config.
-6. P9: command system + palette, XDG dirs, packaging.
+6. P9: full command registry wiring, XDG dirs, packaging.
 
 ---
 
@@ -441,11 +502,22 @@ Lessons 2026-09-16 (don't re-learn):
 
 ## Known Gaps / Tech Debt
 
-- Text pass queues per-cell (one queue call per terminal cell) — needs
-  glyph batching by color/style runs for 60fps on dense grids.
+- Text pass queues per-cell (one `queue_char_at` call per non-blank cell,
+  allocation-free with node-hoisted pixel size; the old per-cell `String`
+  alloc + per-row line clone are gone) — further run-batching by
+  color/style would cut call count for 60fps on dense grids.
+- PTY feed is bounded (128KB/session/frame via `take_output_capped`);
+  projection sync, palette filtering, and region scans are dirty-gated
+  (`Terminal::dirty`, cleared end-of-frame after consumers run).
+- Scrollback is a `VecDeque` (O(1) oldest-line eviction; `Vec::remove(0)`
+  memmoved up to 10k rows per scrolled line under heavy output).
+- Text pass culls off-screen terminals and cells against the visible world
+  rect (`arrange::rects_intersect`) — multi-node dashboards and deep zoom
+  skip queueing entirely instead of rasterizing invisible glyphs.
 - Per-frame `glow::Context` recreate risk: none (stored once).
-- Full-bleed startup ⇒ no empty canvas: left-drag always grabs a node;
-  pan is middle-drag only. Consider space-pan / Alt-drag fallback.
+- Full-bleed startup ⇒ no empty canvas: fixed 2026-09-17 — Space+drag
+  pans anywhere (no-focus only, so typing is unaffected), Alt+drag moves a
+  node (bypasses child mouse-forwarding), middle-drag still pans.
 - Fish first prompt FIXED 2026-09-16 (was ~14s blank): fish's startup query
   burst (kitty `?u`, XTVERSION, OSC 11, XTGETTCAP, CPR) now gets instant
   replies; prompt lands ~1s after launch, verified across relaunches.

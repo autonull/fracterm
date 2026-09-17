@@ -162,13 +162,17 @@ labels.
 
 | Input | Action |
 |---|---|
-| Mouse wheel | Zoom anchored at the cursor (smooth ~0.3 s easing) |
+| Mouse wheel over terminal | Scroll that terminal (follow-live resets on new output) |
+| Mouse wheel over empty canvas | Zoom anchored at the cursor (smooth ~0.3 s easing) |
+| Ctrl + wheel | Always zoom, even over a terminal |
 | Left-drag empty canvas | Pan |
+| Space + left-drag anywhere | Pan (works over nodes; full-bleed startup leaves no empty canvas) |
+| Alt + drag object | Move object (bypasses child mouse-forwarding) |
 | Middle-drag | Pan |
-| Right-click an object | Autozoom to it |
+| Right-click | Autozoom: the highlighted text region under the cursor if any, else the object |
 | Right-drag | Rectangle zoom |
 | Ctrl + right-click | Context menu (spec) |
-| Alt + drag object | Move object (spec; drag-select via left currently) |
+| Alt + drag object | Move object |
 | `0` | Zoom to workspace fit |
 | `f` | Smooth fly-to dashboard fit |
 | `d` | Dashboard mode: tile 2-up from the margin + fit |
@@ -182,8 +186,9 @@ labels.
 | Typing (focused) | Sent to the shell |
 | Arrows / named keys (focused) | Control sequences to the shell |
 | Ctrl + key (focused) | ASCII control codes (e.g. Ctrl+C = 0x03) |
-| Left drag (focused) | Select terminal text (spec) |
-| Shift + wheel | Scroll terminal (spec) |
+| Shift + left-drag (terminal) | Select terminal text (auto-copies to clipboard + primary) |
+| Ctrl + Shift + C | Copy current selection to clipboard |
+| Wheel over terminal | Scroll terminal scrollback (Shift + wheel also scrolls the focused terminal) |
 | Terminal app mouse mode | Forward mouse events to terminal (spec) |
 
 ## Terminal Node Management
@@ -195,6 +200,13 @@ labels.
 | Left-drag bottom-right corner | Resize it — grid + PTY follow (SIGWINCH) |
 | Click empty canvas | Clear selection, start pan |
 | `n` | Spawn a new terminal beside the focused one, wrapping below on narrow viewports (cap: 8) |
+| `N` | Spawn a varied terminal (cycles 80x24, 100x32, 60x16, 120x28 with matched font scales) |
+| `,` / `.` | Shrink / grow selected terminal font (0.7x-2.5x, per-node) |
+| `o` | Cycle selected node opacity (1.0 / 0.92 / 0.8 / 0.67) |
+| `c` | Cycle selected node tint (ink / moss / indigo / maroon) |
+| Red square top-right | Close button (click) |
+| Blue square top-left | Menu button: opens the context menu for the selected node |
+| Right edge bar | Scrollbar showing scrollback depth + live offset |
 
 ## Arrange Commands
 
@@ -204,13 +216,19 @@ labels.
 | `v` | Tile vertically |
 | `t` | Tile grid (3 columns) |
 | `a` | Align left |
+| `C` | Cascade diagonally from the first node (48px steps) |
+| `O` | Orbit nodes in a circle around the centroid |
+| `F` | Focus ring: selected node centered, others orbited around it |
 | `T`/`H`/`V`/`A` variants | Full set: tile, align (L/R/T/B), distribute (spec) |
 
 ## Projections & Bookmarks
 
 | Input | Action |
 |---|---|
-| `p` | Pin the current viewport as a snapshot projection node |
+| `p` | Pin a frozen snapshot of the focused terminal as a card beside it |
+| `P` | Pin a live view of the focused terminal: streams source output every frame (follow tail) |
+| Ctrl + right-click | Context menu for the node (or workspace) under the cursor |
+| Selected terminal | Highlighted rectangles mark auto-zoomable text regions (dense panels, box frames); right-click one to zoom into it |
 | `b` | Save a camera bookmark to the next rotating slot `bm0`–`bm9` |
 | `1`–`9` | Restore camera bookmark `bm<n>` |
 | `0` | Restore `bm0` if saved, otherwise zoom to workspace fit |
@@ -222,18 +240,21 @@ retrievable by digit. Named-bookmark UI is still planned (TODO P5).
 Any zoom can be pinned: zoom into a terminal range, press `p`, and it becomes
 an independent subrange-view node.
 
-## Command Palette & HUD (spec)
+## Command Palette & HUD
 
-- Auto-hiding HUD with configurable edge/hotkey.
-- HUD actions: New Terminal, Command Palette, Save/Restore Layout,
-  Toggle Effects, Plugin Console, Help.
-- The **command palette** is the universal entry point; every action is a
-  command (`terminal.new`, `camera.zoomToFit`, `layout.save`,
-  `reading.enter`, …) bindable from keybindings, HUD, palette, tests, and CLI.
+- Minimal command palette is **live**: `Ctrl+K` anywhere or `:` in workspace
+  mode opens it; fuzzy-filter, `Up`/`Down` + `Enter` runs, `Esc` closes.
+- Palette commands today: new/varied terminal, tile H/V/grid, cascade, orbit,
+  focus ring, fit, workspace fit, pin snapshot / live view, bookmark save, dashboard,
+  close selected, copy selection, help.
+- `?` in workspace mode prints the key cheatsheet to stderr.
+- Auto-hiding HUD with configurable edge/hotkey remains spec; every palette
+  row already maps 1:1 to a command id so HUD/palette/tests/CLI share them.
 
 ## Configuration
 
-TypeScript-first. Default path:
+TypeScript-first. Default path (loaded at startup when present; built-in
+defaults apply otherwise, and a broken config never blocks launch):
 
 ```text
 ~/.config/fracterm/fracterm.config.ts
@@ -1402,9 +1423,11 @@ Example:
 ```
 
 v2 stores full nodes (in z-order) plus explicit z-order, groups, and
-parent→child edges; v1 layouts still import camera-only. Live PTY
-sessions are not persisted — terminal nodes restore as structure and
-re-spawn fresh shells.
+parent→child edges; v1 layouts still import camera-only. By design no
+terminal state is ever saved — no scrollback, no PTY, no running program.
+A layout is an arrangement (positions, sizes, styles, selectors, groups,
+bookmarks); terminal nodes restore as structure and re-spawn fresh shells,
+and every app regenerates its own content on restart.
 
 ---
 
@@ -1801,15 +1824,16 @@ partial), **spec** (design only; see TODO.md phase for landing it).
 | `src/lens.rs` | `CameraLens`, `Lens`, `ZoomTarget`, `Rect`, `GridRange`; full viewport-aware target resolution + `terminal_range_rect` | §1.5, §6 | live |
 | `src/dts.rs` | Generated `fracterm.d.ts` bundle (`config`/`plugin`/`widget` modules) from the Rust API surface | §24.1 | live |
 | `src/canvas.rs` | GL context/capabilities, `RectRenderer` batching, `RenderTarget` FBOs, `RenderGraphExecutor` | §4.1–4.2 | live (PostProcess placeholder) |
-| `src/text.rs` | fontconfig discovery, FreeType rasterization, `Atlas`/`GlyphKey` cache, `TextRenderer`, zoom-size strategy | §4.3–4.4 | live (far-zoom layers pending) |
+| `src/text.rs` | fontconfig discovery, FreeType rasterization, `Atlas`/`GlyphKey` cache, `TextRenderer`, zoom-size strategy | §4.3–4.4 | live (far-zoom layers pending; per-cell queue is allocation-free via `queue_char_at` with node-hoisted pixel size) |
 | `src/rendering.rs` | Logical `RenderGraph` model (`RenderPass`, node config, glyph-atlas stub) | §4.1 | live |
-| `src/window.rs` | winit event loop + glutin surface; terminal sessions, drag state machine, child mouse forwarding (Shift bypass), clipboard/primary paste, keyboard encoding, draw frame | §5 | live |
+| `src/window.rs` | winit event loop + glutin surface; terminal sessions, drag state machine, child mouse forwarding (Shift bypass), clipboard/primary paste, keyboard encoding, wheel scroll-vs-zoom, region cues, border widgets, palette + context menu, draw frame | §5 | live |
+| `src/regions.rs` | `CellRect` + `detect_zoom_regions`: dense-panel and box-frame detection over the live grid for auto-zoom cues | §6 | live |
 | `src/arrange.rs` | Pure layout math: tile/align/distribute/cascade, snapping, `place_beside`, grid metrics | §11 | live |
 | `src/app.rs` | `App`, `AppState`, `InteractionMode`, `CliArgs`; headless fallback loop | §5.1 | scaffold (loop is a stub) |
 | `src/config.rs` | `Config` tree: font/theme/camera/effects/input/terminal/hud/accessibility/profiles | §10 | scaffold (TS loading pending) |
 | `src/theme.rs` | `Theme` colors | §1 | live |
 | `src/event.rs` | `Event`, `EventBus` (serde, throttling) | §9.4 | live |
-| `src/command.rs` | `Command`, typed `CommandInput` params | §17 | scaffold |
+| `src/command.rs` | `Command`, typed `CommandInput` params, builtin catalog (`builtin_commands`, `command_for_key`, `register_builtin_commands`) — palette/keys/menus/help share ids | §17 | scaffold |
 | `src/permission.rs` | `Permission`, `PermissionScope`, `PermissionContext` | §15 | live |
 | `src/plugin.rs` | `Plugin` trait, `Widget`, `V8Host` stub, `PluginSDK`, settings validation + `settings_ui_rows` descriptors | §21 | scaffold |
 | `src/widget.rs` | `WidgetDisplayList` pipeline + `WidgetRegistry`; declarative `WidgetDefinition`/`LiveWidget` (state/timers/view → display lists) | §21 | live (host-side; GL render path spec) |
@@ -1826,16 +1850,16 @@ Plugins enter via `script.rs` behind `ScriptHost`.
 |---|---|---|
 | Canvas, camera, pan/zoom | **live** | eased, cursor-anchored, bookmarked; drift-free |
 | Text rendering | **live** | atlas + subpixel + near/large zoom sizes; far-zoom layer textures pending |
-| Terminal (PTY/VT/grid) | **live** | SGR 16/256/24-bit, alt screen, scrollback, keyboard, mouse forwarding (press/drag/release, Shift bypass; wheel stays zoom), paste (Ctrl+Shift+V / Shift+Insert clipboard, middle-click primary; ?2004-framed); selection-copy/OSC pending |
-| Projections | **live** | selectors + live/snapshot; presentation options pending |
+| Terminal (PTY/VT/grid) | **live** | SGR 16/256/24-bit, alt screen, scrollback + scroll offset rendering, Shift-drag text selection (clipboard + primary copy), Ctrl+Shift+C copy, wheel-over-terminal scroll with follow-live — or forwarded to the child as buttons 64/65 when it reports mouse (vim/less/tmux), Ctrl+wheel zooms, keyboard, mouse forwarding (press/drag/release/wheel, Shift bypass), paste (Ctrl+Shift+V / Shift+Insert clipboard, middle-click primary; ?2004-framed); OSC 52 child→host clipboard live, OSC 8 pending |
+| Projections | **live** | selectors + live/snapshot; `p` pins a frozen snapshot beside the source, `P` pins a live follow view (re-synced per frame); projection content renders as overlay text; presentation options (wrap/reflow/highlight) pending |
 | Lens zoom + pin | **live** | all targets resolve (workspace-fit/object/rect/terminal-range/projection/reading); grid-precise range zoom via `terminal_range_rect` |
 | Script host + TS load | **live** | QuickJS + SWC; V8 behind trait pending |
 | Permissions | **live** | scoped matching; enforcement surface partial |
-| Arrange/dashboard | **live** | tile/align/distribute/snap/persist; guides UI + multi-select drag pending |
-| Config system | **scaffold** | Rust `Config` tree + profiles; TS config file loading pending |
-| Command system | **scaffold** | typed params exist; palette/keybinding wiring pending |
-| HUD / palette / menus | **spec** | — |
-| Reading mode / accessibility | **spec** | config struct exists |
+| Arrange/dashboard | **live** | tile/align/distribute/cascade-from/orbit/focus-ring/snap/persist; per-node font scale (`,`/`.`), opacity (`o`), tint (`c`); header overlays show `colsxrows @scale +scroll sbN`; varied-size spawn (`N`); layout save (`S`) + restore with PTY respawn and projection re-link; guides UI + multi-select drag pending |
+| Config system | **scaffold** | Rust `Config` tree + profiles; `fracterm.config.ts` loads at startup (XDG-aware, defaults on error); hot-reload / full profile application pending |
+| Command system | **scaffold** | builtin catalog live (keys/palette/menus/help share ids; registry-registered); full keybinding registry wiring pending |
+| HUD / palette / menus | **scaffold** | minimal palette live (Ctrl+K / `:`); context menu live (Ctrl+right-click or blue border button, target-aware implemented commands); border meta-widgets live (close/menu/resize/scrollbar/region cues); HUD chrome spec |
+| Reading mode / accessibility | **spec** | config struct exists; reduce-motion honored (animated camera moves snap) + palette toggle live |
 | Widgets (display lists) | **scaffold** | `Widget` type exists; render pipeline spec |
 | Search / context menus | **spec** | — |
 | Packaging / XDG / CLI | **spec** | `CliArgs` parsed-but-unused |

@@ -4,10 +4,12 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 
+use crate::input::{ContextMenuItem, ContextMenuBuilder};
+
 type CellPos = (u32, u32);
 type TextSelection = (SurfaceId, crate::NodeId, CellPos, CellPos);
 type SelectDrag = (SurfaceId, crate::NodeId, CellPos);
-type MenuItems = Vec<(String, String)>;
+type MenuItems = Vec<ContextMenuItem>;
 type MenuSnap = Option<(f64, f64, MenuItems, usize)>;
 type ScrollBar = (f64, f64, f64, f64, f64, f64, f64, f64);
 
@@ -142,6 +144,28 @@ struct CanvasState {
     region_cache_node: Option<crate::NodeId>,
     region_cache_key: (u64, u64, u64, u64),
     region_cache: Vec<(f64, f64, f64, f64)>,
+    /// Transient status line (toast): last action feedback with expiry.
+    toast: Option<(String, std::time::Instant)>,
+    /// On-screen help overlay (toggled by `?` / F1, closed by Esc).
+    help_open: bool,
+    /// Auto-hiding HUD state.
+    hud_visible: bool,
+    hud_last_activity: std::time::Instant,
+    /// Search state
+    search_query: String,
+    search_case_sensitive: bool,
+    search_regex: bool,
+    search_matches: Vec<(u32, u32)>, // (row, col)
+    search_current_match: usize,
+    search_input_active: bool,
+    /// Active drag guides for visual feedback during move/resize
+    drag_guides: Vec<crate::arrange::GuideLine>,
+    /// Recently closed nodes for undo (`u` reopens the last one, cap 20).
+    closed_stack: Vec<ClosedNode>,
+    /// Undo stack for workspace mutations
+    undo_stack: Vec<UndoAction>,
+    /// Redo stack
+    redo_stack: Vec<UndoAction>,
 }
 
 /// A terminal child that owns the mouse until left-button release.
@@ -149,6 +173,60 @@ struct CanvasState {
 struct ForwardMouse {
     surface: SurfaceId,
     button: crate::vt::MouseButton,
+}
+
+/// Undoable workspace action
+#[derive(Debug, Clone)]
+enum UndoAction {
+    NodeMoved { node_id: crate::NodeId, old_pos: (f64, f64), new_pos: (f64, f64) },
+    NodeResized { node_id: crate::NodeId, old_size: (f64, f64), new_size: (f64, f64) },
+    NodeCreated { node_id: crate::NodeId },
+    NodeDeleted { node: crate::Node, font_scale: Option<f32> },
+    NodeStyleChanged { node_id: crate::NodeId, old_style: crate::Theme, new_style: crate::Theme },
+}
+
+/// A closed node kept for undo (`terminal.reopen`). Terminal nodes re-spawn
+/// a fresh PTY on reopen (arrangement-only restore, like layouts); plain
+/// projection/widget nodes restore as-is.
+#[derive(Debug, Clone)]
+struct ClosedNode {
+    node: crate::Node,
+    font_scale: Option<f32>,
+}
+
+/// Next node in z-order after `cur` (`reverse` = Shift+Tab). Wraps around;
+/// `None` when empty. Pure helper so Tab-cycling is unit-testable.
+pub fn cycle_selection(
+    ids: &[crate::NodeId],
+    cur: Option<crate::NodeId>,
+    reverse: bool,
+) -> Option<crate::NodeId> {
+    if ids.is_empty() {
+        return None;
+    }
+    let cur_idx = cur.and_then(|c| ids.iter().position(|id| *id == c));
+    match cur_idx {
+        None => Some(if reverse { ids[ids.len() - 1] } else { ids[0] }),
+        Some(i) => {
+            let n = ids.len();
+            let next = if reverse {
+                (i + n - 1) % n
+            } else {
+                (i + 1) % n
+            };
+            Some(ids[next])
+        }
+    }
+}
+
+/// One-line palette row: title plus key hint and category so every row is
+/// self-describing without opening docs.
+pub fn format_palette_row(title: &str, key: &str, category: &str) -> String {
+    if key.is_empty() {
+        format!("{title}  · {category}")
+    } else {
+        format!("{title}  [{key}] · {category}")
+    }
 }
 
 /// Fuzzy subsequence score for palette filtering (`None` = no match).
@@ -234,6 +312,20 @@ impl CanvasState {
             region_cache_node: None,
             region_cache_key: (0, 0, 0, 0),
             region_cache: Vec::new(),
+            toast: None,
+            help_open: false,
+            hud_visible: true,
+            hud_last_activity: std::time::Instant::now(),
+            search_query: String::new(),
+            search_case_sensitive: false,
+            search_regex: false,
+            search_matches: Vec::new(),
+            search_current_match: 0,
+            search_input_active: false,
+            drag_guides: Vec::new(),
+            closed_stack: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 
@@ -461,7 +553,50 @@ impl CanvasState {
         self.app.state.workspace.add_node(node);
         self.selected = Some(next_id);
         let kind = if live { "live view" } else { "snapshot" };
-        eprintln!("pinned {kind} as node {next_id:?}");
+        self.notify(format!(
+            "pinned {kind} as node {next_id:?} (arrange with h/v/t)"
+        ));
+    }
+
+    /// Status feedback: logs to stderr (headless/diagnostics) AND shows an
+    /// on-screen toast that expires after ~2.5s. Replaces bare `eprintln!`
+    /// for user-facing action feedback.
+    fn notify(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        eprintln!("{msg}");
+        self.toast = Some((msg, std::time::Instant::now()));
+    }
+
+    fn toast_text(&self) -> Option<String> {
+        let (msg, at) = self.toast.as_ref()?;
+        if at.elapsed().as_secs_f32() > 2.5 {
+            return None;
+        }
+        Some(msg.clone())
+    }
+
+    /// Cycle workspace selection through nodes in z-order (`reverse` for
+    /// Shift+Tab). Also follows with keyboard focus when the new selection
+    /// is a live terminal.
+    fn cycle_selection(&mut self, reverse: bool) {
+        let ids = self.app.state.workspace.nodes().to_vec();
+        let next = cycle_selection(&ids, self.selected, reverse);
+        if let Some(id) = next {
+            self.selected = Some(id);
+            if let Some(sess) = self.terms.iter().find(|s| s.node == id) {
+                self.focused_term = Some(sess.surface);
+            }
+        }
+    }
+
+    /// Nudge the selected node by whole world pixels (arrow keys).
+    fn nudge_selected(&mut self, dx: f64, dy: f64) {
+        if let Some(id) = self.selected {
+            if let Some(n) = self.app.state.workspace.get_node_mut(id) {
+                n.transform.x += dx;
+                n.transform.y += dy;
+            }
+        }
     }
 
     /// Palette rows, sourced from the builtin command catalog so palette,
@@ -470,34 +605,165 @@ impl CanvasState {
     ///
     /// Rows are ranked by [`fuzzy_score`] so short queries (`tv`, `pinl`)
     /// find their command without exact-substring typing.
-    fn palette_commands() -> Vec<(&'static str, &'static str)> {
+    fn palette_commands() -> Vec<(&'static str, &'static str, &'static str, &'static str, &'static str)> {
         crate::command::builtin_commands()
             .into_iter()
             .filter(|c| c.id != "camera.bookmarkRestore")
-            .map(|c| (c.id, c.title))
+            .map(|c| (c.id, c.title, c.key, c.category, c.description))
             .collect()
     }
 
-    fn palette_filtered(&self) -> Vec<(&'static str, &'static str)> {
+    /// On-screen cheatsheet rows (key, title), generated from the same
+    /// builtin catalog as palette/menus/keys so help never drifts.
+    fn help_rows() -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String)> = crate::command::builtin_commands()
+            .into_iter()
+            .map(|c| {
+                let key = if c.key.is_empty() {
+                    "(palette)".to_string()
+                } else {
+                    c.key.to_string()
+                };
+                (key, format!("{} · {}", c.title, c.category))
+            })
+            .collect();
+        rows.push(("Ctrl+K".to_string(), "Command palette · Help".to_string()));
+        rows.push((
+            "Space+drag".to_string(),
+            "Pan anywhere · Workspace".to_string(),
+        ));
+        rows.push(("Alt+drag".to_string(), "Move node · Workspace".to_string()));
+        rows.push((
+            "Shift+drag".to_string(),
+            "Select terminal text · Terminal".to_string(),
+        ));
+        rows
+    }
+
+    /// HUD rows: action buttons shown in the auto-hiding HUD bar.
+    fn hud_rows() -> Vec<(&'static str, &'static str, &'static str)> {
+        vec![
+            ("terminal.new", "New Terminal", "Terminal"),
+            ("palette.open", "Command Palette", "Help"),
+            ("layout.save", "Save Layout", "Arrange"),
+            ("layout.restore", "Restore Layout", "Arrange"),
+            ("view.reduceMotion", "Toggle Effects", "View"),
+            ("plugin.console", "Plugin Console", "Dev"),
+            ("help.open", "Help", "Help"),
+        ]
+    }
+
+    /// Render the auto-hiding HUD bar at the configured edge.
+    fn render_hud(
+        renderer: &mut RectRenderer,
+        text: &mut TextRenderer,
+        gl: &glow::Context,
+        atlas: &mut Atlas,
+        fonts: &mut FontSystem,
+        font_id: u32,
+        cam: &crate::Camera,
+        viewport_size: (f32, f32),
+        hud_cfg: &crate::config::HudConfig,
+        theme: &crate::config::ThemeConfig,
+    ) {
+        let vw = viewport_size.0 as f64;
+        let vh = viewport_size.1 as f64;
+        let zoom = cam.zoom.max(0.05);
+        let rows = Self::hud_rows();
+        let item_w = 140.0f64;
+        let item_h = 28.0f64;
+        let gap = 8.0f64;
+        let total_w = rows.len() as f64 * item_w + (rows.len() - 1) as f64 * gap;
+        let bar_h = item_h + 16.0;
+        let bg_color = crate::surface::Color::from_hex(&theme.background);
+        let fg_color = crate::surface::Color::from_hex(&theme.foreground);
+        let accent = (0.35, 0.7, 1.0, 1.0);
+
+        // Position based on edge config
+        let (bx, by) = match hud_cfg.edge.as_str() {
+            "top-left" => (cam.x + 16.0 / zoom, cam.y + 16.0 / zoom),
+            "top-right" => (cam.x + vw / zoom - total_w - 16.0 / zoom, cam.y + 16.0 / zoom),
+            "bottom-left" => (cam.x + 16.0 / zoom, cam.y + vh / zoom - bar_h - 16.0 / zoom),
+            "bottom-right" => (
+                cam.x + vw / zoom - total_w - 16.0 / zoom,
+                cam.y + vh / zoom - bar_h - 16.0 / zoom,
+            ),
+            _ => (cam.x + 16.0 / zoom, cam.y + 16.0 / zoom),
+        };
+
+        // Background bar
+        renderer.push_overlay_rect(bx, by, total_w + 16.0, bar_h, (
+            bg_color.r as f32 / 255.0,
+            bg_color.g as f32 / 255.0,
+            bg_color.b as f32 / 255.0,
+            0.9,
+        ));
+        renderer.push_border(bx, by, total_w + 16.0, bar_h, 1.0, accent);
+
+        // Items
+        for (i, (_id, title, _category)) in rows.iter().enumerate() {
+            let ix = bx + 8.0 + i as f64 * (item_w + gap);
+            let iy = by + 8.0;
+            renderer.push_overlay_rect(ix, iy, item_w, item_h, (
+                bg_color.r as f32 / 255.0 * 0.7,
+                bg_color.g as f32 / 255.0 * 0.7,
+                bg_color.b as f32 / 255.0 * 0.7,
+                0.8,
+            ));
+            renderer.push_border(ix, iy, item_w, item_h, 1.0, (
+                accent.0 * 0.7, accent.1 * 0.7, accent.2 * 0.7, 0.8
+            ));
+            unsafe {
+                text.queue_string(
+                    gl,
+                    atlas,
+                    fonts,
+                    font_id,
+                    (ix + 8.0, iy + 6.0),
+                    (cam.x, cam.y, cam.zoom),
+                    10,
+                    title,
+                    (
+                        fg_color.r as f32 / 255.0,
+                        fg_color.g as f32 / 255.0,
+                        fg_color.b as f32 / 255.0,
+                        1.0,
+                    ),
+                );
+            }
+        }
+    }
+
+    fn palette_filtered(&self) -> Vec<(&'static str, &'static str, &'static str, &'static str, &'static str)> {
         let q = self.palette_query.to_lowercase();
         if q.is_empty() {
             return Self::palette_commands();
         }
-        let mut scored: Vec<(u32, &'static str, &'static str)> = Self::palette_commands()
-            .into_iter()
-            .filter_map(|(id, title)| {
-                let a = fuzzy_score(&q, &id.to_lowercase());
-                let b = fuzzy_score(&q, &title.to_lowercase());
-                match (a, b) {
-                    (None, None) => None,
-                    (x, y) => Some((x.unwrap_or(0).max(y.unwrap_or(0)), id, title)),
-                }
-            })
-            .collect();
+        let mut scored: Vec<(u32, &'static str, &'static str, &'static str, &'static str, &'static str)> =
+            Self::palette_commands()
+                .into_iter()
+                .filter_map(|(id, title, key, category, description)| {
+                    let a = fuzzy_score(&q, &id.to_lowercase());
+                    let b = fuzzy_score(&q, &title.to_lowercase());
+                    let c = fuzzy_score(&q, &category.to_lowercase());
+                    let d = fuzzy_score(&q, &description.to_lowercase());
+                    match (a, b, c, d) {
+                        (None, None, None, None) => None,
+                        (x, y, z, w) => Some((
+                            x.unwrap_or(0).max(y.unwrap_or(0)).max(z.unwrap_or(0)).max(w.unwrap_or(0)),
+                            id,
+                            title,
+                            key,
+                            category,
+                            description,
+                        )),
+                    }
+                })
+                .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
         scored
             .into_iter()
-            .map(|(_, id, title)| (id, title))
+            .map(|(_, id, title, key, category, description)| (id, title, key, category, description))
             .collect()
     }
 
@@ -522,12 +788,16 @@ impl CanvasState {
                         .unwrap_or((DASH_MARGIN, DASH_MARGIN, size.0, size.1));
                     let pos = crate::arrange::place_beside(anchor, size, DASH_GAP, view);
                     if let Err(e) = self.spawn_terminal_node(GRID_COLS, GRID_ROWS, pos) {
-                        eprintln!("failed to spawn terminal: {e}");
+                        self.notify(format!("failed to spawn terminal: {e}"));
+                    } else {
+                        self.notify("terminal spawned (n)");
                     }
                 } else {
-                    eprintln!("terminal limit reached");
+                    self.notify("terminal limit reached (8)");
                 }
             }
+            "terminal.reopen" => self.reopen_closed(),
+            "layout.selectNext" => self.cycle_selection(false),
             "layout.tileH" => self.apply_arrange(
                 |ns, _| crate::arrange::tile_horizontally(ns, crate::arrange::DEFAULT_GAP),
                 0,
@@ -551,7 +821,7 @@ impl CanvasState {
             "view.pinLive" => self.pin_view(true),
             "camera.bookmarkSave" => {
                 let name = self.app.state.workspace.camera_mut().save_next_bookmark();
-                eprintln!("bookmark {name} saved");
+                self.notify(format!("bookmark {name} saved (1-9 to restore)"));
             }
             "layout.dashboard" => {
                 if let Some(first) = self.app.state.workspace.all_nodes().first().map(|n| n.id) {
@@ -571,12 +841,18 @@ impl CanvasState {
             "view.reduceMotion" => {
                 let on = !self.app.state.config.accessibility.reduce_motion;
                 self.app.state.config.accessibility.reduce_motion = on;
-                eprintln!("reduce motion {}", if on { "on" } else { "off" });
+                self.notify(format!("reduce motion {}", if on { "on" } else { "off" }));
             }
             "terminal.close" => {
-                self.close_selected();
+                if self.close_selected() {
+                    self.notify("closed (u to reopen)");
+                }
             }
-            "terminal.copy" => self.copy_selection_to_clipboard(false),
+            "terminal.copy" => {
+                if self.copy_selection_to_clipboard(false) {
+                    self.notify("selection copied");
+                }
+            }
             "terminal.varied" => self.spawn_varied_terminal(),
             "style.fontBigger" => self.adjust_selected_font(0.15),
             "style.fontSmaller" => self.adjust_selected_font(-0.15),
@@ -610,18 +886,446 @@ impl CanvasState {
                 }
             }
             "help.open" => {
-                let mut parts: Vec<String> = crate::command::builtin_commands()
-                    .into_iter()
-                    .map(|c| {
-                        if c.key.is_empty() {
-                            format!("{} ({})", c.title, c.id)
-                        } else {
-                            format!("{}: {}", c.key, c.title)
+                self.help_open = !self.help_open;
+            }
+            "profile.default" => {
+                self.app.state.config = crate::config::Config::new();
+                self.notify("applied profile: default");
+            }
+            "profile.big-text" => {
+                self.app.state.config.apply_profile("big-text");
+                self.notify("applied profile: big-text");
+            }
+            "profile.ssh" => {
+                self.app.state.config.apply_profile("ssh");
+                self.notify("applied profile: ssh");
+            }
+            "profile.logs" => {
+                self.app.state.config.apply_profile("logs");
+                self.notify("applied profile: logs");
+            }
+            "profile.presentation" => {
+                self.app.state.config.apply_profile("presentation");
+                self.notify("applied profile: presentation");
+            }
+            "profile.high-contrast" => {
+                self.app.state.config.apply_profile("high-contrast");
+                self.notify("applied profile: high-contrast");
+            }
+            "reading.enter" => {
+                if let Some(surface) = self.focused_term {
+                    if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
+                        let term = &self.terms[idx].engine.term;
+                        // Create a reading projection from the terminal
+                        let node_id = self.terms[idx].node;
+                        if let Some(node) = self.app.state.workspace.get_node(node_id) {
+                            let (nx, ny) = (node.transform.x, node.transform.y);
+                            let next_id = crate::NodeId(
+                                self.app.state.workspace.node_ids().iter().map(|n| n.0).max().unwrap_or(0) + 1,
+                            );
+                            let selector = crate::ProjectionSelector {
+                                rows: None,
+                                columns: None,
+                                filter: None,
+                                search: None,
+                                max_lines: None,
+                                follow: true,
+                            };
+                            let proj = crate::ProjectionSurface::from_terminal(term, selector, crate::ProjectionMode::Live);
+                            let mut reading_node = crate::Node::new(next_id, nx, ny);
+                            reading_node.size = (600.0, 400.0);
+                            reading_node.set_surface(surface);
+                            reading_node.projection = Some(proj);
+                            reading_node.transform.scale = 1.0;
+                            self.app.state.workspace.add_node(reading_node);
+                            self.selected = Some(next_id);
+                            self.app.state.active_mode = crate::app::InteractionMode::Reading;
+                            self.notify("entered reading mode (Esc to exit)");
                         }
-                    })
-                    .collect();
-                parts.push("Ctrl+K / :: palette".to_string());
-                eprintln!("keys: {}", parts.join(", "));
+                    }
+                }
+            }
+            "reading.exit" => {
+                self.app.state.active_mode = crate::app::InteractionMode::Workspace;
+                self.notify("exited reading mode");
+            }
+            "reading.readSelection" => {
+                if let Some((surface, _, a, b)) = self.selection {
+                    if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
+                        let term = &self.terms[idx].engine.term;
+                        let text = term.selected_text(a, b);
+                        if !text.is_empty() {
+                            let node_id = self.terms[idx].node;
+                            if let Some(node) = self.app.state.workspace.get_node(node_id) {
+                                let (nx, ny) = (node.transform.x, node.transform.y);
+                                let next_id = crate::NodeId(
+                                    self.app.state.workspace.node_ids().iter().map(|n| n.0).max().unwrap_or(0) + 1,
+                                );
+                                let selector = crate::ProjectionSelector {
+                                    rows: None,
+                                    columns: None,
+                                    filter: None,
+                                    search: None,
+                                    max_lines: None,
+                                    follow: false,
+                                };
+                                // Create a snapshot projection with the selected text
+                                let mut proj = crate::ProjectionSurface::from_terminal(term, selector, crate::ProjectionMode::Snapshot);
+                                proj.content = text.lines().map(|s| s.to_string()).collect();
+                                let mut reading_node = crate::Node::new(next_id, nx, ny);
+                                reading_node.size = (600.0, 400.0);
+                                reading_node.set_surface(surface);
+                                reading_node.projection = Some(proj);
+                                reading_node.transform.scale = 1.0;
+                                self.app.state.workspace.add_node(reading_node);
+                                self.selected = Some(next_id);
+                                self.app.state.active_mode = crate::app::InteractionMode::Reading;
+                                self.notify("reading selection");
+                            }
+                        }
+                    }
+                }
+            }
+            "reading.readCurrentLine" => {
+                if let Some(surface) = self.focused_term {
+                    if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
+                        let term = &self.terms[idx].engine.term;
+                        let row = term.cursor_row.min(term.grid.rows.saturating_sub(1));
+                        let line = term.visible_line(row).map(|l| l.iter().map(|c| c.character).collect::<String>()).unwrap_or_default();
+                        if !line.is_empty() {
+                            let node_id = self.terms[idx].node;
+                            if let Some(node) = self.app.state.workspace.get_node(node_id) {
+                                let (nx, ny) = (node.transform.x, node.transform.y);
+                                let next_id = crate::NodeId(
+                                    self.app.state.workspace.node_ids().iter().map(|n| n.0).max().unwrap_or(0) + 1,
+                                );
+                                let selector = crate::ProjectionSelector {
+                                    rows: None,
+                                    columns: None,
+                                    filter: None,
+                                    search: None,
+                                    max_lines: None,
+                                    follow: false,
+                                };
+                                let mut proj = crate::ProjectionSurface::from_terminal(term, selector, crate::ProjectionMode::Snapshot);
+                                proj.content = vec![line];
+                                let mut reading_node = crate::Node::new(next_id, nx, ny);
+                                reading_node.size = (600.0, 400.0);
+                                reading_node.set_surface(surface);
+                                reading_node.projection = Some(proj);
+                                reading_node.transform.scale = 1.0;
+                                self.app.state.workspace.add_node(reading_node);
+                                self.selected = Some(next_id);
+                                self.app.state.active_mode = crate::app::InteractionMode::Reading;
+                                self.notify("reading current line");
+                            }
+                        }
+                    }
+                }
+            }
+            "reading.readLastLines" => {
+                if let Some(surface) = self.focused_term {
+                    if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
+                        let term = &self.terms[idx].engine.term;
+                        let lines: Vec<String> = term.grid.scrollback.iter().rev().take(50).rev().map(|l| l.iter().map(|c| c.character).collect()).collect();
+                        if !lines.is_empty() {
+                            let node_id = self.terms[idx].node;
+                            if let Some(node) = self.app.state.workspace.get_node(node_id) {
+                                let (nx, ny) = (node.transform.x, node.transform.y);
+                                let next_id = crate::NodeId(
+                                    self.app.state.workspace.node_ids().iter().map(|n| n.0).max().unwrap_or(0) + 1,
+                                );
+                                let selector = crate::ProjectionSelector {
+                                    rows: None,
+                                    columns: None,
+                                    filter: None,
+                                    search: None,
+                                    max_lines: None,
+                                    follow: false,
+                                };
+                                let mut proj = crate::ProjectionSurface::from_terminal(term, selector, crate::ProjectionMode::Snapshot);
+                                proj.content = lines;
+                                let mut reading_node = crate::Node::new(next_id, nx, ny);
+                                reading_node.size = (600.0, 400.0);
+                                reading_node.set_surface(surface);
+                                reading_node.projection = Some(proj);
+                                reading_node.transform.scale = 1.0;
+                                self.app.state.workspace.add_node(reading_node);
+                                self.selected = Some(next_id);
+                                self.app.state.active_mode = crate::app::InteractionMode::Reading;
+                                self.notify("reading last 50 lines");
+                            }
+                        }
+                    }
+                }
+            }
+            "reading.readFiltered" => {
+                if let Some(surface) = self.focused_term {
+                    if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
+                        let term = &self.terms[idx].engine.term;
+                        let filter = crate::projection::FilterSpec::Levels {
+                            levels: vec!["ERROR".to_string(), "WARN".to_string(), "FATAL".to_string()],
+                        };
+                        let lines: Vec<String> = term.grid.scrollback.iter().filter_map(|l| {
+                            let line_text: String = l.iter().map(|c| c.character).collect();
+                            if line_text.contains("ERROR") || line_text.contains("WARN") || line_text.contains("FATAL") {
+                                Some(line_text)
+                            } else {
+                                None
+                            }
+                        }).collect();
+                        if !lines.is_empty() {
+                            let node_id = self.terms[idx].node;
+                            if let Some(node) = self.app.state.workspace.get_node(node_id) {
+                                let (nx, ny) = (node.transform.x, node.transform.y);
+                                let next_id = crate::NodeId(
+                                    self.app.state.workspace.node_ids().iter().map(|n| n.0).max().unwrap_or(0) + 1,
+                                );
+                                let selector = crate::ProjectionSelector {
+                                    rows: None,
+                                    columns: None,
+                                    filter: Some(filter),
+                                    search: None,
+                                    max_lines: None,
+                                    follow: false,
+                                };
+                                let mut proj = crate::ProjectionSurface::from_terminal(term, selector, crate::ProjectionMode::Snapshot);
+                                proj.content = lines;
+                                let mut reading_node = crate::Node::new(next_id, nx, ny);
+                                reading_node.size = (600.0, 400.0);
+                                reading_node.set_surface(surface);
+                                reading_node.projection = Some(proj);
+                                reading_node.transform.scale = 1.0;
+                                self.app.state.workspace.add_node(reading_node);
+                                self.selected = Some(next_id);
+                                self.app.state.active_mode = crate::app::InteractionMode::Reading;
+                                self.notify("reading filtered (errors/warnings)");
+                            }
+                        }
+                    }
+                }
+            }
+            "search.find" => {
+                if let Some(surface) = self.focused_term {
+                    if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
+                        let term = &self.terms[idx].engine.term;
+                        let matches = term.search(&self.search_query, self.search_case_sensitive, self.search_regex);
+                        self.search_matches = matches;
+                        self.search_current_match = 0;
+                        if !self.search_matches.is_empty() {
+                            let (row, col) = self.search_matches[0];
+                            self.terms[idx].engine.term.cursor_row = row;
+                            self.terms[idx].engine.term.cursor_col = col;
+                            self.terms[idx].engine.term.reset_scroll();
+                            self.notify(format!("found {} matches (F3/Shift+F3 to navigate)", self.search_matches.len()));
+                        } else {
+                            self.notify(format!("no matches for '{}'", self.search_query));
+                        }
+                    }
+                } else {
+                    self.notify("no focused terminal to search");
+                }
+            }
+            "search.findNext" => {
+                if !self.search_matches.is_empty() {
+                    self.search_current_match = (self.search_current_match + 1) % self.search_matches.len();
+                    if let Some(surface) = self.focused_term {
+                        if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
+                            let (row, col) = self.search_matches[self.search_current_match];
+                            self.terms[idx].engine.term.cursor_row = row;
+                            self.terms[idx].engine.term.cursor_col = col;
+                            self.terms[idx].engine.term.reset_scroll();
+                            self.notify(format!("match {} of {}", self.search_current_match + 1, self.search_matches.len()));
+                        }
+                    }
+                }
+            }
+            "search.findPrev" => {
+                if !self.search_matches.is_empty() {
+                    if self.search_current_match == 0 {
+                        self.search_current_match = self.search_matches.len() - 1;
+                    } else {
+                        self.search_current_match -= 1;
+                    }
+                    if let Some(surface) = self.focused_term {
+                        if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
+                            let (row, col) = self.search_matches[self.search_current_match];
+                            self.terms[idx].engine.term.cursor_row = row;
+                            self.terms[idx].engine.term.cursor_col = col;
+                            self.terms[idx].engine.term.reset_scroll();
+                            self.notify(format!("match {} of {}", self.search_current_match + 1, self.search_matches.len()));
+                        }
+                    }
+                }
+            }
+            "search.toggleCase" => {
+                self.search_case_sensitive = !self.search_case_sensitive;
+                self.notify(format!("search case sensitive: {}", self.search_case_sensitive));
+            }
+            "search.toggleRegex" => {
+                self.search_regex = !self.search_regex;
+                self.notify(format!("search regex: {}", self.search_regex));
+            }
+            "search.projectFromResults" => {
+                if !self.search_matches.is_empty() {
+                    if let Some(surface) = self.focused_term {
+                        if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
+                            let term = &self.terms[idx].engine.term;
+                            let node_id = self.terms[idx].node;
+                            if let Some(node) = self.app.state.workspace.get_node(node_id) {
+                                let (nx, ny) = (node.transform.x, node.transform.y);
+                                let next_id = crate::NodeId(
+                                    self.app.state.workspace.node_ids().iter().map(|n| n.0).max().unwrap_or(0) + 1,
+                                );
+                                let selector = crate::ProjectionSelector {
+                                    rows: None,
+                                    columns: None,
+                                    filter: None,
+                                    search: Some(self.search_query.clone()),
+                                    max_lines: None,
+                                    follow: false,
+                                };
+                                let proj = crate::ProjectionSurface::from_terminal(term, selector, crate::ProjectionMode::Snapshot);
+                                let mut search_node = crate::Node::new(next_id, nx, ny);
+                                search_node.size = (600.0, 400.0);
+                                search_node.set_surface(surface);
+                                search_node.projection = Some(proj);
+                                search_node.transform.scale = 1.0;
+                                self.app.state.workspace.add_node(search_node);
+                                self.selected = Some(next_id);
+                                self.notify("created projection from search results");
+                            }
+                        }
+                    }
+                }
+            }
+            "hud.toggle" => {
+                self.hud_visible = !self.hud_visible;
+                self.hud_last_activity = std::time::Instant::now();
+                self.notify(format!("HUD {}", if self.hud_visible { "shown" } else { "hidden" }));
+            }
+            "edit.undo" => {
+                if let Some(action) = self.undo_stack.pop() {
+                    match &action {
+                        UndoAction::NodeMoved { node_id, old_pos, .. } => {
+                            if let Some(node) = self.app.state.workspace.get_node_mut(*node_id) {
+                                node.transform.x = old_pos.0;
+                                node.transform.y = old_pos.1;
+                            }
+                        }
+                        UndoAction::NodeResized { node_id, old_size, .. } => {
+                            if let Some(node) = self.app.state.workspace.get_node_mut(*node_id) {
+                                node.size = *old_size;
+                            }
+                        }
+                        UndoAction::NodeCreated { node_id } => {
+                            self.app.state.workspace.remove_node(*node_id);
+                            self.terms.retain(|t| t.node != *node_id);
+                        }
+                        UndoAction::NodeDeleted { node, font_scale } => {
+                            self.app.state.workspace.add_node(node.clone());
+                            if let Some(scale) = font_scale {
+                                self.font_scales.insert(node.id, *scale);
+                            }
+                        }
+                        UndoAction::NodeStyleChanged { node_id, old_style, .. } => {
+                            if let Some(node) = self.app.state.workspace.get_node_mut(*node_id) {
+                                node.style = old_style.clone();
+                            }
+                        }
+                    }
+                    self.redo_stack.push(action);
+                    self.notify("undone");
+                } else {
+                    self.notify("nothing to undo");
+                }
+            }
+            "edit.redo" => {
+                if let Some(action) = self.redo_stack.pop() {
+                    match &action {
+                        UndoAction::NodeMoved { node_id, new_pos, .. } => {
+                            if let Some(node) = self.app.state.workspace.get_node_mut(*node_id) {
+                                node.transform.x = new_pos.0;
+                                node.transform.y = new_pos.1;
+                            }
+                        }
+                        UndoAction::NodeResized { node_id, new_size, .. } => {
+                            if let Some(node) = self.app.state.workspace.get_node_mut(*node_id) {
+                                node.size = *new_size;
+                            }
+                        }
+                        UndoAction::NodeCreated { node_id: _ } => {
+                            // Node already exists, nothing to do
+                        }
+                        UndoAction::NodeDeleted { node, font_scale: _ } => {
+                            self.app.state.workspace.remove_node(node.id);
+                            self.terms.retain(|t| t.node != node.id);
+                            self.font_scales.remove(&node.id);
+                        }
+                        UndoAction::NodeStyleChanged { node_id, new_style, .. } => {
+                            if let Some(node) = self.app.state.workspace.get_node_mut(*node_id) {
+                                node.style = new_style.clone();
+                            }
+                        }
+                    }
+                    self.undo_stack.push(action);
+                    self.notify("redone");
+                } else {
+                    self.notify("nothing to redo");
+                }
+            }
+            "config.keybindings" => {
+                // Create a projection showing all keybindings
+                let mut content = vec![
+                    "Keybindings:".to_string(),
+                    "=============".to_string(),
+                    "".to_string(),
+                ];
+                for cmd in crate::command::builtin_commands() {
+                    if !cmd.key.is_empty() {
+                        content.push(format!("  {}  ->  {} ({})", cmd.key, cmd.title, cmd.id));
+                    }
+                }
+                content.push("".to_string());
+                content.push("Palette-only commands (no direct key):".to_string());
+                for cmd in crate::command::builtin_commands() {
+                    if cmd.key.is_empty() && cmd.id != "camera.bookmarkRestore" {
+                        content.push(format!("  (palette)  ->  {} ({})", cmd.title, cmd.id));
+                    }
+                }
+                if let Some(surface) = self.focused_term {
+                    if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
+                        let node_id = self.terms[idx].node;
+                        if let Some(node) = self.app.state.workspace.get_node(node_id) {
+                            let (nx, ny) = (node.transform.x, node.transform.y);
+                            let next_id = crate::NodeId(
+                                self.app.state.workspace.node_ids().iter().map(|n| n.0).max().unwrap_or(0) + 1,
+                            );
+                            let selector = crate::ProjectionSelector {
+                                rows: None,
+                                columns: None,
+                                filter: None,
+                                search: None,
+                                max_lines: None,
+                                follow: false,
+                            };
+                            let term = &self.terms[idx].engine.term;
+                            let mut proj = crate::ProjectionSurface::from_terminal(term, selector, crate::ProjectionMode::Snapshot);
+                            proj.content = content;
+                            let mut kb_node = crate::Node::new(next_id, nx, ny);
+                            kb_node.size = (500.0, 400.0);
+                            kb_node.set_surface(surface);
+                            kb_node.projection = Some(proj);
+                            kb_node.transform.scale = 1.0;
+                            self.app.state.workspace.add_node(kb_node);
+                            self.selected = Some(next_id);
+                            self.notify("opened keybinding reference");
+                        }
+                    }
+                }
+            }
+            "plugin.hotReload" => {
+                self.notify("plugin hot reload: not yet implemented (requires file watcher + plugin state persistence)");
             }
             _ => {}
         }
@@ -721,40 +1425,12 @@ impl CanvasState {
                 }
             })
             .unwrap_or("workspace");
-        let ids: &[&str] = match kind {
-            "terminal" => &[
-                "terminal.copy",
-                "view.pin",
-                "view.pinLive",
-                "style.fontBigger",
-                "style.fontSmaller",
-                "style.opacity",
-                "style.tint",
-                "layout.focus",
-                "terminal.close",
-            ],
-            "projection" => &["layout.focus", "terminal.close"],
-            _ => &[
-                "terminal.new",
-                "terminal.varied",
-                "layout.tileH",
-                "layout.tileV",
-                "layout.tileGrid",
-                "layout.cascade",
-                "layout.orbit",
-                "layout.focus",
-                "layout.save",
-                "layout.restore",
-                "view.reduceMotion",
-                "camera.fit",
-                "help.open",
-            ],
-        };
-        Self::palette_commands()
-            .into_iter()
-            .filter(|(id, _)| ids.contains(id))
-            .map(|(a, b)| (a.to_string(), b.to_string()))
-            .collect()
+        let node_id = node.map(|n| n.0.to_string()).unwrap_or_default();
+        match kind {
+            "terminal" => ContextMenuBuilder::for_terminal_node(&node_id),
+            "projection" => ContextMenuBuilder::for_projection_node(&node_id),
+            _ => ContextMenuBuilder::for_workspace(),
+        }
     }
 
     fn open_menu(&mut self, x: f64, y: f64, node: Option<crate::NodeId>) {
@@ -802,9 +1478,9 @@ impl CanvasState {
         })
     }
 
-    fn copy_selection_to_clipboard(&mut self, primary: bool) {
+    fn copy_selection_to_clipboard(&mut self, primary: bool) -> bool {
         let Some((surface, _, a, b)) = self.selection else {
-            return;
+            return false;
         };
         let text = self
             .terms
@@ -813,7 +1489,7 @@ impl CanvasState {
             .map(|t| t.engine.term.selected_text(a, b))
             .unwrap_or_default();
         if text.is_empty() {
-            return;
+            return false;
         }
         if primary {
             if let Ok(mut cb) = arboard::Clipboard::new() {
@@ -823,6 +1499,7 @@ impl CanvasState {
         } else if let Ok(mut cb) = arboard::Clipboard::new() {
             let _ = cb.set_text(text);
         }
+        true
     }
 
     /// Header height above the grid: label row + clear padding so the
@@ -954,6 +1631,13 @@ impl CanvasState {
             return false;
         };
         let sess = self.terms.remove(pos);
+        if let Some(node) = self.app.state.workspace.get_node(node_id).cloned() {
+            let font_scale = self.font_scales.remove(&node_id);
+            self.closed_stack.push(ClosedNode { node, font_scale });
+            if self.closed_stack.len() > 20 {
+                self.closed_stack.remove(0);
+            }
+        }
         self.app.state.workspace.remove_node(node_id);
         if self.selected == Some(node_id) {
             self.selected = None;
@@ -978,9 +1662,74 @@ impl CanvasState {
         if self.close_terminal_node(id) {
             return true;
         }
+        if let Some(node) = self.app.state.workspace.get_node(id).cloned() {
+            self.closed_stack.push(ClosedNode {
+                node,
+                font_scale: None,
+            });
+            if self.closed_stack.len() > 20 {
+                self.closed_stack.remove(0);
+            }
+        }
         self.app.state.workspace.remove_node(id);
         self.selected = None;
         true
+    }
+
+    /// Undo the last close: restore the node at its old position with a
+    /// fresh PTY for terminals (arrangement-only, matching layouts).
+    fn reopen_closed(&mut self) {
+        let Some(closed) = self.closed_stack.pop() else {
+            self.notify("nothing to reopen");
+            return;
+        };
+        let mut node = closed.node;
+        if self.app.state.workspace.get_node(node.id).is_some() {
+            node.id = crate::NodeId(self.next_node_id);
+            self.next_node_id += 1;
+        }
+        let node_id = node.id;
+        let is_terminal = node.surface_id().is_some() && node.projection.is_none();
+        if is_terminal {
+            let (cell_w, line_h) = self.grid_cell;
+            let header_h = self.header_h();
+            let (cols, rows) = crate::arrange::terminal_grid_size(
+                node.size.0.max(1.0),
+                node.size.1.max(1.0),
+                cell_w,
+                line_h,
+                header_h,
+                GRID_PAD_X,
+                GRID_PAD_BOTTOM,
+            );
+            let surface = SurfaceId(self.next_surface_id);
+            self.next_surface_id += 1;
+            match PtySession::spawn(cols as u16, rows as u16, None) {
+                Ok(pty) => {
+                    node.set_surface(surface);
+                    let engine = VtEngine::new(Terminal::new(surface, rows, cols));
+                    self.app.state.workspace.add_node(node);
+                    self.terms.push(TermSession {
+                        surface,
+                        node: node_id,
+                        engine,
+                        pty,
+                    });
+                    self.focused_term = Some(surface);
+                }
+                Err(e) => {
+                    self.notify(format!("reopen failed: {e}"));
+                    return;
+                }
+            }
+        } else {
+            self.app.state.workspace.add_node(node);
+        }
+        if let Some(scale) = closed.font_scale {
+            self.font_scales.insert(node_id, scale);
+        }
+        self.selected = Some(node_id);
+        self.notify("reopened closed node");
     }
 
     /// Save the whole scene (nodes, groups, camera, bookmarks) to the
@@ -989,8 +1738,8 @@ impl CanvasState {
     fn save_layout(&mut self) {
         let path = crate::config::Config::layout_path();
         match self.save_layout_to(&path) {
-            Ok(n) => eprintln!("layout saved ({} nodes) to {}", n, path.display()),
-            Err(e) => eprintln!("layout save failed: {e}"),
+            Ok(n) => self.notify(format!("layout saved ({} nodes)", n)),
+            Err(e) => self.notify(format!("layout save failed: {e}")),
         }
     }
 
@@ -1013,8 +1762,8 @@ impl CanvasState {
     fn restore_layout(&mut self) {
         let path = crate::config::Config::layout_path();
         match self.restore_layout_from(&path) {
-            Ok(n) => eprintln!("layout restored ({} sessions) from {}", n, path.display()),
-            Err(e) => eprintln!("layout restore failed: {e}"),
+            Ok(n) => self.notify(format!("layout restored ({} sessions)", n)),
+            Err(e) => self.notify(format!("layout restore failed: {e}")),
         }
     }
 
@@ -1225,14 +1974,16 @@ impl CanvasState {
         // The catalog is filtered only while open: every frame otherwise
         // paid filter + String clones for a hidden popup. Single
         // implementation via `palette_filtered` (fuzzy-ranked).
-        let palette_items: Vec<(String, String)> = if palette_open {
+        let palette_items: Vec<(String, String, String, String, String)> = if palette_open {
             self.palette_filtered()
                 .into_iter()
-                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .map(|(a, b, c, d, e)| (a.to_string(), b.to_string(), c.to_string(), d.to_string(), e.to_string()))
                 .collect()
         } else {
             Vec::new()
         };
+        let toast_msg = self.toast_text();
+        let help_open = self.help_open;
         // Auto-zoom cues re-run the grid scan only when the selected
         // terminal's content changed or the node/metrics moved; idle
         // frames reuse the cached world rects. The `dirty` flag clears
@@ -1532,12 +2283,32 @@ impl CanvasState {
                                     {
                                         continue;
                                     }
-                                    let color = (
-                                        fg.r as f32 / 255.0,
-                                        fg.g as f32 / 255.0,
-                                        fg.b as f32 / 255.0,
-                                        1.0,
-                                    );
+                                    // Highlight search matches
+                                    let is_search_match = self.focused_term == Some(self.terms[i].surface)
+                                        && !self.search_matches.is_empty()
+                                        && self.search_matches.iter().any(|(mr, mc)| *mr == r && *mc == c);
+                                    let is_current_match = is_search_match
+                                        && self.search_current_match < self.search_matches.len()
+                                        && self.search_matches[self.search_current_match] == (r, c);
+                                    let color = if is_current_match {
+                                        (1.0, 1.0, 0.0, 1.0) // Yellow for current match
+                                    } else if is_search_match {
+                                        (1.0, 0.8, 0.2, 1.0) // Orange for other matches
+                                    } else {
+                                        (
+                                            fg.r as f32 / 255.0,
+                                            fg.g as f32 / 255.0,
+                                            fg.b as f32 / 255.0,
+                                            1.0,
+                                        )
+                                    };
+                                    // Draw match highlight background
+                                    if is_search_match {
+                                        renderer.push_overlay_rect(
+                                            ox, oy, cell_w, line_h,
+                                            if is_current_match { (1.0, 0.8, 0.0, 0.3) } else { (1.0, 0.6, 0.0, 0.2) }
+                                        );
+                                    }
                                     text.queue_char_at(
                                         gl,
                                         atlas,
@@ -1680,7 +2451,7 @@ impl CanvasState {
                             let sel = palette_index.min(items.len().saturating_sub(1));
                             let vw = self.viewport_size.0 as f64;
                             let vh = self.viewport_size.1 as f64;
-                            let bw = 460.0f64;
+                            let bw = 520.0f64;
                             let bh = (items.len().min(8) as f64 * 22.0 + 52.0).max(52.0);
                             let bx = cam.x + (vw / cam.zoom - bw) / 2.0;
                             let by = cam.y + (vh / cam.zoom - bh) / 2.0;
@@ -1698,8 +2469,13 @@ impl CanvasState {
                                 &prompt,
                                 (0.9, 0.93, 1.0, 1.0),
                             );
-                            for (i, (_id, title)) in items.iter().take(8).enumerate() {
-                                let row = format!("{} {}", if i == sel { ">" } else { " " }, title);
+                            for (i, (_id, title, key, category, _desc)) in items.iter().take(8).enumerate()
+                            {
+                                let row = format!(
+                                    "{} {}",
+                                    if i == sel { ">" } else { " " },
+                                    format_palette_row(title, key, category)
+                                );
                                 let col = if i == sel {
                                     (0.55, 0.85, 1.0, 1.0)
                                 } else {
@@ -1717,31 +2493,293 @@ impl CanvasState {
                                     col,
                                 );
                             }
-                        }
-                        if let Some((mx, my, items, sel)) = &menu_snap {
-                            let mw = 300.0f64;
-                            let ih = 22.0f64;
-                            let mh = (items.len() as f64 * ih + 20.0).max(20.0);
-                            renderer.push_overlay_rect(*mx, *my, mw, mh, (0.07, 0.08, 0.11, 0.97));
-                            renderer.push_border(*mx, *my, mw, mh, 1.5, (0.35, 0.7, 1.0, 1.0));
-                            for (i, (_, title)) in items.iter().enumerate() {
-                                let row =
-                                    format!("{} {}", if i == *sel { ">" } else { " " }, title);
-                                let col = if i == *sel {
-                                    (0.55, 0.85, 1.0, 1.0)
-                                } else {
-                                    (0.75, 0.78, 0.85, 1.0)
-                                };
+                            // Preview panel: show description of selected command
+                            if let Some((_, _title, _key, _cat, desc)) = items.get(sel) {
+                                let pw = 360.0f64;
+                                let ph = 120.0f64;
+                                let px = bx + bw + 16.0;
+                                let py = by;
+                                renderer.push_overlay_rect(px, py, pw, ph, (0.07, 0.08, 0.11, 0.96));
+                                renderer.push_border(px, py, pw, ph, 1.0, (0.35, 0.7, 1.0, 0.8));
                                 text.queue_string(
                                     gl,
                                     atlas,
                                     fonts,
                                     fid,
-                                    (mx + 12.0, my + 10.0 + i as f64 * ih),
+                                    (px + 12.0, py + 10.0),
+                                    (cam.x, cam.y, cam.zoom),
+                                    11,
+                                    "Preview",
+                                    (0.55, 0.85, 1.0, 1.0),
+                                );
+                                // Word-wrap description
+                                let words: Vec<&str> = desc.split_whitespace().collect();
+                                let mut line = String::new();
+                                let mut line_y = py + 28.0;
+                                for word in words {
+                                    let test = if line.is_empty() {
+                                        word.to_string()
+                                    } else {
+                                        format!("{} {}", line, word)
+                                    };
+                                    // Rough width check: ~6.5px per char at size 12
+                                    if test.len() as f64 * 7.8 > pw - 24.0 {
+                                        text.queue_string(
+                                            gl,
+                                            atlas,
+                                            fonts,
+                                            fid,
+                                            (px + 12.0, line_y),
+                                            (cam.x, cam.y, cam.zoom),
+                                            12,
+                                            &line,
+                                            (0.75, 0.78, 0.85, 1.0),
+                                        );
+                                        line_y += 16.0;
+                                        line = word.to_string();
+                                    } else {
+                                        line = test;
+                                    }
+                                }
+                                if !line.is_empty() && line_y < py + ph - 16.0 {
+                                    text.queue_string(
+                                        gl,
+                                        atlas,
+                                        fonts,
+                                        fid,
+                                        (px + 12.0, line_y),
+                                        (cam.x, cam.y, cam.zoom),
+                                        12,
+                                        &line,
+                                        (0.75, 0.78, 0.85, 1.0),
+                                    );
+                                }
+                            }
+                        }
+                        // Search overlay
+                        if self.search_input_active {
+                            let vw = self.viewport_size.0 as f64;
+                            let vh = self.viewport_size.1 as f64;
+                            let bw = 520.0f64;
+                            let bh = 80.0f64;
+                            let bx = cam.x + (vw / cam.zoom - bw) / 2.0;
+                            let by = cam.y + (vh / cam.zoom - bh) / 2.0;
+                            renderer.push_overlay_rect(bx, by, bw, bh, (0.07, 0.08, 0.11, 0.96));
+                            renderer.push_border(bx, by, bw, bh, 1.5, (0.35, 0.7, 1.0, 1.0));
+                            let prompt = format!("Search: {}", self.search_query);
+                            text.queue_string(
+                                gl,
+                                atlas,
+                                fonts,
+                                fid,
+                                (bx + 12.0, by + 12.0),
+                                (cam.x, cam.y, cam.zoom),
+                                14,
+                                &prompt,
+                                (0.9, 0.93, 1.0, 1.0),
+                            );
+                            let hint = format!(
+                                "{}  {}  {}",
+                                if self.search_case_sensitive { "Aa" } else { "aa" },
+                                if self.search_regex { ".*" } else { "" },
+                                "Enter=search  Esc=cancel  F3=next  Shift+F3=prev"
+                            );
+                            text.queue_string(
+                                gl,
+                                atlas,
+                                fonts,
+                                fid,
+                                (bx + 12.0, by + 38.0),
+                                (cam.x, cam.y, cam.zoom),
+                                11,
+                                &hint,
+                                (0.6, 0.7, 0.8, 1.0),
+                            );
+                            // Show match count if any
+                            if !self.search_matches.is_empty() {
+                                let count_text = format!("{} matches", self.search_matches.len());
+                                text.queue_string(
+                                    gl,
+                                    atlas,
+                                    fonts,
+                                    fid,
+                                    (bx + bw - 12.0 - count_text.len() as f64 * 7.0, by + 12.0),
+                                    (cam.x, cam.y, cam.zoom),
+                                    11,
+                                    &count_text,
+                                    (0.55, 0.85, 0.65, 1.0),
+                                );
+                            }
+                        }
+                        if let Some((mx, my, items, sel)) = &menu_snap {
+                            let mw = 300.0f64;
+                            let ih = 24.0f64;
+                            let mh = (items.len() as f64 * ih + 20.0).max(20.0);
+                            renderer.push_overlay_rect(*mx, *my, mw, mh, (0.07, 0.08, 0.11, 0.97));
+                            renderer.push_border(*mx, *my, mw, mh, 1.5, (0.35, 0.7, 1.0, 1.0));
+                            for (i, item) in items.iter().enumerate() {
+                                let is_sel = i == *sel;
+                                let row_y = my + 10.0 + i as f64 * ih;
+                                let bg_col = if is_sel {
+                                    (0.35, 0.7, 1.0, 0.15)
+                                } else {
+                                    (0.0, 0.0, 0.0, 0.0)
+                                };
+                                if is_sel {
+                                    renderer.push_overlay_rect(*mx, row_y - 2.0, mw, ih, bg_col);
+                                }
+                                let col = if is_sel {
+                                    (0.55, 0.85, 1.0, 1.0)
+                                } else if item.enabled {
+                                    (0.75, 0.78, 0.85, 1.0)
+                                } else {
+                                    (0.5, 0.5, 0.55, 1.0)
+                                };
+                                let label = match &item.kind {
+                                    crate::input::ContextMenuItemKind::Separator => "──────────────".to_string(),
+                                    crate::input::ContextMenuItemKind::Info { label, value } => format!("{label}: {value}"),
+                                    crate::input::ContextMenuItemKind::Toggle { label_on, label_off, .. } => {
+                                        format!("{}  [{}]", item.label, if is_sel { label_on } else { label_off })
+                                    }
+                                    crate::input::ContextMenuItemKind::Slider { min, max, .. } => {
+                                        format!("{}  [{:.0}–{:.0}]", item.label, min, max)
+                                    }
+                                    crate::input::ContextMenuItemKind::Select { .. } => {
+                                        format!("{}  ▼", item.label)
+                                    }
+                                    crate::input::ContextMenuItemKind::ColorPicker { .. } => {
+                                        format!("{}  ■", item.label)
+                                    }
+                                    crate::input::ContextMenuItemKind::Submenu { .. } => {
+                                        format!("{}  ▸", item.label)
+                                    }
+                                    crate::input::ContextMenuItemKind::Command { .. } => {
+                                        item.label.clone()
+                                    }
+                                };
+                                let icon_prefix = item.icon.as_ref().map(|i| format!("{i} ")).unwrap_or_default();
+                                text.queue_string(
+                                    gl,
+                                    atlas,
+                                    fonts,
+                                    fid,
+                                    (mx + 12.0, row_y),
                                     (cam.x, cam.y, cam.zoom),
                                     12,
-                                    &row,
+                                    &format!("{icon_prefix}{label}"),
                                     col,
+                                );
+                            }
+                        }
+                        // Render drag alignment guides
+                        if !self.drag_guides.is_empty() {
+                            let zoom = cam.zoom.max(0.05);
+                            let line_thickness = 1.0 / zoom;
+                            for guide in &self.drag_guides {
+                                match guide.orientation {
+                                    crate::arrange::GuideOrientation::Horizontal => {
+                                        // Draw horizontal line across viewport
+                                        let vx0 = cam.x;
+                                        let vx1 = cam.x + self.viewport_size.0 as f64 / zoom;
+                                        renderer.push_overlay_rect(
+                                            vx0, guide.position, vx1 - vx0, line_thickness,
+                                            (0.35, 0.7, 1.0, 0.8)
+                                        );
+                                    }
+                                    crate::arrange::GuideOrientation::Vertical => {
+                                        // Draw vertical line across viewport
+                                        let vy0 = cam.y;
+                                        let vy1 = cam.y + self.viewport_size.1 as f64 / zoom;
+                                        renderer.push_overlay_rect(
+                                            guide.position, vy0, line_thickness, vy1 - vy0,
+                                            (0.35, 0.7, 1.0, 0.8)
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(msg) = &toast_msg {
+                            let vw = self.viewport_size.0 as f64;
+                            let vh = self.viewport_size.1 as f64;
+                            let tw = (msg.len() as f64 * 7.0 + 32.0).clamp(120.0, 620.0);
+                            let th = 30.0f64;
+                            let tx = cam.x + (vw / cam.zoom - tw) / 2.0;
+                            let ty = cam.y + vh / cam.zoom - th - 18.0;
+                            renderer.push_overlay_rect(tx, ty, tw, th, (0.07, 0.09, 0.13, 0.95));
+                            renderer.push_border(tx, ty, tw, th, 1.0, (0.35, 0.7, 1.0, 0.9));
+                            text.queue_string(
+                                gl,
+                                atlas,
+                                fonts,
+                                fid,
+                                (tx + 14.0, ty + 8.0),
+                                (cam.x, cam.y, cam.zoom),
+                                12,
+                                msg,
+                                (0.85, 0.9, 1.0, 1.0),
+                            );
+                        }
+                        // Auto-hiding HUD
+                        let hud_cfg = &self.app.state.config.hud;
+                        if hud_cfg.auto_hide {
+                            // Hide HUD after 3 seconds of inactivity
+                            if self.hud_last_activity.elapsed().as_secs_f32() > 3.0 {
+                                self.hud_visible = false;
+                            }
+                        } else {
+                            self.hud_visible = true;
+                        }
+                        if self.hud_visible {
+                            Self::render_hud(
+                                renderer,
+                                text,
+                                gl,
+                                atlas,
+                                fonts,
+                                fid,
+                                cam,
+                                self.viewport_size,
+                                &self.app.state.config.hud,
+                                &self.app.state.config.theme,
+                            );
+                        }
+                        if help_open {
+                            let vw = self.viewport_size.0 as f64;
+                            let vh = self.viewport_size.1 as f64;
+                            let rows = Self::help_rows();
+                            let hw = 560.0f64;
+                            let hh = (rows.len() as f64 * 20.0 + 64.0).min(vh / cam.zoom - 40.0);
+                            let hx = cam.x + (vw / cam.zoom - hw) / 2.0;
+                            let hy = cam.y + (vh / cam.zoom - hh) / 2.0;
+                            renderer.push_overlay_rect(hx, hy, hw, hh, (0.06, 0.07, 0.10, 0.97));
+                            renderer.push_border(hx, hy, hw, hh, 1.5, (0.35, 0.7, 1.0, 1.0));
+                            text.queue_string(
+                                gl,
+                                atlas,
+                                fonts,
+                                fid,
+                                (hx + 14.0, hy + 10.0),
+                                (cam.x, cam.y, cam.zoom),
+                                GRID_PX,
+                                "Keys  (?/F1 toggles, Esc closes)",
+                                (0.9, 0.93, 1.0, 1.0),
+                            );
+                            for (i, (key, title)) in rows.iter().enumerate() {
+                                let y = hy + 32.0 + i as f64 * 20.0;
+                                if y + 20.0 > hy + hh {
+                                    break;
+                                }
+                                let line = format!("{key:>12}  {title}");
+                                text.queue_string(
+                                    gl,
+                                    atlas,
+                                    fonts,
+                                    fid,
+                                    (hx + 14.0, y),
+                                    (cam.x, cam.y, cam.zoom),
+                                    12,
+                                    &line,
+                                    (0.75, 0.8, 0.88, 1.0),
                                 );
                             }
                         }
@@ -2082,12 +3120,17 @@ impl ApplicationHandler for CanvasState {
                                 let refs: Vec<&crate::Node> = others.iter().collect();
                                 let g = crate::arrange::snap_to_edges(t, &refs, 8.0);
                                 if g.distance.is_finite() {
+                                    self.drag_guides = g.guides;
                                     (g.x, g.y)
                                 } else {
+                                    self.drag_guides.clear();
                                     (nx, ny)
                                 }
                             }
-                            None => (nx, ny),
+                            None => {
+                                self.drag_guides.clear();
+                                (nx, ny)
+                            }
                         };
                         if let Some(n) = self.app.state.workspace.get_node_mut(node) {
                             n.transform.x = fx;
@@ -2122,10 +3165,14 @@ impl ApplicationHandler for CanvasState {
                 }
                 self.last_cursor = new_cursor;
             }
-            WindowEvent::MouseInput { state, button, .. } => match (state, button) {
-                (ElementState::Pressed, MouseButton::Right) => {
-                    self.rect_anchor = Some(self.last_cursor);
-                }
+            WindowEvent::MouseInput { state, button, .. } => {
+                // Update HUD activity on any mouse interaction
+                self.hud_last_activity = std::time::Instant::now();
+                self.hud_visible = true;
+                match (state, button) {
+                    (ElementState::Pressed, MouseButton::Right) => {
+                        self.rect_anchor = Some(self.last_cursor);
+                    }
                 (ElementState::Released, MouseButton::Right) => {
                     self.finish_right_click(event_loop);
                 }
@@ -2150,7 +3197,7 @@ impl ApplicationHandler for CanvasState {
                             .map(|m| (m.x, m.y, m.items.clone(), m.index))
                             .unwrap();
                         let mw = 300.0f64;
-                        let ih = 22.0f64;
+                        let ih = 24.0f64;
                         let mh = mitems.len() as f64 * ih + 20.0;
                         self.menu = None;
                         if mx >= mmx
@@ -2160,9 +3207,12 @@ impl ApplicationHandler for CanvasState {
                             && my >= mmy + 10.0
                         {
                             let idx = ((my - mmy - 10.0) / ih) as usize;
-                            if let Some((id, _)) = mitems.get(idx) {
-                                let owned = id.clone();
-                                self.run_palette_command(&owned);
+                            if let Some(item) = mitems.get(idx) {
+                                if item.enabled && !matches!(item.kind, crate::input::ContextMenuItemKind::Separator) {
+                                    if let crate::input::ContextMenuItemKind::Command { command, .. } = &item.kind {
+                                        self.run_palette_command(command);
+                                    }
+                                }
                             }
                             return;
                         }
@@ -2395,6 +3445,7 @@ impl ApplicationHandler for CanvasState {
                         }
                     }
                     self.drag = DragState::None;
+                    self.drag_guides.clear();
                 }
                 (ElementState::Released, MouseButton::Middle) => {
                     if self.middle_down.take().is_some() {
@@ -2414,15 +3465,19 @@ impl ApplicationHandler for CanvasState {
                         }
                     } else {
                         self.drag = DragState::None;
+                        self.drag_guides.clear();
                     }
                 }
                 _ => {}
-            },
+            }},
             WindowEvent::KeyboardInput {
                 event,
                 is_synthetic: _,
                 ..
             } => {
+                // Update HUD activity on any key press
+                self.hud_last_activity = std::time::Instant::now();
+                self.hud_visible = true;
                 // Space doubles as a pan modifier (space-drag pans even
                 // over a node). Track it on press AND release, before the
                 // release early-return: typing still works because the
@@ -2455,21 +3510,43 @@ impl ApplicationHandler for CanvasState {
                         }
                         Key::Named(NamedKey::Enter) => {
                             if let Some(m) = self.menu.take() {
-                                if let Some((id, _)) = m.items.get(m.index) {
-                                    let owned = id.clone();
-                                    self.run_palette_command(&owned);
+                                if let Some(item) = m.items.get(m.index) {
+                                    if item.enabled && !matches!(item.kind, crate::input::ContextMenuItemKind::Separator) {
+                                        if let crate::input::ContextMenuItemKind::Command { command, .. } = &item.kind {
+                                            self.run_palette_command(command);
+                                        }
+                                    }
                                 }
                             }
                         }
                         Key::Named(NamedKey::ArrowUp) => {
                             if let Some(m) = self.menu.as_mut() {
-                                m.index = m.index.saturating_sub(1);
+                                // Skip separators and disabled items
+                                let mut new_index = m.index.saturating_sub(1);
+                                while new_index > 0 {
+                                    if let Some(item) = m.items.get(new_index) {
+                                        if item.enabled && !matches!(item.kind, crate::input::ContextMenuItemKind::Separator) {
+                                            break;
+                                        }
+                                    }
+                                    new_index = new_index.saturating_sub(1);
+                                }
+                                m.index = new_index;
                             }
                         }
                         Key::Named(NamedKey::ArrowDown) => {
                             if let Some(m) = self.menu.as_mut() {
                                 let n = m.items.len().saturating_sub(1);
-                                m.index = (m.index + 1).min(n);
+                                let mut new_index = (m.index + 1).min(n);
+                                while new_index < n {
+                                    if let Some(item) = m.items.get(new_index) {
+                                        if item.enabled && !matches!(item.kind, crate::input::ContextMenuItemKind::Separator) {
+                                            break;
+                                        }
+                                    }
+                                    new_index = (new_index + 1).min(n);
+                                }
+                                m.index = new_index;
                             }
                         }
                         _ => {}
@@ -2485,7 +3562,7 @@ impl ApplicationHandler for CanvasState {
                         }
                         Key::Named(NamedKey::Enter) => {
                             let items = self.palette_filtered();
-                            if let Some((id, _)) = items.get(self.palette_index).copied() {
+                            if let Some((id, _, _, _, _)) = items.get(self.palette_index).copied() {
                                 self.palette_open = false;
                                 self.palette_query.clear();
                                 self.palette_index = 0;
@@ -2520,17 +3597,93 @@ impl ApplicationHandler for CanvasState {
                     }
                     return;
                 }
+                if self.search_input_active {
+                    use winit::keyboard::{Key, NamedKey};
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            self.search_input_active = false;
+                            self.search_query.clear();
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            self.search_input_active = false;
+                            // Perform the search
+                            if let Some(surface) = self.focused_term {
+                                if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
+                                    let term = &self.terms[idx].engine.term;
+                                    let matches = term.search(&self.search_query, self.search_case_sensitive, self.search_regex);
+                                    self.search_matches = matches;
+                                    self.search_current_match = 0;
+                                    if !self.search_matches.is_empty() {
+                                        let (row, col) = self.search_matches[0];
+                                        self.terms[idx].engine.term.cursor_row = row;
+                                        self.terms[idx].engine.term.cursor_col = col;
+                                        self.terms[idx].engine.term.reset_scroll();
+                                        self.notify(format!("found {} matches (F3/Shift+F3 to navigate)", self.search_matches.len()));
+                                    } else {
+                                        self.notify(format!("no matches for '{}'", self.search_query));
+                                    }
+                                }
+                            }
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            self.search_query.pop();
+                        }
+                        Key::Character(ch)
+                            if event.text.as_ref().is_some_and(|t| !t.is_empty()) =>
+                        {
+                            let t = event.text.clone().unwrap_or_default();
+                            for ch in t.chars() {
+                                if !ch.is_control() {
+                                    self.search_query.push(ch);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                if self.help_open {
+                    use winit::keyboard::{Key, NamedKey};
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape)
+                        | Key::Named(NamedKey::Enter)
+                        | Key::Named(NamedKey::F1) => {
+                            self.help_open = false;
+                        }
+                        Key::Character(c) if c == "?" => {
+                            self.help_open = false;
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                if event.logical_key == winit::keyboard::Key::Named(winit::keyboard::NamedKey::F1) {
+                    self.help_open = !self.help_open;
+                    return;
+                }
                 if st.control_key()
                     && st.shift_key()
                     && matches!(&event.logical_key, winit::keyboard::Key::Character(c) if c.eq_ignore_ascii_case("c"))
                 {
-                    self.copy_selection_to_clipboard(false);
+                    if self.copy_selection_to_clipboard(false) {
+                        self.notify("selection copied");
+                    }
                     return;
                 }
                 use winit::keyboard::{Key, NamedKey};
                 // Esc always drops back to workspace control.
                 if self.term_focus && event.logical_key == Key::Named(NamedKey::Escape) {
                     self.term_focus = false;
+                    return;
+                }
+                // Ctrl+F opens search input (works in both workspace and terminal mode)
+                if st.control_key()
+                    && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("f"))
+                {
+                    self.search_input_active = true;
+                    self.search_query.clear();
+                    self.search_matches.clear();
+                    self.search_current_match = 0;
                     return;
                 }
                 // Workspace shortcuts (workspace mode, not terminal focus).
@@ -2571,7 +3724,7 @@ impl ApplicationHandler for CanvasState {
                                 .camera_mut()
                                 .restore_bookmark(&name)
                             {
-                                eprintln!("bookmark {name} restored");
+                                self.notify(format!("bookmark {name} restored"));
                             }
                         }
                         Key::Character(c) if c == "d" => {
@@ -2585,6 +3738,27 @@ impl ApplicationHandler for CanvasState {
                         }
                         Key::Character(c) if c == "x" => {
                             self.run_palette_command("terminal.close");
+                        }
+                        Key::Character(c) if c == "u" => {
+                            self.run_palette_command("terminal.reopen");
+                        }
+                        Key::Named(NamedKey::Tab) => {
+                            self.cycle_selection(st.shift_key());
+                        }
+                        Key::Named(NamedKey::F1) => {
+                            self.help_open = !self.help_open;
+                        }
+                        Key::Named(NamedKey::ArrowLeft) => {
+                            self.nudge_selected(-10.0, 0.0);
+                        }
+                        Key::Named(NamedKey::ArrowRight) => {
+                            self.nudge_selected(10.0, 0.0);
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            self.nudge_selected(0.0, -10.0);
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            self.nudge_selected(0.0, 10.0);
                         }
                         Key::Character(c) if c == "[" => {
                             self.step_selected_grid(-1, 0);
@@ -3019,7 +4193,7 @@ mod tests {
         use std::collections::HashSet;
         let palette: Vec<_> = CanvasState::palette_commands();
         let catalog = crate::command::builtin_commands();
-        let palette_ids: HashSet<_> = palette.iter().map(|(id, _)| *id).collect();
+        let palette_ids: HashSet<_> = palette.iter().map(|(id, _, _, _, _)| *id).collect();
         // Palette is the catalog minus the key-only digit-restore helper.
         assert_eq!(palette.len(), catalog.len() - 1);
         for spec in &catalog {
@@ -3029,14 +4203,85 @@ mod tests {
                 assert!(palette_ids.contains(spec.id), "palette missing {}", spec.id);
             }
         }
+        // Every row carries its key hint + category for the rich palette UI.
+        for (id, _title, key, category, _desc) in &palette {
+            let spec = catalog.iter().find(|c| c.id == *id).unwrap();
+            assert_eq!(*key, spec.key, "key drift for {id}");
+            assert_eq!(*category, spec.category, "category drift for {id}");
+        }
         // Every single-char key binding resolves to a palette command.
         for key in [
-            "n", "N", "x", "h", "v", "t", "C", "O", "F", "d", "a", "f", "0", "b", "p", "P", ".",
-            ",", "o", "c", "?", "S",
+            "n", "N", "x", "u", "h", "v", "t", "C", "O", "F", "d", "a", "f", "0", "b", "p", "P",
+            ".", ",", "o", "c", "?", "S",
         ] {
             let id = crate::command::command_for_key(key).unwrap();
             assert!(palette_ids.contains(id), "key {key} -> {id} not in palette");
         }
+    }
+
+    #[test]
+    fn test_cycle_selection_wraps_both_directions() {
+        let ids = vec![crate::NodeId(1), crate::NodeId(2), crate::NodeId(3)];
+        assert_eq!(cycle_selection(&[], None, false), None);
+        assert_eq!(cycle_selection(&ids, None, false), Some(crate::NodeId(1)));
+        assert_eq!(cycle_selection(&ids, None, true), Some(crate::NodeId(3)));
+        assert_eq!(
+            cycle_selection(&ids, Some(crate::NodeId(3)), false),
+            Some(crate::NodeId(1))
+        );
+        assert_eq!(
+            cycle_selection(&ids, Some(crate::NodeId(1)), true),
+            Some(crate::NodeId(3))
+        );
+        assert_eq!(
+            cycle_selection(&ids, Some(crate::NodeId(2)), false),
+            Some(crate::NodeId(3))
+        );
+    }
+
+    #[test]
+    fn test_format_palette_row_shows_key_and_category() {
+        assert_eq!(
+            format_palette_row("New Terminal", "n", "Terminal"),
+            "New Terminal  [n] · Terminal"
+        );
+        assert_eq!(
+            format_palette_row("Restore Layout", "", "Arrange"),
+            "Restore Layout  · Arrange"
+        );
+    }
+
+    #[test]
+    fn test_help_rows_cover_catalog() {
+        let rows = CanvasState::help_rows();
+        let catalog = crate::command::builtin_commands();
+        assert!(rows.len() >= catalog.len());
+        for spec in &catalog {
+            assert!(
+                rows.iter().any(|(_, t)| t.contains(spec.title)),
+                "help missing {}",
+                spec.id
+            );
+        }
+    }
+
+    #[test]
+    fn test_close_then_reopen_restores_node() {
+        let mut st = CanvasState::new(App::new(crate::config::Config::new()));
+        st.spawn_terminal_node(80, 24, (0.0, 0.0)).unwrap();
+        let node = st.terms[0].node;
+        st.selected = Some(node);
+        assert!(st.close_selected());
+        assert_eq!(st.terms.len(), 0);
+        assert!(st.app.state.workspace.get_node(node).is_none());
+        st.reopen_closed();
+        assert_eq!(st.terms.len(), 1);
+        assert_eq!(st.selected, Some(node));
+        assert!(st.app.state.workspace.get_node(node).is_some());
+        // Empty stack is a no-op with feedback, not a panic.
+        st.closed_stack.clear();
+        st.reopen_closed();
+        assert!(st.toast_text().is_some());
     }
 
     #[test]

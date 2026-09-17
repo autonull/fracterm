@@ -82,6 +82,8 @@ pub enum Edge {
     Right,
     Top,
     Bottom,
+    CenterX,
+    CenterY,
 }
 
 /// Align all nodes to the extreme edge of the current bounding box.
@@ -117,6 +119,8 @@ pub fn align(nodes: &[&Node], edge: Edge) -> Vec<(NodeId, f64, f64)> {
                 Edge::Right => (max_right - w, n.transform.y),
                 Edge::Top => (n.transform.x, min_top),
                 Edge::Bottom => (n.transform.x, max_bottom - h),
+                Edge::CenterX => (min_left + (max_right - min_left - w) / 2.0, n.transform.y),
+                Edge::CenterY => (n.transform.x, min_top + (max_bottom - min_top - h) / 2.0),
             };
             (n.id, x, y)
         })
@@ -356,47 +360,103 @@ pub struct SnapGuide {
     pub distance: f64,
 }
 
+/// Represents a single alignment guide line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GuideLine {
+    /// Orientation of the guide line.
+    pub orientation: GuideOrientation,
+    /// Position in world coordinates.
+    pub position: f64,
+    /// The node edge that triggered this guide.
+    pub node_id: NodeId,
+    /// Which edge of the node aligned.
+    pub edge: Edge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuideOrientation {
+    Horizontal,
+    Vertical,
+}
+
+/// Result of snap-to-edges calculation with guide lines for rendering.
+#[derive(Debug, Clone)]
+pub struct SnapResult {
+    /// Snapped position (x, y).
+    pub x: f64,
+    pub y: f64,
+    /// Distance from original position.
+    pub distance: f64,
+    /// All guide lines that were activated during snapping.
+    pub guides: Vec<GuideLine>,
+}
+
 /// Snap a moving node's rect to other nodes' edges within `threshold`.
-pub fn snap_to_edges(moving: &Node, others: &[&Node], threshold: f64) -> SnapGuide {
+/// Returns snapped position and guide lines for visual feedback.
+pub fn snap_to_edges(moving: &Node, others: &[&Node], threshold: f64) -> SnapResult {
     let (mw, mh) = (moving.size.0, moving.size.1);
     let (mx, my) = (moving.transform.x, moving.transform.y);
-    let mut best: Option<SnapGuide> = None;
+    let moving_center_x = mx + mw / 2.0;
+    let moving_center_y = my + mh / 2.0;
+
+    let mut best: Option<SnapResult> = None;
+
     for other in others {
         if other.id == moving.id {
             continue;
         }
         let (ox, oy) = (other.transform.x, other.transform.y);
         let (ow, oh) = other.size;
-        let candidates = [
-            (mx, oy),      // top edge to other's top
-            (mx, oy + oh), // top edge to other's bottom
-            (mx, oy - mh), // bottom edge to other's top
-            (ox, my),      // left edge to other's left
-            (ox + ow, my), // left edge to other's right
-            (ox - mw, my), // right edge to other's left
+        let other_center_x = ox + ow / 2.0;
+        let other_center_y = oy + oh / 2.0;
+
+        let mut guides = Vec::new();
+        let mut snapped_x = mx;
+        let mut snapped_y = my;
+        let mut min_distance = f64::INFINITY;
+
+        // Check edge alignments
+        let alignments = [
+            // (target_x, target_y, distance, guide_line)
+            (mx, oy, (my - oy).abs(), GuideLine { orientation: GuideOrientation::Horizontal, position: oy, node_id: other.id, edge: Edge::Top }),
+            (mx, oy + oh, (my - (oy + oh)).abs(), GuideLine { orientation: GuideOrientation::Horizontal, position: oy + oh, node_id: other.id, edge: Edge::Bottom }),
+            (mx, oy - mh, (my - (oy - mh)).abs(), GuideLine { orientation: GuideOrientation::Horizontal, position: oy - mh, node_id: other.id, edge: Edge::Top }),
+            (ox, my, (mx - ox).abs(), GuideLine { orientation: GuideOrientation::Vertical, position: ox, node_id: other.id, edge: Edge::Left }),
+            (ox + ow, my, (mx - (ox + ow)).abs(), GuideLine { orientation: GuideOrientation::Vertical, position: ox + ow, node_id: other.id, edge: Edge::Right }),
+            (ox - mw, my, (mx - (ox - mw)).abs(), GuideLine { orientation: GuideOrientation::Vertical, position: ox - mw, node_id: other.id, edge: Edge::Left }),
+            // Center alignments
+            (other_center_x - mw / 2.0, my, (moving_center_x - other_center_x).abs(), GuideLine { orientation: GuideOrientation::Vertical, position: other_center_x, node_id: other.id, edge: Edge::CenterX }),
+            (mx, other_center_y - mh / 2.0, (moving_center_y - other_center_y).abs(), GuideLine { orientation: GuideOrientation::Horizontal, position: other_center_y, node_id: other.id, edge: Edge::CenterY }),
         ];
-        for (cx, cy) in candidates {
-            let dx = (cx - mx).abs();
-            let dy = (cy - my).abs();
-            let d = dx.max(dy);
-            if d > threshold {
-                continue;
+
+        for (cx, cy, d, guide) in alignments {
+            if d <= threshold {
+                guides.push(guide);
+                if d < min_distance {
+                    min_distance = d;
+                    snapped_x = cx;
+                    snapped_y = cy;
+                }
             }
-            if best.as_ref().map(|b| d < b.distance).unwrap_or(true) {
-                best = Some(SnapGuide {
-                    node_id: moving.id,
-                    x: cx,
-                    y: cy,
-                    distance: d,
+        }
+
+        if !guides.is_empty() {
+            if best.as_ref().map(|b| min_distance < b.distance).unwrap_or(true) {
+                best = Some(SnapResult {
+                    x: snapped_x,
+                    y: snapped_y,
+                    distance: min_distance,
+                    guides,
                 });
             }
         }
     }
-    best.unwrap_or(SnapGuide {
-        node_id: moving.id,
+
+    best.unwrap_or(SnapResult {
         x: mx,
         y: my,
         distance: f64::INFINITY,
+        guides: Vec::new(),
     })
 }
 
@@ -562,10 +622,12 @@ mod tests {
         let g = snap_to_edges(&moving, &refs(&mut others), 10.0);
         assert_eq!(g.x, 100.0); // left snapped to other's left
         assert_eq!(g.y, 500.0); // y untouched
+        assert!(!g.guides.is_empty());
 
         moving.transform.x = 310.0;
         let g = snap_to_edges(&moving, &refs(&mut others), 15.0);
         assert_eq!(g.x, 300.0); // to other's right edge (100+200)
+        assert!(!g.guides.is_empty());
     }
 
     #[test]

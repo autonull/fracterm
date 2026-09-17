@@ -22,7 +22,28 @@ fn load_config() -> Config {
 }
 
 fn main() {
-    let args = CliArgs::default();
+    let args = CliArgs::parse();
+    
+    if args.show_help {
+        CliArgs::print_help();
+        return;
+    }
+    
+    if args.show_version {
+        CliArgs::print_version();
+        return;
+    }
+    
+    if args.print_config {
+        args.print_effective_config();
+        return;
+    }
+    
+    if args.doctor {
+        args.run_doctor();
+        return;
+    }
+
     let config = load_config();
     let app = App::new(config);
 
@@ -32,5 +53,4 @@ fn main() {
         let mut app = App::new(load_config());
         app.run();
     }
-    let _ = args;
 }

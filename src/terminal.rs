@@ -1,5 +1,6 @@
 //! Terminal engine - PTY-based terminal with grid, parser, and input handling.
 
+use regex::Regex;
 use std::collections::VecDeque;
 
 use crate::surface::Color;
@@ -133,6 +134,79 @@ impl TerminalGrid {
         self.rows = new_rows;
         self.cols = new_cols;
     }
+
+    /// Search for text in the grid and scrollback.
+    /// Returns a list of (row, col) matches where row is the absolute row index
+    /// (0 = oldest scrollback line, scrollback.len() + rows - 1 = bottom of visible grid).
+    pub fn search(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+        use_regex: bool,
+    ) -> Vec<(u32, u32)> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+
+        let regex = if use_regex {
+            let pattern = if case_sensitive {
+                query.to_string()
+            } else {
+                format!("(?i){}", query)
+            };
+            regex::Regex::new(&pattern).ok()
+        } else {
+            None
+        };
+
+        let mut matches = Vec::new();
+        let sb = self.scrollback.len();
+        let _total_rows = sb + self.rows as usize;
+
+        // Search scrollback (rows 0..sb-1)
+        for (sb_idx, line) in self.scrollback.iter().enumerate() {
+            let line_text: String = line.iter().map(|c| c.character).collect();
+            let mut search_start = 0;
+            while search_start < line_text.len() {
+                let found = if let Some(re) = &regex {
+                    re.find(&line_text[search_start..]).map(|m| (m.start() + search_start, m.end() + search_start))
+                } else {
+                    let q = if case_sensitive { query } else { &query.to_lowercase() };
+                    let haystack = if case_sensitive { &line_text[search_start..] } else { &line_text[search_start..].to_lowercase() };
+                    haystack.find(q).map(|pos| (pos + search_start, pos + search_start + query.len()))
+                };
+                if let Some((start, end)) = found {
+                    matches.push((sb_idx as u32, start as u32));
+                    search_start = end;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Search visible grid (rows sb..sb+rows-1)
+        for r in 0..self.rows as usize {
+            let line: String = self.cells[r].iter().map(|c| c.character).collect();
+            let mut search_start = 0;
+            while search_start < line.len() {
+                let found = if let Some(re) = &regex {
+                    re.find(&line[search_start..]).map(|m| (m.start() + search_start, m.end() + search_start))
+                } else {
+                    let q = if case_sensitive { query } else { &query.to_lowercase() };
+                    let haystack = if case_sensitive { &line[search_start..] } else { &line[search_start..].to_lowercase() };
+                    haystack.find(q).map(|pos| (pos + search_start, pos + search_start + query.len()))
+                };
+                if let Some((start, end)) = found {
+                    matches.push(((sb + r) as u32, start as u32));
+                    search_start = end;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        matches
+    }
 }
 
 /// Terminal state
@@ -217,6 +291,10 @@ impl Terminal {
 
     pub fn scrollback_content(&self) -> &VecDeque<Vec<TerminalCell>> {
         &self.grid.scrollback
+    }
+
+    pub fn search(&self, query: &str, case_sensitive: bool, use_regex: bool) -> Vec<(u32, u32)> {
+        self.grid.search(query, case_sensitive, use_regex)
     }
 
     pub fn write(&mut self, text: &str) {

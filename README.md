@@ -176,6 +176,9 @@ labels.
 | `0` | Zoom to workspace fit |
 | `f` | Smooth fly-to dashboard fit |
 | `d` | Dashboard mode: tile 2-up from the margin + fit |
+| `Tab` / `Shift+Tab` | Cycle node selection in z-order (follows with keyboard focus on terminals) |
+| Arrow keys | Nudge the selected node by 10px |
+| `?` or `F1` | Toggle the on-screen key cheatsheet (generated from the command registry; `Esc` closes) |
 
 ## Terminal Controls
 
@@ -204,9 +207,10 @@ labels.
 | `,` / `.` | Shrink / grow selected terminal font (0.7x-2.5x, per-node) |
 | `o` | Cycle selected node opacity (1.0 / 0.92 / 0.8 / 0.67) |
 | `c` | Cycle selected node tint (ink / moss / indigo / maroon) |
-| Red square top-right | Close button (click) |
+| Red square top-right | Close button (click) — `u` reopens the last closed node (undo, depth 20) |
 | Blue square top-left | Menu button: opens the context menu for the selected node |
 | Right edge bar | Scrollbar showing scrollback depth + live offset |
+| `x` / `u` | Close selected node / reopen last closed node |
 
 ## Arrange Commands
 
@@ -244,10 +248,15 @@ an independent subrange-view node.
 
 - Minimal command palette is **live**: `Ctrl+K` anywhere or `:` in workspace
   mode opens it; fuzzy-filter, `Up`/`Down` + `Enter` runs, `Esc` closes.
-- Palette commands today: new/varied terminal, tile H/V/grid, cascade, orbit,
-  focus ring, fit, workspace fit, pin snapshot / live view, bookmark save, dashboard,
+- Palette commands today: new/varied terminal, reopen closed, tile H/V/grid, cascade, orbit,
+  focus ring, select-next, fit, workspace fit, pin snapshot / live view, bookmark save, dashboard,
   close selected, copy selection, help.
-- `?` in workspace mode prints the key cheatsheet to stderr.
+- Every palette row shows its key hint and category (`Title [key] · Category`),
+  sourced from the same builtin catalog as keys, menus, and help — they cannot drift.
+- `?` or `F1` in workspace mode toggles the on-screen key cheatsheet (same source);
+  `Esc` closes it. (The old stderr key dump is gone.)
+- Action feedback is a transient on-screen toast (2.5 s) plus the stderr log:
+  pins, bookmarks, layout save/restore, copy, close/reopen, spawn, reduce-motion.
 - Auto-hiding HUD with configurable edge/hotkey remains spec; every palette
   row already maps 1:1 to a command id so HUD/palette/tests/CLI share them.
 

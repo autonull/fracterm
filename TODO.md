@@ -7,7 +7,7 @@ regression guardrails this plan must respect are in Development Guardrails
 below. Prefer finishing a phase before starting the next. Unfinished items
 carry forward in-place, so this file is always the single resume point.
 
-**Current state (2026-09-17): all gates green** — `cargo build`, 172 tests
+**Current state (2026-09-17): all gates green** — `cargo build`, 176 tests
 passing, `cargo clippy --all-targets` clean,
 `cargo fmt --check` clean. Fish startup fixed (~1s prompt via terminal-query
 replies); caret/title/modes live-verified on :0. Binary runs on-display (X :0, 1280x720 Luscombe);
@@ -328,6 +328,14 @@ target AND `animating=false`; ANIMATED moves set target AND
       `register_builtin_commands` exposes them to plugins/tests/CLI via
       `CommandRegistry`; `command_for_key` covers the single-char dispatch.
       Full `CommandContext`-executing handlers (mutable workspace) pending.
+- [x] Usability pass (session 2026-09-17): on-screen help overlay (`?`/`F1`
+      toggles, `Esc` closes, rows generated from the catalog), palette rows
+      show key hint + category (`format_palette_row`), transient toast status
+      line (`notify`: pins, bookmarks, layout save/restore, copy, close/
+      reopen, spawn, reduce-motion), undo-close (`terminal.reopen` on `u`,
+      20-deep stack, terminals re-spawn fresh PTYs), keyboard nav (`Tab`/
+      `Shift+Tab` cycles z-order via `layout.selectNext`, arrows nudge the
+      selection 10px). Pure helpers + close/reopen round-trip unit-tested.
 - [x] Command palette fuzzy scoring (`fuzzy_score`: subsequence +
   word-boundary + consecutive-run bonuses, shared by the frame and
   keyboard paths) — preview still pending.
@@ -378,10 +386,10 @@ Self-teaching; help generated from live registries, not hand-written.
 - [ ] `fracterm --help`, `fracterm help <topic>`, man page; `--version`,
       `--print-config`.
 - [ ] `fracterm doctor` with actionable fix suggestions.
-- [ ] In-app help overlay (`F1`/`?`): contextual by mode/target.
+- [x] In-app help overlay (`F1`/`?`): contextual by mode/target.
 - [ ] First-run onboarding tour + demo layout.
-- [ ] Cheatsheet auto-generated from keybinding registry.
-- [ ] Palette rows show description + keybinding + "open docs".
+- [x] Cheatsheet auto-generated from keybinding registry.
+- [x] Palette rows show description + keybinding + "open docs".
 - [ ] Contextual "what can I do here?" per node/selection.
 - [ ] Tooltips exposing command id + bound keys.
 - [ ] Error messages link to troubleshooting.

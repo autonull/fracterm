@@ -190,7 +190,7 @@ impl SceneGraph {
 }
 
 /// The workspace is the infinite zoomable canvas containing nodes and a camera lens.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Workspace {
     pub camera: CameraLens,
     pub scene: SceneGraph,
@@ -216,6 +216,14 @@ impl Workspace {
 
     pub fn camera(&self) -> &Camera {
         &self.camera
+    }
+
+    pub fn camera_lens(&self) -> &CameraLens {
+        &self.camera
+    }
+
+    pub fn camera_lens_mut(&mut self) -> &mut CameraLens {
+        &mut self.camera
     }
 
     pub fn camera_mut(&mut self) -> &mut Camera {

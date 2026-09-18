@@ -1,6 +1,5 @@
 //! Terminal engine - PTY-based terminal with grid, parser, and input handling.
 
-use regex::Regex;
 use std::collections::VecDeque;
 
 use crate::surface::Color;
@@ -138,12 +137,7 @@ impl TerminalGrid {
     /// Search for text in the grid and scrollback.
     /// Returns a list of (row, col) matches where row is the absolute row index
     /// (0 = oldest scrollback line, scrollback.len() + rows - 1 = bottom of visible grid).
-    pub fn search(
-        &self,
-        query: &str,
-        case_sensitive: bool,
-        use_regex: bool,
-    ) -> Vec<(u32, u32)> {
+    pub fn search(&self, query: &str, case_sensitive: bool, use_regex: bool) -> Vec<(u32, u32)> {
         if query.is_empty() {
             return Vec::new();
         }
@@ -169,11 +163,22 @@ impl TerminalGrid {
             let mut search_start = 0;
             while search_start < line_text.len() {
                 let found = if let Some(re) = &regex {
-                    re.find(&line_text[search_start..]).map(|m| (m.start() + search_start, m.end() + search_start))
+                    re.find(&line_text[search_start..])
+                        .map(|m| (m.start() + search_start, m.end() + search_start))
                 } else {
-                    let q = if case_sensitive { query } else { &query.to_lowercase() };
-                    let haystack = if case_sensitive { &line_text[search_start..] } else { &line_text[search_start..].to_lowercase() };
-                    haystack.find(q).map(|pos| (pos + search_start, pos + search_start + query.len()))
+                    let q = if case_sensitive {
+                        query
+                    } else {
+                        &query.to_lowercase()
+                    };
+                    let haystack = if case_sensitive {
+                        &line_text[search_start..]
+                    } else {
+                        &line_text[search_start..].to_lowercase()
+                    };
+                    haystack
+                        .find(q)
+                        .map(|pos| (pos + search_start, pos + search_start + query.len()))
                 };
                 if let Some((start, end)) = found {
                     matches.push((sb_idx as u32, start as u32));
@@ -190,11 +195,22 @@ impl TerminalGrid {
             let mut search_start = 0;
             while search_start < line.len() {
                 let found = if let Some(re) = &regex {
-                    re.find(&line[search_start..]).map(|m| (m.start() + search_start, m.end() + search_start))
+                    re.find(&line[search_start..])
+                        .map(|m| (m.start() + search_start, m.end() + search_start))
                 } else {
-                    let q = if case_sensitive { query } else { &query.to_lowercase() };
-                    let haystack = if case_sensitive { &line[search_start..] } else { &line[search_start..].to_lowercase() };
-                    haystack.find(q).map(|pos| (pos + search_start, pos + search_start + query.len()))
+                    let q = if case_sensitive {
+                        query
+                    } else {
+                        &query.to_lowercase()
+                    };
+                    let haystack = if case_sensitive {
+                        &line[search_start..]
+                    } else {
+                        &line[search_start..].to_lowercase()
+                    };
+                    haystack
+                        .find(q)
+                        .map(|pos| (pos + search_start, pos + search_start + query.len()))
                 };
                 if let Some((start, end)) = found {
                     matches.push(((sb + r) as u32, start as u32));

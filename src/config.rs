@@ -316,6 +316,18 @@ impl Config {
         }
     }
 
+    /// Create a new profile from current config and add it to profiles
+    pub fn create_profile(&mut self, name: &str) {
+        let profile = ProfileConfig {
+            font: Some(self.font.clone()),
+            theme: Some(self.theme.clone()),
+            terminal: Some(self.terminal.clone()),
+            accessibility: Some(self.accessibility.clone()),
+            effects: Some(self.effects.clone()),
+        };
+        self.profiles.insert(name.to_string(), profile);
+    }
+
     /// Get the config directory path
     pub fn config_dir() -> PathBuf {
         if let Ok(config_home) = std::env::var("XDG_CONFIG_HOME") {

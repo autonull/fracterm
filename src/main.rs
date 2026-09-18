@@ -23,22 +23,22 @@ fn load_config() -> Config {
 
 fn main() {
     let args = CliArgs::parse();
-    
+
     if args.show_help {
         CliArgs::print_help();
         return;
     }
-    
+
     if args.show_version {
         CliArgs::print_version();
         return;
     }
-    
+
     if args.print_config {
         args.print_effective_config();
         return;
     }
-    
+
     if args.doctor {
         args.run_doctor();
         return;

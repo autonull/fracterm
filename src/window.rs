@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 
-use crate::input::{ContextMenuItem, ContextMenuBuilder};
+use crate::input::{ContextMenuBuilder, ContextMenuItem};
 
 type CellPos = (u32, u32);
 type TextSelection = (SurfaceId, crate::NodeId, CellPos, CellPos);
@@ -114,8 +114,8 @@ struct CanvasState {
     last_frame: std::time::Instant,
     capabilities: Option<Capabilities>,
     window: Option<Window>,
-    /// Node selected as a whole (accent border + resize handle).
-    selected: Option<crate::NodeId>,
+    /// Nodes selected as a whole (accent border + resize handle). First is primary.
+    selected: Vec<crate::NodeId>,
     /// Current drag interaction (pan / move / resize).
     drag: DragState,
     last_cursor: (f64, f64),
@@ -148,9 +148,10 @@ struct CanvasState {
     toast: Option<(String, std::time::Instant)>,
     /// On-screen help overlay (toggled by `?` / F1, closed by Esc).
     help_open: bool,
-    /// Auto-hiding HUD state.
-    hud_visible: bool,
-    hud_last_activity: std::time::Instant,
+    /// Context popup menu (right-click or hotkey).
+    popup_open: bool,
+    popup_position: (f64, f64),
+    popup_items: Vec<PopupItem>,
     /// Search state
     search_query: String,
     search_case_sensitive: bool,
@@ -160,6 +161,8 @@ struct CanvasState {
     search_input_active: bool,
     /// Active drag guides for visual feedback during move/resize
     drag_guides: Vec<crate::arrange::GuideLine>,
+    /// Last valid snap result during move drag (for snap-on-release).
+    last_snap: Option<crate::arrange::SnapResult>,
     /// Recently closed nodes for undo (`u` reopens the last one, cap 20).
     closed_stack: Vec<ClosedNode>,
     /// Undo stack for workspace mutations
@@ -178,11 +181,28 @@ struct ForwardMouse {
 /// Undoable workspace action
 #[derive(Debug, Clone)]
 enum UndoAction {
-    NodeMoved { node_id: crate::NodeId, old_pos: (f64, f64), new_pos: (f64, f64) },
-    NodeResized { node_id: crate::NodeId, old_size: (f64, f64), new_size: (f64, f64) },
-    NodeCreated { node_id: crate::NodeId },
-    NodeDeleted { node: crate::Node, font_scale: Option<f32> },
-    NodeStyleChanged { node_id: crate::NodeId, old_style: crate::Theme, new_style: crate::Theme },
+    NodeMoved {
+        node_id: crate::NodeId,
+        old_pos: (f64, f64),
+        new_pos: (f64, f64),
+    },
+    NodeResized {
+        node_id: crate::NodeId,
+        old_size: (f64, f64),
+        new_size: (f64, f64),
+    },
+    NodeCreated {
+        node_id: crate::NodeId,
+    },
+    NodeDeleted {
+        node: crate::Node,
+        font_scale: Option<f32>,
+    },
+    NodeStyleChanged {
+        node_id: crate::NodeId,
+        old_style: crate::Theme,
+        new_style: crate::Theme,
+    },
 }
 
 /// A closed node kept for undo (`terminal.reopen`). Terminal nodes re-spawn
@@ -192,6 +212,14 @@ enum UndoAction {
 struct ClosedNode {
     node: crate::Node,
     font_scale: Option<f32>,
+}
+
+/// Context popup menu item
+#[derive(Debug, Clone)]
+struct PopupItem {
+    command: String,
+    title: String,
+    category: String,
 }
 
 /// Next node in z-order after `cur` (`reverse` = Shift+Tab). Wraps around;
@@ -295,7 +323,7 @@ impl CanvasState {
             last_frame: std::time::Instant::now(),
             capabilities: None,
             window: None,
-            selected: None,
+            selected: Vec::new(),
             drag: DragState::None,
             last_cursor: (0.0, 0.0),
             viewport_size: (1280.0, 720.0),
@@ -314,8 +342,9 @@ impl CanvasState {
             region_cache: Vec::new(),
             toast: None,
             help_open: false,
-            hud_visible: true,
-            hud_last_activity: std::time::Instant::now(),
+            popup_open: false,
+            popup_position: (0.0, 0.0),
+            popup_items: Vec::new(),
             search_query: String::new(),
             search_case_sensitive: false,
             search_regex: false,
@@ -323,6 +352,7 @@ impl CanvasState {
             search_current_match: 0,
             search_input_active: false,
             drag_guides: Vec::new(),
+            last_snap: None,
             closed_stack: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -379,24 +409,11 @@ impl CanvasState {
             let node = self.hit_node(wx, wy).map(|n| n.id);
             self.open_menu(wx, wy, node);
         } else {
+            // Simple right-click: open popup menu at cursor position
             let (wx, wy) = (cam.x + sx / cam.zoom, cam.y + sy / cam.zoom);
-            let hit = self.hit_node(wx, wy).map(|n| (n.id, n.transform, n.size));
-            if let Some((nid, t, size)) = hit {
-                let (vw, vh) = self.viewport_size;
-                if let Some(rect) = self.region_zoom_rect(nid, sx, sy) {
-                    self.app
-                        .state
-                        .workspace
-                        .camera_mut()
-                        .fit_rect(rect, vw as f64, vh as f64);
-                } else {
-                    self.app
-                        .state
-                        .workspace
-                        .camera_mut()
-                        .zoom_to_node(nid, t, size, vw as f64, vh as f64);
-                }
-            }
+            self.popup_open = true;
+            self.popup_position = (wx, wy);
+            self.popup_items = Self::popup_items();
         }
     }
 
@@ -551,7 +568,7 @@ impl CanvasState {
         node.projection = Some(proj);
         node.transform.scale = 1.0;
         self.app.state.workspace.add_node(node);
-        self.selected = Some(next_id);
+        self.selected = vec![next_id];
         let kind = if live { "live view" } else { "snapshot" };
         self.notify(format!(
             "pinned {kind} as node {next_id:?} (arrange with h/v/t)"
@@ -580,9 +597,10 @@ impl CanvasState {
     /// is a live terminal.
     fn cycle_selection(&mut self, reverse: bool) {
         let ids = self.app.state.workspace.nodes().to_vec();
-        let next = cycle_selection(&ids, self.selected, reverse);
+        let current = self.selected.first().copied();
+        let next = cycle_selection(&ids, current, reverse);
         if let Some(id) = next {
-            self.selected = Some(id);
+            self.selected = vec![id];
             if let Some(sess) = self.terms.iter().find(|s| s.node == id) {
                 self.focused_term = Some(sess.surface);
             }
@@ -591,7 +609,7 @@ impl CanvasState {
 
     /// Nudge the selected node by whole world pixels (arrow keys).
     fn nudge_selected(&mut self, dx: f64, dy: f64) {
-        if let Some(id) = self.selected {
+        if let Some(id) = self.selected.first().copied() {
             if let Some(n) = self.app.state.workspace.get_node_mut(id) {
                 n.transform.x += dx;
                 n.transform.y += dy;
@@ -605,7 +623,13 @@ impl CanvasState {
     ///
     /// Rows are ranked by [`fuzzy_score`] so short queries (`tv`, `pinl`)
     /// find their command without exact-substring typing.
-    fn palette_commands() -> Vec<(&'static str, &'static str, &'static str, &'static str, &'static str)> {
+    fn palette_commands() -> Vec<(
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+    )> {
         crate::command::builtin_commands()
             .into_iter()
             .filter(|c| c.id != "camera.bookmarkRestore")
@@ -640,21 +664,52 @@ impl CanvasState {
         rows
     }
 
-    /// HUD rows: action buttons shown in the auto-hiding HUD bar.
-    fn hud_rows() -> Vec<(&'static str, &'static str, &'static str)> {
+    /// Build popup menu items (command, title, category).
+    fn popup_items() -> Vec<PopupItem> {
         vec![
-            ("terminal.new", "New Terminal", "Terminal"),
-            ("palette.open", "Command Palette", "Help"),
-            ("layout.save", "Save Layout", "Arrange"),
-            ("layout.restore", "Restore Layout", "Arrange"),
-            ("view.reduceMotion", "Toggle Effects", "View"),
-            ("plugin.console", "Plugin Console", "Dev"),
-            ("help.open", "Help", "Help"),
+            PopupItem {
+                command: "terminal.new".into(),
+                title: "New Terminal".into(),
+                category: "Terminal".into(),
+            },
+            PopupItem {
+                command: "palette.open".into(),
+                title: "Command Palette".into(),
+                category: "Help".into(),
+            },
+            PopupItem {
+                command: "layout.save".into(),
+                title: "Save Layout".into(),
+                category: "Arrange".into(),
+            },
+            PopupItem {
+                command: "layout.restore".into(),
+                title: "Restore Layout".into(),
+                category: "Arrange".into(),
+            },
+            PopupItem {
+                command: "view.reduceMotion".into(),
+                title: "Toggle Effects".into(),
+                category: "View".into(),
+            },
+            PopupItem {
+                command: "plugin.console".into(),
+                title: "Plugin Console".into(),
+                category: "Dev".into(),
+            },
+            PopupItem {
+                command: "help.open".into(),
+                title: "Help".into(),
+                category: "Help".into(),
+            },
         ]
     }
 
-    /// Render the auto-hiding HUD bar at the configured edge.
-    fn render_hud(
+    /// Render the context popup menu at the given position.
+    fn render_popup(
+        popup_open: bool,
+        popup_position: (f64, f64),
+        popup_items: &[PopupItem],
         renderer: &mut RectRenderer,
         text: &mut TextRenderer,
         gl: &glow::Context,
@@ -663,66 +718,101 @@ impl CanvasState {
         font_id: u32,
         cam: &crate::Camera,
         viewport_size: (f32, f32),
-        hud_cfg: &crate::config::HudConfig,
         theme: &crate::config::ThemeConfig,
     ) {
+        if !popup_open || popup_items.is_empty() {
+            return;
+        }
         let vw = viewport_size.0 as f64;
         let vh = viewport_size.1 as f64;
         let zoom = cam.zoom.max(0.05);
-        let rows = Self::hud_rows();
-        let item_w = 140.0f64;
+
+        // Popup styling - professional, minimal, fighter-jet cockpit aesthetic
         let item_h = 28.0f64;
-        let gap = 8.0f64;
-        let total_w = rows.len() as f64 * item_w + (rows.len() - 1) as f64 * gap;
-        let bar_h = item_h + 16.0;
+        let item_padding_x = 16.0;
+        let item_padding_y = 6.0;
+        let font_size = 12.0;
+        let accent = (0.35, 0.7, 1.0, 1.0);
         let bg_color = crate::surface::Color::from_hex(&theme.background);
         let fg_color = crate::surface::Color::from_hex(&theme.foreground);
-        let accent = (0.35, 0.7, 1.0, 1.0);
+        let border_color = (0.25, 0.4, 0.55, 1.0);
 
-        // Position based on edge config
-        let (bx, by) = match hud_cfg.edge.as_str() {
-            "top-left" => (cam.x + 16.0 / zoom, cam.y + 16.0 / zoom),
-            "top-right" => (cam.x + vw / zoom - total_w - 16.0 / zoom, cam.y + 16.0 / zoom),
-            "bottom-left" => (cam.x + 16.0 / zoom, cam.y + vh / zoom - bar_h - 16.0 / zoom),
-            "bottom-right" => (
-                cam.x + vw / zoom - total_w - 16.0 / zoom,
-                cam.y + vh / zoom - bar_h - 16.0 / zoom,
+        // Calculate popup size
+        let max_title_width = popup_items
+            .iter()
+            .map(|item| item.title.len() as f64 * font_size * 0.6)
+            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .unwrap_or(150.0);
+        let popup_w = max_title_width + item_padding_x * 2.0 + 80.0; // extra space for category
+        let popup_h = popup_items.len() as f64 * item_h + 8.0;
+
+        // Position popup at stored position, clamped to viewport
+        let mut px = popup_position.0;
+        let mut py = popup_position.1;
+        if px + popup_w > cam.x + vw / zoom {
+            px = cam.x + vw / zoom - popup_w - 8.0 / zoom;
+        }
+        if py + popup_h > cam.y + vh / zoom {
+            py = cam.y + vh / zoom - popup_h - 8.0 / zoom;
+        }
+        px = px.max(cam.x + 8.0 / zoom);
+        py = py.max(cam.y + 8.0 / zoom);
+
+        // Background with subtle blur effect
+        renderer.push_overlay_rect(
+            px,
+            py,
+            popup_w,
+            popup_h,
+            (
+                bg_color.r as f32 / 255.0,
+                bg_color.g as f32 / 255.0,
+                bg_color.b as f32 / 255.0,
+                0.96,
             ),
-            _ => (cam.x + 16.0 / zoom, cam.y + 16.0 / zoom),
-        };
-
-        // Background bar
-        renderer.push_overlay_rect(bx, by, total_w + 16.0, bar_h, (
-            bg_color.r as f32 / 255.0,
-            bg_color.g as f32 / 255.0,
-            bg_color.b as f32 / 255.0,
-            0.9,
-        ));
-        renderer.push_border(bx, by, total_w + 16.0, bar_h, 1.0, accent);
+        );
+        // Border - thin, precise
+        renderer.push_border(px, py, popup_w, popup_h, 1.0, border_color);
+        // Top accent line - fighter jet HUD style
+        renderer.push_overlay_rect(px, py, popup_w, 2.0, accent);
 
         // Items
-        for (i, (_id, title, _category)) in rows.iter().enumerate() {
-            let ix = bx + 8.0 + i as f64 * (item_w + gap);
-            let iy = by + 8.0;
-            renderer.push_overlay_rect(ix, iy, item_w, item_h, (
-                bg_color.r as f32 / 255.0 * 0.7,
-                bg_color.g as f32 / 255.0 * 0.7,
-                bg_color.b as f32 / 255.0 * 0.7,
-                0.8,
-            ));
-            renderer.push_border(ix, iy, item_w, item_h, 1.0, (
-                accent.0 * 0.7, accent.1 * 0.7, accent.2 * 0.7, 0.8
-            ));
+        for (i, item) in popup_items.iter().enumerate() {
+            let iy = py + 4.0 + i as f64 * item_h;
+            let ix = px + 4.0;
+
+            // Category label (muted, right-aligned)
+            let cat_x = px + popup_w - item_padding_x - 70.0;
             unsafe {
                 text.queue_string(
                     gl,
                     atlas,
                     fonts,
                     font_id,
-                    (ix + 8.0, iy + 6.0),
+                    (cat_x, iy + item_padding_y),
                     (cam.x, cam.y, cam.zoom),
-                    10,
-                    title,
+                    font_size as u32,
+                    &item.category,
+                    (
+                        fg_color.r as f32 / 255.0 * 0.55,
+                        fg_color.g as f32 / 255.0 * 0.55,
+                        fg_color.b as f32 / 255.0 * 0.55,
+                        1.0,
+                    ),
+                );
+            }
+
+            // Command title
+            unsafe {
+                text.queue_string(
+                    gl,
+                    atlas,
+                    fonts,
+                    font_id,
+                    (ix + item_padding_x, iy + item_padding_y),
+                    (cam.x, cam.y, cam.zoom),
+                    font_size as u32,
+                    &item.title,
                     (
                         fg_color.r as f32 / 255.0,
                         fg_color.g as f32 / 255.0,
@@ -731,39 +821,69 @@ impl CanvasState {
                     ),
                 );
             }
+
+            // Subtle separator between items
+            if i < popup_items.len() - 1 {
+                renderer.push_overlay_rect(
+                    px + 8.0,
+                    iy + item_h,
+                    popup_w - 16.0,
+                    0.5,
+                    (border_color.0, border_color.1, border_color.2, 0.4),
+                );
+            }
         }
     }
 
-    fn palette_filtered(&self) -> Vec<(&'static str, &'static str, &'static str, &'static str, &'static str)> {
+    fn palette_filtered(
+        &self,
+    ) -> Vec<(
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+    )> {
         let q = self.palette_query.to_lowercase();
         if q.is_empty() {
             return Self::palette_commands();
         }
-        let mut scored: Vec<(u32, &'static str, &'static str, &'static str, &'static str, &'static str)> =
-            Self::palette_commands()
-                .into_iter()
-                .filter_map(|(id, title, key, category, description)| {
-                    let a = fuzzy_score(&q, &id.to_lowercase());
-                    let b = fuzzy_score(&q, &title.to_lowercase());
-                    let c = fuzzy_score(&q, &category.to_lowercase());
-                    let d = fuzzy_score(&q, &description.to_lowercase());
-                    match (a, b, c, d) {
-                        (None, None, None, None) => None,
-                        (x, y, z, w) => Some((
-                            x.unwrap_or(0).max(y.unwrap_or(0)).max(z.unwrap_or(0)).max(w.unwrap_or(0)),
-                            id,
-                            title,
-                            key,
-                            category,
-                            description,
-                        )),
-                    }
-                })
-                .collect();
+        let mut scored: Vec<(
+            u32,
+            &'static str,
+            &'static str,
+            &'static str,
+            &'static str,
+            &'static str,
+        )> = Self::palette_commands()
+            .into_iter()
+            .filter_map(|(id, title, key, category, description)| {
+                let a = fuzzy_score(&q, &id.to_lowercase());
+                let b = fuzzy_score(&q, &title.to_lowercase());
+                let c = fuzzy_score(&q, &category.to_lowercase());
+                let d = fuzzy_score(&q, &description.to_lowercase());
+                match (a, b, c, d) {
+                    (None, None, None, None) => None,
+                    (x, y, z, w) => Some((
+                        x.unwrap_or(0)
+                            .max(y.unwrap_or(0))
+                            .max(z.unwrap_or(0))
+                            .max(w.unwrap_or(0)),
+                        id,
+                        title,
+                        key,
+                        category,
+                        description,
+                    )),
+                }
+            })
+            .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
         scored
             .into_iter()
-            .map(|(_, id, title, key, category, description)| (id, title, key, category, description))
+            .map(|(_, id, title, key, category, description)| {
+                (id, title, key, category, description)
+            })
             .collect()
     }
 
@@ -867,7 +987,7 @@ impl CanvasState {
             ),
             "layout.orbit" => self.apply_arrange(|ns, _| crate::arrange::orbit(ns, 420.0), 0),
             "layout.focus" => {
-                if let Some(id) = self.selected {
+                if let Some(id) = self.selected.first().copied() {
                     let owned: Vec<crate::Node> = self
                         .app
                         .state
@@ -912,6 +1032,28 @@ impl CanvasState {
                 self.app.state.config.apply_profile("high-contrast");
                 self.notify("applied profile: high-contrast");
             }
+            "profile.createFromCurrent" => {
+                if let Some(sel_id) = self.selected.first().copied() {
+                    if let Some(node) = self.app.state.workspace.get_node(sel_id) {
+                        if node.input.mode.as_str() == "terminal" {
+                            // Generate a unique profile name
+                            let base_name = "custom";
+                            let mut name = base_name.to_string();
+                            let mut counter = 1;
+                            while self.app.state.config.profiles.contains_key(&name) {
+                                counter += 1;
+                                name = format!("{base_name}{counter}");
+                            }
+                            self.app.state.config.create_profile(&name);
+                            self.notify(format!("created profile '{name}' from current terminal"));
+                        } else {
+                            self.notify("select a terminal to create profile from");
+                        }
+                    }
+                } else {
+                    self.notify("no terminal selected");
+                }
+            }
             "reading.enter" => {
                 if let Some(surface) = self.focused_term {
                     if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
@@ -921,7 +1063,15 @@ impl CanvasState {
                         if let Some(node) = self.app.state.workspace.get_node(node_id) {
                             let (nx, ny) = (node.transform.x, node.transform.y);
                             let next_id = crate::NodeId(
-                                self.app.state.workspace.node_ids().iter().map(|n| n.0).max().unwrap_or(0) + 1,
+                                self.app
+                                    .state
+                                    .workspace
+                                    .node_ids()
+                                    .iter()
+                                    .map(|n| n.0)
+                                    .max()
+                                    .unwrap_or(0)
+                                    + 1,
                             );
                             let selector = crate::ProjectionSelector {
                                 rows: None,
@@ -931,15 +1081,25 @@ impl CanvasState {
                                 max_lines: None,
                                 follow: true,
                             };
-                            let proj = crate::ProjectionSurface::from_terminal(term, selector, crate::ProjectionMode::Live);
+                            let mut proj = crate::ProjectionSurface::from_terminal(
+                                term,
+                                selector,
+                                crate::ProjectionMode::Live,
+                            );
+                            proj.presentation = crate::ProjectionPresentation::reading();
                             let mut reading_node = crate::Node::new(next_id, nx, ny);
                             reading_node.size = (600.0, 400.0);
                             reading_node.set_surface(surface);
                             reading_node.projection = Some(proj);
                             reading_node.transform.scale = 1.0;
                             self.app.state.workspace.add_node(reading_node);
-                            self.selected = Some(next_id);
+                            self.selected = vec![next_id];
                             self.app.state.active_mode = crate::app::InteractionMode::Reading;
+                            self.app
+                                .state
+                                .workspace
+                                .camera_lens_mut()
+                                .enter_reading_mode();
                             self.notify("entered reading mode (Esc to exit)");
                         }
                     }
@@ -947,6 +1107,11 @@ impl CanvasState {
             }
             "reading.exit" => {
                 self.app.state.active_mode = crate::app::InteractionMode::Workspace;
+                self.app
+                    .state
+                    .workspace
+                    .camera_lens_mut()
+                    .exit_reading_mode();
                 self.notify("exited reading mode");
             }
             "reading.readSelection" => {
@@ -959,7 +1124,15 @@ impl CanvasState {
                             if let Some(node) = self.app.state.workspace.get_node(node_id) {
                                 let (nx, ny) = (node.transform.x, node.transform.y);
                                 let next_id = crate::NodeId(
-                                    self.app.state.workspace.node_ids().iter().map(|n| n.0).max().unwrap_or(0) + 1,
+                                    self.app
+                                        .state
+                                        .workspace
+                                        .node_ids()
+                                        .iter()
+                                        .map(|n| n.0)
+                                        .max()
+                                        .unwrap_or(0)
+                                        + 1,
                                 );
                                 let selector = crate::ProjectionSelector {
                                     rows: None,
@@ -970,16 +1143,26 @@ impl CanvasState {
                                     follow: false,
                                 };
                                 // Create a snapshot projection with the selected text
-                                let mut proj = crate::ProjectionSurface::from_terminal(term, selector, crate::ProjectionMode::Snapshot);
+                                let mut proj = crate::ProjectionSurface::from_terminal(
+                                    term,
+                                    selector,
+                                    crate::ProjectionMode::Snapshot,
+                                );
                                 proj.content = text.lines().map(|s| s.to_string()).collect();
+                                proj.presentation = crate::ProjectionPresentation::reading();
                                 let mut reading_node = crate::Node::new(next_id, nx, ny);
                                 reading_node.size = (600.0, 400.0);
                                 reading_node.set_surface(surface);
                                 reading_node.projection = Some(proj);
                                 reading_node.transform.scale = 1.0;
                                 self.app.state.workspace.add_node(reading_node);
-                                self.selected = Some(next_id);
+                                self.selected = vec![next_id];
                                 self.app.state.active_mode = crate::app::InteractionMode::Reading;
+                                self.app
+                                    .state
+                                    .workspace
+                                    .camera_lens_mut()
+                                    .enter_reading_mode();
                                 self.notify("reading selection");
                             }
                         }
@@ -991,13 +1174,24 @@ impl CanvasState {
                     if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
                         let term = &self.terms[idx].engine.term;
                         let row = term.cursor_row.min(term.grid.rows.saturating_sub(1));
-                        let line = term.visible_line(row).map(|l| l.iter().map(|c| c.character).collect::<String>()).unwrap_or_default();
+                        let line = term
+                            .visible_line(row)
+                            .map(|l| l.iter().map(|c| c.character).collect::<String>())
+                            .unwrap_or_default();
                         if !line.is_empty() {
                             let node_id = self.terms[idx].node;
                             if let Some(node) = self.app.state.workspace.get_node(node_id) {
                                 let (nx, ny) = (node.transform.x, node.transform.y);
                                 let next_id = crate::NodeId(
-                                    self.app.state.workspace.node_ids().iter().map(|n| n.0).max().unwrap_or(0) + 1,
+                                    self.app
+                                        .state
+                                        .workspace
+                                        .node_ids()
+                                        .iter()
+                                        .map(|n| n.0)
+                                        .max()
+                                        .unwrap_or(0)
+                                        + 1,
                                 );
                                 let selector = crate::ProjectionSelector {
                                     rows: None,
@@ -1007,16 +1201,26 @@ impl CanvasState {
                                     max_lines: None,
                                     follow: false,
                                 };
-                                let mut proj = crate::ProjectionSurface::from_terminal(term, selector, crate::ProjectionMode::Snapshot);
+                                let mut proj = crate::ProjectionSurface::from_terminal(
+                                    term,
+                                    selector,
+                                    crate::ProjectionMode::Snapshot,
+                                );
                                 proj.content = vec![line];
+                                proj.presentation = crate::ProjectionPresentation::reading();
                                 let mut reading_node = crate::Node::new(next_id, nx, ny);
                                 reading_node.size = (600.0, 400.0);
                                 reading_node.set_surface(surface);
                                 reading_node.projection = Some(proj);
                                 reading_node.transform.scale = 1.0;
                                 self.app.state.workspace.add_node(reading_node);
-                                self.selected = Some(next_id);
+                                self.selected = vec![next_id];
                                 self.app.state.active_mode = crate::app::InteractionMode::Reading;
+                                self.app
+                                    .state
+                                    .workspace
+                                    .camera_lens_mut()
+                                    .enter_reading_mode();
                                 self.notify("reading current line");
                             }
                         }
@@ -1027,13 +1231,29 @@ impl CanvasState {
                 if let Some(surface) = self.focused_term {
                     if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
                         let term = &self.terms[idx].engine.term;
-                        let lines: Vec<String> = term.grid.scrollback.iter().rev().take(50).rev().map(|l| l.iter().map(|c| c.character).collect()).collect();
+                        let lines: Vec<String> = term
+                            .grid
+                            .scrollback
+                            .iter()
+                            .rev()
+                            .take(50)
+                            .rev()
+                            .map(|l| l.iter().map(|c| c.character).collect())
+                            .collect();
                         if !lines.is_empty() {
                             let node_id = self.terms[idx].node;
                             if let Some(node) = self.app.state.workspace.get_node(node_id) {
                                 let (nx, ny) = (node.transform.x, node.transform.y);
                                 let next_id = crate::NodeId(
-                                    self.app.state.workspace.node_ids().iter().map(|n| n.0).max().unwrap_or(0) + 1,
+                                    self.app
+                                        .state
+                                        .workspace
+                                        .node_ids()
+                                        .iter()
+                                        .map(|n| n.0)
+                                        .max()
+                                        .unwrap_or(0)
+                                        + 1,
                                 );
                                 let selector = crate::ProjectionSelector {
                                     rows: None,
@@ -1043,16 +1263,26 @@ impl CanvasState {
                                     max_lines: None,
                                     follow: false,
                                 };
-                                let mut proj = crate::ProjectionSurface::from_terminal(term, selector, crate::ProjectionMode::Snapshot);
+                                let mut proj = crate::ProjectionSurface::from_terminal(
+                                    term,
+                                    selector,
+                                    crate::ProjectionMode::Snapshot,
+                                );
                                 proj.content = lines;
+                                proj.presentation = crate::ProjectionPresentation::reading();
                                 let mut reading_node = crate::Node::new(next_id, nx, ny);
                                 reading_node.size = (600.0, 400.0);
                                 reading_node.set_surface(surface);
                                 reading_node.projection = Some(proj);
                                 reading_node.transform.scale = 1.0;
                                 self.app.state.workspace.add_node(reading_node);
-                                self.selected = Some(next_id);
+                                self.selected = vec![next_id];
                                 self.app.state.active_mode = crate::app::InteractionMode::Reading;
+                                self.app
+                                    .state
+                                    .workspace
+                                    .camera_lens_mut()
+                                    .enter_reading_mode();
                                 self.notify("reading last 50 lines");
                             }
                         }
@@ -1064,22 +1294,42 @@ impl CanvasState {
                     if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
                         let term = &self.terms[idx].engine.term;
                         let filter = crate::projection::FilterSpec::Levels {
-                            levels: vec!["ERROR".to_string(), "WARN".to_string(), "FATAL".to_string()],
+                            levels: vec![
+                                "ERROR".to_string(),
+                                "WARN".to_string(),
+                                "FATAL".to_string(),
+                            ],
                         };
-                        let lines: Vec<String> = term.grid.scrollback.iter().filter_map(|l| {
-                            let line_text: String = l.iter().map(|c| c.character).collect();
-                            if line_text.contains("ERROR") || line_text.contains("WARN") || line_text.contains("FATAL") {
-                                Some(line_text)
-                            } else {
-                                None
-                            }
-                        }).collect();
+                        let lines: Vec<String> = term
+                            .grid
+                            .scrollback
+                            .iter()
+                            .filter_map(|l| {
+                                let line_text: String = l.iter().map(|c| c.character).collect();
+                                if line_text.contains("ERROR")
+                                    || line_text.contains("WARN")
+                                    || line_text.contains("FATAL")
+                                {
+                                    Some(line_text)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
                         if !lines.is_empty() {
                             let node_id = self.terms[idx].node;
                             if let Some(node) = self.app.state.workspace.get_node(node_id) {
                                 let (nx, ny) = (node.transform.x, node.transform.y);
                                 let next_id = crate::NodeId(
-                                    self.app.state.workspace.node_ids().iter().map(|n| n.0).max().unwrap_or(0) + 1,
+                                    self.app
+                                        .state
+                                        .workspace
+                                        .node_ids()
+                                        .iter()
+                                        .map(|n| n.0)
+                                        .max()
+                                        .unwrap_or(0)
+                                        + 1,
                                 );
                                 let selector = crate::ProjectionSelector {
                                     rows: None,
@@ -1089,16 +1339,26 @@ impl CanvasState {
                                     max_lines: None,
                                     follow: false,
                                 };
-                                let mut proj = crate::ProjectionSurface::from_terminal(term, selector, crate::ProjectionMode::Snapshot);
+                                let mut proj = crate::ProjectionSurface::from_terminal(
+                                    term,
+                                    selector,
+                                    crate::ProjectionMode::Snapshot,
+                                );
                                 proj.content = lines;
+                                proj.presentation = crate::ProjectionPresentation::reading();
                                 let mut reading_node = crate::Node::new(next_id, nx, ny);
                                 reading_node.size = (600.0, 400.0);
                                 reading_node.set_surface(surface);
                                 reading_node.projection = Some(proj);
                                 reading_node.transform.scale = 1.0;
                                 self.app.state.workspace.add_node(reading_node);
-                                self.selected = Some(next_id);
+                                self.selected = vec![next_id];
                                 self.app.state.active_mode = crate::app::InteractionMode::Reading;
+                                self.app
+                                    .state
+                                    .workspace
+                                    .camera_lens_mut()
+                                    .enter_reading_mode();
                                 self.notify("reading filtered (errors/warnings)");
                             }
                         }
@@ -1109,7 +1369,11 @@ impl CanvasState {
                 if let Some(surface) = self.focused_term {
                     if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
                         let term = &self.terms[idx].engine.term;
-                        let matches = term.search(&self.search_query, self.search_case_sensitive, self.search_regex);
+                        let matches = term.search(
+                            &self.search_query,
+                            self.search_case_sensitive,
+                            self.search_regex,
+                        );
                         self.search_matches = matches;
                         self.search_current_match = 0;
                         if !self.search_matches.is_empty() {
@@ -1117,7 +1381,10 @@ impl CanvasState {
                             self.terms[idx].engine.term.cursor_row = row;
                             self.terms[idx].engine.term.cursor_col = col;
                             self.terms[idx].engine.term.reset_scroll();
-                            self.notify(format!("found {} matches (F3/Shift+F3 to navigate)", self.search_matches.len()));
+                            self.notify(format!(
+                                "found {} matches (F3/Shift+F3 to navigate)",
+                                self.search_matches.len()
+                            ));
                         } else {
                             self.notify(format!("no matches for '{}'", self.search_query));
                         }
@@ -1128,14 +1395,19 @@ impl CanvasState {
             }
             "search.findNext" => {
                 if !self.search_matches.is_empty() {
-                    self.search_current_match = (self.search_current_match + 1) % self.search_matches.len();
+                    self.search_current_match =
+                        (self.search_current_match + 1) % self.search_matches.len();
                     if let Some(surface) = self.focused_term {
                         if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
                             let (row, col) = self.search_matches[self.search_current_match];
                             self.terms[idx].engine.term.cursor_row = row;
                             self.terms[idx].engine.term.cursor_col = col;
                             self.terms[idx].engine.term.reset_scroll();
-                            self.notify(format!("match {} of {}", self.search_current_match + 1, self.search_matches.len()));
+                            self.notify(format!(
+                                "match {} of {}",
+                                self.search_current_match + 1,
+                                self.search_matches.len()
+                            ));
                         }
                     }
                 }
@@ -1153,14 +1425,21 @@ impl CanvasState {
                             self.terms[idx].engine.term.cursor_row = row;
                             self.terms[idx].engine.term.cursor_col = col;
                             self.terms[idx].engine.term.reset_scroll();
-                            self.notify(format!("match {} of {}", self.search_current_match + 1, self.search_matches.len()));
+                            self.notify(format!(
+                                "match {} of {}",
+                                self.search_current_match + 1,
+                                self.search_matches.len()
+                            ));
                         }
                     }
                 }
             }
             "search.toggleCase" => {
                 self.search_case_sensitive = !self.search_case_sensitive;
-                self.notify(format!("search case sensitive: {}", self.search_case_sensitive));
+                self.notify(format!(
+                    "search case sensitive: {}",
+                    self.search_case_sensitive
+                ));
             }
             "search.toggleRegex" => {
                 self.search_regex = !self.search_regex;
@@ -1175,7 +1454,15 @@ impl CanvasState {
                             if let Some(node) = self.app.state.workspace.get_node(node_id) {
                                 let (nx, ny) = (node.transform.x, node.transform.y);
                                 let next_id = crate::NodeId(
-                                    self.app.state.workspace.node_ids().iter().map(|n| n.0).max().unwrap_or(0) + 1,
+                                    self.app
+                                        .state
+                                        .workspace
+                                        .node_ids()
+                                        .iter()
+                                        .map(|n| n.0)
+                                        .max()
+                                        .unwrap_or(0)
+                                        + 1,
                                 );
                                 let selector = crate::ProjectionSelector {
                                     rows: None,
@@ -1185,35 +1472,52 @@ impl CanvasState {
                                     max_lines: None,
                                     follow: false,
                                 };
-                                let proj = crate::ProjectionSurface::from_terminal(term, selector, crate::ProjectionMode::Snapshot);
+                                let proj = crate::ProjectionSurface::from_terminal(
+                                    term,
+                                    selector,
+                                    crate::ProjectionMode::Snapshot,
+                                );
                                 let mut search_node = crate::Node::new(next_id, nx, ny);
                                 search_node.size = (600.0, 400.0);
                                 search_node.set_surface(surface);
                                 search_node.projection = Some(proj);
                                 search_node.transform.scale = 1.0;
                                 self.app.state.workspace.add_node(search_node);
-                                self.selected = Some(next_id);
+                                self.selected = vec![next_id];
                                 self.notify("created projection from search results");
                             }
                         }
                     }
                 }
             }
-            "hud.toggle" => {
-                self.hud_visible = !self.hud_visible;
-                self.hud_last_activity = std::time::Instant::now();
-                self.notify(format!("HUD {}", if self.hud_visible { "shown" } else { "hidden" }));
+            "popup.toggle" => {
+                self.popup_open = !self.popup_open;
+                if self.popup_open {
+                    // Position at mouse cursor in world coordinates
+                    let cam = self.app.state.workspace.camera();
+                    let zoom = cam.zoom.max(0.05);
+                    let (wx, wy) = (
+                        cam.x + self.last_cursor.0 / zoom,
+                        cam.y + self.last_cursor.1 / zoom,
+                    );
+                    self.popup_position = (wx, wy);
+                    self.popup_items = Self::popup_items();
+                }
             }
             "edit.undo" => {
                 if let Some(action) = self.undo_stack.pop() {
                     match &action {
-                        UndoAction::NodeMoved { node_id, old_pos, .. } => {
+                        UndoAction::NodeMoved {
+                            node_id, old_pos, ..
+                        } => {
                             if let Some(node) = self.app.state.workspace.get_node_mut(*node_id) {
                                 node.transform.x = old_pos.0;
                                 node.transform.y = old_pos.1;
                             }
                         }
-                        UndoAction::NodeResized { node_id, old_size, .. } => {
+                        UndoAction::NodeResized {
+                            node_id, old_size, ..
+                        } => {
                             if let Some(node) = self.app.state.workspace.get_node_mut(*node_id) {
                                 node.size = *old_size;
                             }
@@ -1228,7 +1532,9 @@ impl CanvasState {
                                 self.font_scales.insert(node.id, *scale);
                             }
                         }
-                        UndoAction::NodeStyleChanged { node_id, old_style, .. } => {
+                        UndoAction::NodeStyleChanged {
+                            node_id, old_style, ..
+                        } => {
                             if let Some(node) = self.app.state.workspace.get_node_mut(*node_id) {
                                 node.style = old_style.clone();
                             }
@@ -1243,13 +1549,17 @@ impl CanvasState {
             "edit.redo" => {
                 if let Some(action) = self.redo_stack.pop() {
                     match &action {
-                        UndoAction::NodeMoved { node_id, new_pos, .. } => {
+                        UndoAction::NodeMoved {
+                            node_id, new_pos, ..
+                        } => {
                             if let Some(node) = self.app.state.workspace.get_node_mut(*node_id) {
                                 node.transform.x = new_pos.0;
                                 node.transform.y = new_pos.1;
                             }
                         }
-                        UndoAction::NodeResized { node_id, new_size, .. } => {
+                        UndoAction::NodeResized {
+                            node_id, new_size, ..
+                        } => {
                             if let Some(node) = self.app.state.workspace.get_node_mut(*node_id) {
                                 node.size = *new_size;
                             }
@@ -1257,12 +1567,17 @@ impl CanvasState {
                         UndoAction::NodeCreated { node_id: _ } => {
                             // Node already exists, nothing to do
                         }
-                        UndoAction::NodeDeleted { node, font_scale: _ } => {
+                        UndoAction::NodeDeleted {
+                            node,
+                            font_scale: _,
+                        } => {
                             self.app.state.workspace.remove_node(node.id);
                             self.terms.retain(|t| t.node != node.id);
                             self.font_scales.remove(&node.id);
                         }
-                        UndoAction::NodeStyleChanged { node_id, new_style, .. } => {
+                        UndoAction::NodeStyleChanged {
+                            node_id, new_style, ..
+                        } => {
                             if let Some(node) = self.app.state.workspace.get_node_mut(*node_id) {
                                 node.style = new_style.clone();
                             }
@@ -1299,7 +1614,15 @@ impl CanvasState {
                         if let Some(node) = self.app.state.workspace.get_node(node_id) {
                             let (nx, ny) = (node.transform.x, node.transform.y);
                             let next_id = crate::NodeId(
-                                self.app.state.workspace.node_ids().iter().map(|n| n.0).max().unwrap_or(0) + 1,
+                                self.app
+                                    .state
+                                    .workspace
+                                    .node_ids()
+                                    .iter()
+                                    .map(|n| n.0)
+                                    .max()
+                                    .unwrap_or(0)
+                                    + 1,
                             );
                             let selector = crate::ProjectionSelector {
                                 rows: None,
@@ -1310,7 +1633,11 @@ impl CanvasState {
                                 follow: false,
                             };
                             let term = &self.terms[idx].engine.term;
-                            let mut proj = crate::ProjectionSurface::from_terminal(term, selector, crate::ProjectionMode::Snapshot);
+                            let mut proj = crate::ProjectionSurface::from_terminal(
+                                term,
+                                selector,
+                                crate::ProjectionMode::Snapshot,
+                            );
                             proj.content = content;
                             let mut kb_node = crate::Node::new(next_id, nx, ny);
                             kb_node.size = (500.0, 400.0);
@@ -1318,7 +1645,7 @@ impl CanvasState {
                             kb_node.projection = Some(proj);
                             kb_node.transform.scale = 1.0;
                             self.app.state.workspace.add_node(kb_node);
-                            self.selected = Some(next_id);
+                            self.selected = vec![next_id];
                             self.notify("opened keybinding reference");
                         }
                     }
@@ -1368,14 +1695,14 @@ impl CanvasState {
     }
 
     fn adjust_selected_font(&mut self, delta: f32) {
-        if let Some(id) = self.selected {
+        if let Some(id) = self.selected.first().copied() {
             let cur = self.font_scales.get(&id).copied().unwrap_or(1.0);
             self.font_scales.insert(id, (cur + delta).clamp(0.7, 2.5));
         }
     }
 
     fn cycle_selected_opacity(&mut self) {
-        if let Some(id) = self.selected {
+        if let Some(id) = self.selected.first().copied() {
             if let Some(n) = self.app.state.workspace.get_node_mut(id) {
                 const STEPS: [u8; 4] = [255, 235, 205, 170];
                 let cur = n.style.background.a;
@@ -1386,7 +1713,7 @@ impl CanvasState {
     }
 
     fn cycle_selected_tint(&mut self) {
-        if let Some(id) = self.selected {
+        if let Some(id) = self.selected.first().copied() {
             if let Some(n) = self.app.state.workspace.get_node_mut(id) {
                 const TINTS: [&str; 4] = ["#0b0d12", "#0d1410", "#101322", "#1a1214"];
                 let cur = (
@@ -1639,9 +1966,7 @@ impl CanvasState {
             }
         }
         self.app.state.workspace.remove_node(node_id);
-        if self.selected == Some(node_id) {
-            self.selected = None;
-        }
+        self.selected.retain(|&id| id != node_id);
         if self.focused_term == Some(sess.surface) {
             self.focused_term = None;
             self.term_focus = false;
@@ -1656,7 +1981,7 @@ impl CanvasState {
     /// node removal for projections/widgets. Returns false with nothing
     /// selected.
     fn close_selected(&mut self) -> bool {
-        let Some(id) = self.selected else {
+        let Some(id) = self.selected.first().copied() else {
             return false;
         };
         if self.close_terminal_node(id) {
@@ -1672,7 +1997,7 @@ impl CanvasState {
             }
         }
         self.app.state.workspace.remove_node(id);
-        self.selected = None;
+        self.selected.clear();
         true
     }
 
@@ -1728,7 +2053,7 @@ impl CanvasState {
         if let Some(scale) = closed.font_scale {
             self.font_scales.insert(node_id, scale);
         }
-        self.selected = Some(node_id);
+        self.selected = vec![node_id];
         self.notify("reopened closed node");
     }
 
@@ -1855,11 +2180,8 @@ impl CanvasState {
         if let Some(first) = self.terms.first() {
             self.focused_term = Some(first.surface);
         }
-        if let Some(sel) = self.selected {
-            if self.app.state.workspace.get_node(sel).is_none() {
-                self.selected = None;
-            }
-        }
+        self.selected
+            .retain(|id| self.app.state.workspace.get_node(*id).is_some());
         Ok(self.terms.len())
     }
 
@@ -1882,7 +2204,7 @@ impl CanvasState {
     /// Step the selected terminal's grid by whole cells (border/menu grid
     /// control without pixel dragging). Returns false with no session.
     fn step_selected_grid(&mut self, dcols: i32, drows: i32) -> bool {
-        let Some(id) = self.selected else {
+        let Some(id) = self.selected.first().copied() else {
             return false;
         };
         let Some(sess) = self.terms.iter().find(|s| s.node == id) else {
@@ -1977,7 +2299,15 @@ impl CanvasState {
         let palette_items: Vec<(String, String, String, String, String)> = if palette_open {
             self.palette_filtered()
                 .into_iter()
-                .map(|(a, b, c, d, e)| (a.to_string(), b.to_string(), c.to_string(), d.to_string(), e.to_string()))
+                .map(|(a, b, c, d, e)| {
+                    (
+                        a.to_string(),
+                        b.to_string(),
+                        c.to_string(),
+                        d.to_string(),
+                        e.to_string(),
+                    )
+                })
                 .collect()
         } else {
             Vec::new()
@@ -1988,7 +2318,7 @@ impl CanvasState {
         // terminal's content changed or the node/metrics moved; idle
         // frames reuse the cached world rects. The `dirty` flag clears
         // below, after this frame's consumers ran.
-        let region_cues: Vec<(f64, f64, f64, f64)> = match self.selected {
+        let region_cues: Vec<(f64, f64, f64, f64)> = match self.selected.first().copied() {
             Some(id) => {
                 let idx = self.terms.iter().position(|s| s.node == id);
                 let pos = self
@@ -2063,13 +2393,17 @@ impl CanvasState {
             .menu
             .as_ref()
             .map(|m| (m.x, m.y, m.items.clone(), m.index));
+        // Extract popup state to avoid borrow conflicts
+        let popup_open = self.popup_open;
+        let popup_position = self.popup_position;
+        let popup_items = self.popup_items.clone();
         if let (Some(renderer), Some(graph)) = (&mut self.renderer, &self.graph) {
             let cam = self.app.state.workspace.camera();
             renderer.set_camera(cam.x, cam.y, cam.zoom);
 
             // ContentPass: one rect per node, batched into a single draw call.
-            // The selected node gets an accent border; others keep theirs.
-            let selected = self.selected;
+            // Selected nodes get an accent border; others keep theirs.
+            let selected = &self.selected;
             for node in self.app.state.workspace.all_nodes() {
                 let bg = node.style.background;
                 let (w, h) = node.size;
@@ -2087,7 +2421,7 @@ impl CanvasState {
                         bg.a as f32 / 255.0,
                     ),
                 );
-                if Some(node.id) == selected {
+                if selected.contains(&node.id) {
                     renderer.push_border(
                         node.transform.x,
                         node.transform.y,
@@ -2116,23 +2450,27 @@ impl CanvasState {
             // Resize handle: filled accent square at the selected node's
             // bottom-right corner, 12 screen px in world units.
             // Close button: same size at the top-right corner.
-            if let Some(sel) = selected {
-                if let Some(node) = self.app.state.workspace.get_node(sel) {
-                    let handle = 12.0 / cam.zoom.max(0.05);
-                    let (w, h) = (node.size.0.max(1.0), node.size.1.max(1.0));
-                    renderer.push_overlay_rect(
-                        node.transform.x + w - handle,
-                        node.transform.y + h - handle,
-                        handle,
-                        handle,
-                        (0.35, 0.7, 1.0, 1.0),
-                    );
-                    let (cx, cy, cs, _) =
-                        close_button_rect(node.transform.x, node.transform.y, w, cam.zoom);
-                    renderer.push_overlay_rect(cx, cy, cs, cs, (0.9, 0.35, 0.35, 1.0));
-                    let (mx, my, ms) =
-                        menu_button_rect(node.transform.x, node.transform.y, cam.zoom);
-                    renderer.push_overlay_rect(mx, my, ms, ms, (0.35, 0.7, 1.0, 1.0));
+            // Hide chrome in reading mode. Only show chrome for primary selection.
+            let in_reading_mode = self.app.state.workspace.camera_lens().is_reading_mode();
+            if let Some(primary_sel) = selected.first().copied() {
+                if let Some(node) = self.app.state.workspace.get_node(primary_sel) {
+                    if !in_reading_mode {
+                        let handle = 12.0 / cam.zoom.max(0.05);
+                        let (w, h) = (node.size.0.max(1.0), node.size.1.max(1.0));
+                        renderer.push_overlay_rect(
+                            node.transform.x + w - handle,
+                            node.transform.y + h - handle,
+                            handle,
+                            handle,
+                            (0.35, 0.7, 1.0, 1.0),
+                        );
+                        let (cx, cy, cs, _) =
+                            close_button_rect(node.transform.x, node.transform.y, w, cam.zoom);
+                        renderer.push_overlay_rect(cx, cy, cs, cs, (0.9, 0.35, 0.35, 1.0));
+                        let (mx, my, ms) =
+                            menu_button_rect(node.transform.x, node.transform.y, cam.zoom);
+                        renderer.push_overlay_rect(mx, my, ms, ms, (0.35, 0.7, 1.0, 1.0));
+                    }
                     for (rx, ry, rw, rh) in &region_cues {
                         renderer.push_border(*rx, *ry, *rw, *rh, 1.5, (0.4, 0.8, 1.0, 0.9));
                     }
@@ -2284,9 +2622,13 @@ impl CanvasState {
                                         continue;
                                     }
                                     // Highlight search matches
-                                    let is_search_match = self.focused_term == Some(self.terms[i].surface)
+                                    let is_search_match = self.focused_term
+                                        == Some(self.terms[i].surface)
                                         && !self.search_matches.is_empty()
-                                        && self.search_matches.iter().any(|(mr, mc)| *mr == r && *mc == c);
+                                        && self
+                                            .search_matches
+                                            .iter()
+                                            .any(|(mr, mc)| *mr == r && *mc == c);
                                     let is_current_match = is_search_match
                                         && self.search_current_match < self.search_matches.len()
                                         && self.search_matches[self.search_current_match] == (r, c);
@@ -2305,8 +2647,15 @@ impl CanvasState {
                                     // Draw match highlight background
                                     if is_search_match {
                                         renderer.push_overlay_rect(
-                                            ox, oy, cell_w, line_h,
-                                            if is_current_match { (1.0, 0.8, 0.0, 0.3) } else { (1.0, 0.6, 0.0, 0.2) }
+                                            ox,
+                                            oy,
+                                            cell_w,
+                                            line_h,
+                                            if is_current_match {
+                                                (1.0, 0.8, 0.0, 0.3)
+                                            } else {
+                                                (1.0, 0.6, 0.0, 0.2)
+                                            },
                                         );
                                     }
                                     text.queue_char_at(
@@ -2358,6 +2707,12 @@ impl CanvasState {
                             else {
                                 continue;
                             };
+                            let scroll_offset = sess.engine.term.scroll_offset as u32;
+                            let cursor_row =
+                                sess.engine.term.cursor_row.saturating_add(scroll_offset);
+                            if cursor_row >= sess.engine.term.grid.rows {
+                                continue;
+                            }
                             let (ox, oy) = crate::arrange::grid_cell_origin(
                                 node.0,
                                 node.1,
@@ -2366,7 +2721,7 @@ impl CanvasState {
                                 cell_w,
                                 line_h,
                                 sess.engine.term.cursor_col,
-                                sess.engine.term.cursor_row,
+                                cursor_row,
                             );
                             let (cx, cy, cw, ch) = match style.shape {
                                 crate::vt::CursorShape::Block => (ox, oy, cell_w, line_h),
@@ -2421,28 +2776,95 @@ impl CanvasState {
                                 (0.55, 0.62, 0.72, 1.0),
                             );
                         }
-                        // Projection nodes: render their content lines.
+                        // Projection nodes: render their content lines using presentation options.
                         for node in self.app.state.workspace.all_nodes() {
                             let Some(proj) = &node.projection else {
                                 continue;
                             };
-                            for (li, line) in proj.content.iter().enumerate() {
-                                if line.trim().is_empty() {
+                            let pres = &proj.presentation;
+                            let font_size = (12.0 * pres.font_size_scale) as u32;
+                            let line_height = (font_size as f64 * 1.3).round();
+                            let (fg_r, fg_g, fg_b) = if let Some(theme) = &pres.theme_override {
+                                (
+                                    theme.foreground.r as f32 / 255.0,
+                                    theme.foreground.g as f32 / 255.0,
+                                    theme.foreground.b as f32 / 255.0,
+                                )
+                            } else {
+                                (0.55, 0.85, 0.65)
+                            };
+                            let (bg_r, bg_g, bg_b, bg_a) = if let Some(theme) = &pres.theme_override
+                            {
+                                (
+                                    theme.background.r as f32 / 255.0,
+                                    theme.background.g as f32 / 255.0,
+                                    theme.background.b as f32 / 255.0,
+                                    0.95,
+                                )
+                            } else {
+                                (0.07, 0.09, 0.11, 0.9)
+                            };
+                            // Reflow mode: word-wrap content to node width
+                            let lines_to_render: Vec<String> =
+                                if pres.reflow && !proj.content.is_empty() {
+                                    let max_width = node.size.0.max(200.0) - 20.0; // 10px padding each side
+                                    let chars_per_line =
+                                        (max_width / (font_size as f64 * 0.55)).max(10.0) as usize;
+                                    let joined = proj.content.join(" ");
+                                    let mut wrapped = Vec::new();
+                                    let mut current_line = String::new();
+                                    for word in joined.split_whitespace() {
+                                        if current_line.len() + word.len() + 1 > chars_per_line {
+                                            wrapped.push(std::mem::take(&mut current_line));
+                                        }
+                                        if !current_line.is_empty() {
+                                            current_line.push(' ');
+                                        }
+                                        current_line.push_str(word);
+                                    }
+                                    if !current_line.is_empty() {
+                                        wrapped.push(current_line);
+                                    }
+                                    wrapped
+                                } else {
+                                    proj.content.clone()
+                                };
+                            // Draw background for reading mode
+                            if pres.reflow {
+                                let content_width = node.size.0.max(200.0);
+                                let content_height =
+                                    lines_to_render.len() as f64 * line_height + 20.0;
+                                renderer.push_overlay_rect(
+                                    node.transform.x,
+                                    node.transform.y,
+                                    content_width,
+                                    content_height,
+                                    (bg_r, bg_g, bg_b, bg_a),
+                                );
+                                renderer.push_border(
+                                    node.transform.x,
+                                    node.transform.y,
+                                    content_width,
+                                    content_height,
+                                    1.0,
+                                    (fg_r, fg_g, fg_b, 0.5),
+                                );
+                            }
+                            for (li, line) in lines_to_render.iter().enumerate() {
+                                if line.trim().is_empty() && !pres.reflow {
                                     continue;
                                 }
+                                let y = node.transform.y + 10.0 + line_height * li as f64;
                                 text.queue_string(
                                     gl,
                                     atlas,
                                     fonts,
                                     fid,
-                                    (
-                                        node.transform.x + 8.0,
-                                        node.transform.y + 20.0 + 16.0 * li as f64,
-                                    ),
+                                    (node.transform.x + 10.0, y),
                                     (cam.x, cam.y, cam.zoom),
-                                    12,
+                                    font_size,
                                     line,
-                                    (0.55, 0.85, 0.65, 1.0),
+                                    (fg_r, fg_g, fg_b, 1.0),
                                 );
                             }
                         }
@@ -2469,7 +2891,8 @@ impl CanvasState {
                                 &prompt,
                                 (0.9, 0.93, 1.0, 1.0),
                             );
-                            for (i, (_id, title, key, category, _desc)) in items.iter().take(8).enumerate()
+                            for (i, (_id, title, key, category, _desc)) in
+                                items.iter().take(8).enumerate()
                             {
                                 let row = format!(
                                     "{} {}",
@@ -2499,7 +2922,13 @@ impl CanvasState {
                                 let ph = 120.0f64;
                                 let px = bx + bw + 16.0;
                                 let py = by;
-                                renderer.push_overlay_rect(px, py, pw, ph, (0.07, 0.08, 0.11, 0.96));
+                                renderer.push_overlay_rect(
+                                    px,
+                                    py,
+                                    pw,
+                                    ph,
+                                    (0.07, 0.08, 0.11, 0.96),
+                                );
                                 renderer.push_border(px, py, pw, ph, 1.0, (0.35, 0.7, 1.0, 0.8));
                                 text.queue_string(
                                     gl,
@@ -2580,7 +3009,11 @@ impl CanvasState {
                             );
                             let hint = format!(
                                 "{}  {}  {}",
-                                if self.search_case_sensitive { "Aa" } else { "aa" },
+                                if self.search_case_sensitive {
+                                    "Aa"
+                                } else {
+                                    "aa"
+                                },
                                 if self.search_regex { ".*" } else { "" },
                                 "Enter=search  Esc=cancel  F3=next  Shift+F3=prev"
                             );
@@ -2636,12 +3069,26 @@ impl CanvasState {
                                     (0.5, 0.5, 0.55, 1.0)
                                 };
                                 let label = match &item.kind {
-                                    crate::input::ContextMenuItemKind::Separator => "──────────────".to_string(),
-                                    crate::input::ContextMenuItemKind::Info { label, value } => format!("{label}: {value}"),
-                                    crate::input::ContextMenuItemKind::Toggle { label_on, label_off, .. } => {
-                                        format!("{}  [{}]", item.label, if is_sel { label_on } else { label_off })
+                                    crate::input::ContextMenuItemKind::Separator => {
+                                        "──────────────".to_string()
                                     }
-                                    crate::input::ContextMenuItemKind::Slider { min, max, .. } => {
+                                    crate::input::ContextMenuItemKind::Info { label, value } => {
+                                        format!("{label}: {value}")
+                                    }
+                                    crate::input::ContextMenuItemKind::Toggle {
+                                        label_on,
+                                        label_off,
+                                        ..
+                                    } => {
+                                        format!(
+                                            "{}  [{}]",
+                                            item.label,
+                                            if is_sel { label_on } else { label_off }
+                                        )
+                                    }
+                                    crate::input::ContextMenuItemKind::Slider {
+                                        min, max, ..
+                                    } => {
                                         format!("{}  [{:.0}–{:.0}]", item.label, min, max)
                                     }
                                     crate::input::ContextMenuItemKind::Select { .. } => {
@@ -2657,7 +3104,11 @@ impl CanvasState {
                                         item.label.clone()
                                     }
                                 };
-                                let icon_prefix = item.icon.as_ref().map(|i| format!("{i} ")).unwrap_or_default();
+                                let icon_prefix = item
+                                    .icon
+                                    .as_ref()
+                                    .map(|i| format!("{i} "))
+                                    .unwrap_or_default();
                                 text.queue_string(
                                     gl,
                                     atlas,
@@ -2682,8 +3133,11 @@ impl CanvasState {
                                         let vx0 = cam.x;
                                         let vx1 = cam.x + self.viewport_size.0 as f64 / zoom;
                                         renderer.push_overlay_rect(
-                                            vx0, guide.position, vx1 - vx0, line_thickness,
-                                            (0.35, 0.7, 1.0, 0.8)
+                                            vx0,
+                                            guide.position,
+                                            vx1 - vx0,
+                                            line_thickness,
+                                            (0.35, 0.7, 1.0, 0.8),
                                         );
                                     }
                                     crate::arrange::GuideOrientation::Vertical => {
@@ -2691,8 +3145,11 @@ impl CanvasState {
                                         let vy0 = cam.y;
                                         let vy1 = cam.y + self.viewport_size.1 as f64 / zoom;
                                         renderer.push_overlay_rect(
-                                            guide.position, vy0, line_thickness, vy1 - vy0,
-                                            (0.35, 0.7, 1.0, 0.8)
+                                            guide.position,
+                                            vy0,
+                                            line_thickness,
+                                            vy1 - vy0,
+                                            (0.35, 0.7, 1.0, 0.8),
                                         );
                                     }
                                 }
@@ -2719,18 +3176,12 @@ impl CanvasState {
                                 (0.85, 0.9, 1.0, 1.0),
                             );
                         }
-                        // Auto-hiding HUD
-                        let hud_cfg = &self.app.state.config.hud;
-                        if hud_cfg.auto_hide {
-                            // Hide HUD after 3 seconds of inactivity
-                            if self.hud_last_activity.elapsed().as_secs_f32() > 3.0 {
-                                self.hud_visible = false;
-                            }
-                        } else {
-                            self.hud_visible = true;
-                        }
-                        if self.hud_visible {
-                            Self::render_hud(
+                        // Context popup menu
+                        if popup_open {
+                            Self::render_popup(
+                                popup_open,
+                                popup_position,
+                                &popup_items,
                                 renderer,
                                 text,
                                 gl,
@@ -2739,7 +3190,6 @@ impl CanvasState {
                                 fid,
                                 cam,
                                 self.viewport_size,
-                                &self.app.state.config.hud,
                                 &self.app.state.config.theme,
                             );
                         }
@@ -2888,7 +3338,15 @@ impl ApplicationHandler for CanvasState {
         let mut fonts = FontSystem::new().ok();
         if let Some(fs) = &mut fonts {
             self.font_id = fs
-                .load_family_stack(&["monospace", "DejaVu Sans Mono", "Noto Sans Symbols"])
+                .load_family_stack(&[
+                    "JetBrains Mono",
+                    "Monospace",
+                    "DejaVu Sans Mono",
+                    "Noto Sans Mono",
+                    "Fira Code",
+                    "Noto Sans Symbols",
+                    "monospace",
+                ])
                 .ok()
                 .and_then(|ids| ids.into_iter().next());
         }
@@ -3099,7 +3557,21 @@ impl ApplicationHandler for CanvasState {
                     DragState::Move { node, dx, dy } => {
                         let (wx, wy) = (cam.x + new_cursor.0 / zoom, cam.y + new_cursor.1 / zoom);
                         let (nx, ny) = (wx + dx, wy + dy);
-                        // Snap the moved rect to nearby edges (8 world px).
+                        // Calculate delta for primary node
+                        let primary_delta =
+                            if let Some(primary) = self.app.state.workspace.get_node(node) {
+                                (nx - primary.transform.x, ny - primary.transform.y)
+                            } else {
+                                (0.0, 0.0)
+                            };
+                        // Move all selected nodes by the same delta
+                        for sel_id in &self.selected {
+                            if let Some(n) = self.app.state.workspace.get_node_mut(*sel_id) {
+                                n.transform.x += primary_delta.0;
+                                n.transform.y += primary_delta.1;
+                            }
+                        }
+                        // Snap primary node to edges (for visual feedback)
                         let tmp = self.app.state.workspace.get_node(node).map(|n| {
                             let mut c = n.clone();
                             c.transform.x = nx;
@@ -3115,27 +3587,23 @@ impl ApplicationHandler for CanvasState {
                             .filter(|n| n.id != node)
                             .map(|n| (*n).clone())
                             .collect();
-                        let (fx, fy) = match tmp {
+                        match tmp {
                             Some(ref t) => {
                                 let refs: Vec<&crate::Node> = others.iter().collect();
                                 let g = crate::arrange::snap_to_edges(t, &refs, 8.0);
                                 if g.distance.is_finite() {
-                                    self.drag_guides = g.guides;
-                                    (g.x, g.y)
+                                    self.drag_guides = g.guides.clone();
+                                    self.last_snap = Some(g);
                                 } else {
                                     self.drag_guides.clear();
-                                    (nx, ny)
+                                    self.last_snap = None;
                                 }
                             }
                             None => {
                                 self.drag_guides.clear();
-                                (nx, ny)
+                                self.last_snap = None;
                             }
                         };
-                        if let Some(n) = self.app.state.workspace.get_node_mut(node) {
-                            n.transform.x = fx;
-                            n.transform.y = fy;
-                        }
                     }
                     DragState::Resize { node } => {
                         let (wx, wy) = (cam.x + new_cursor.0 / zoom, cam.y + new_cursor.1 / zoom);
@@ -3166,318 +3634,398 @@ impl ApplicationHandler for CanvasState {
                 self.last_cursor = new_cursor;
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                // Update HUD activity on any mouse interaction
-                self.hud_last_activity = std::time::Instant::now();
-                self.hud_visible = true;
                 match (state, button) {
                     (ElementState::Pressed, MouseButton::Right) => {
                         self.rect_anchor = Some(self.last_cursor);
                     }
-                (ElementState::Released, MouseButton::Right) => {
-                    self.finish_right_click(event_loop);
-                }
-                (ElementState::Pressed, MouseButton::Middle) => {
-                    // Deferred pan: a release without drag pastes the
-                    // primary selection (X11); movement beyond the click
-                    // threshold becomes a pan in CursorMoved.
-                    self.middle_down = Some(self.last_cursor);
-                }
-                (ElementState::Pressed, MouseButton::Left) => {
-                    // Copy hit data into owned values before mutating self.
-                    let cam = self.app.state.workspace.camera().clone();
-                    let (wx, wy) = (
-                        cam.x + self.last_cursor.0 / cam.zoom,
-                        cam.y + self.last_cursor.1 / cam.zoom,
-                    );
-                    if self.menu.is_some() {
-                        let (mx, my) = (wx, wy);
-                        let (mmx, mmy, mitems, _) = self
-                            .menu
-                            .as_ref()
-                            .map(|m| (m.x, m.y, m.items.clone(), m.index))
-                            .unwrap();
-                        let mw = 300.0f64;
-                        let ih = 24.0f64;
-                        let mh = mitems.len() as f64 * ih + 20.0;
-                        self.menu = None;
-                        if mx >= mmx
-                            && mx <= mmx + mw
-                            && my >= mmy
-                            && my <= mmy + mh
-                            && my >= mmy + 10.0
-                        {
-                            let idx = ((my - mmy - 10.0) / ih) as usize;
-                            if let Some(item) = mitems.get(idx) {
-                                if item.enabled && !matches!(item.kind, crate::input::ContextMenuItemKind::Separator) {
-                                    if let crate::input::ContextMenuItemKind::Command { command, .. } = &item.kind {
-                                        self.run_palette_command(command);
-                                    }
-                                }
-                            }
-                            return;
-                        }
+                    (ElementState::Released, MouseButton::Right) => {
+                        self.finish_right_click(event_loop);
                     }
-                    if let Some(sel) = self.selected {
-                        if let Some(n) = self.app.state.workspace.get_node(sel) {
-                            let (mbx, mby, mbs) =
-                                menu_button_rect(n.transform.x, n.transform.y, cam.zoom);
-                            if wx >= mbx && wx <= mbx + mbs && wy >= mby && wy <= mby + mbs {
-                                self.open_menu(n.transform.x, n.transform.y, Some(sel));
-                                return;
-                            }
-                        }
+                    (ElementState::Pressed, MouseButton::Middle) => {
+                        // Deferred pan: a release without drag pastes the
+                        // primary selection (X11); movement beyond the click
+                        // threshold becomes a pan in CursorMoved.
+                        self.middle_down = Some(self.last_cursor);
                     }
-                    // Selected node's close button wins over everything.
-                    if let Some(sel) = self.selected {
-                        if let Some(n) = self.app.state.workspace.get_node(sel) {
-                            let (cx, cy, cs, _) =
-                                close_button_rect(n.transform.x, n.transform.y, n.size.0, cam.zoom);
-                            if wx >= cx && wx <= cx + cs && wy >= cy && wy <= cy + cs {
-                                self.close_selected();
-                                return;
-                            }
-                        }
-                    }
-                    let handle_hit = match self.selected {
-                        Some(sel) => self
-                            .app
-                            .state
-                            .workspace
-                            .get_node(sel)
-                            .map(|n| {
-                                crate::arrange::resize_handle_hit(
-                                    n.transform.x,
-                                    n.transform.y,
-                                    n.size.0.max(1.0),
-                                    n.size.1.max(1.0),
-                                    cam.x,
-                                    cam.y,
-                                    cam.zoom,
-                                    self.last_cursor.0,
-                                    self.last_cursor.1,
-                                    10.0,
-                                )
-                            })
-                            .unwrap_or(false),
-                        None => false,
-                    };
-                    if handle_hit {
-                        if let Some(sel) = self.selected {
-                            self.drag = DragState::Resize { node: sel };
-                        }
-                    } else {
-                        let hit = self.hit_node(wx, wy).map(|n| {
-                            (
-                                n.id,
-                                n.surface_id(),
-                                n.input.mode.clone(),
-                                n.transform.x,
-                                n.transform.y,
-                            )
-                        });
-                        // Child mouse forwarding (xterm 1000+): an unshifted
-                        // press on a reporting terminal goes to its PTY
-                        // instead of starting a Move-drag. Shift forces host
-                        // behavior; Alt forces a host move-drag (spec §5.1);
-                        // space forces a host pan (see below). The resize
-                        // handle (checked above) always wins.
-                        let mst = self.modifiers.state();
-                        let space_pan = self.space_down && !self.term_focus;
-                        let forward_press: Option<(crate::NodeId, SurfaceId, Vec<u8>)> =
-                            if mst.shift_key() || mst.alt_key() || space_pan {
-                                None
-                            } else if let Some((id, Some(surface), mode, _, _)) = &hit {
-                                if mode.as_str() != "terminal" {
-                                    None
-                                } else {
-                                    self.terms
-                                        .iter()
-                                        .position(|s| s.surface == *surface)
-                                        .and_then(|i| {
-                                            let (col, row) = self.mouse_cell_for(
-                                                i,
-                                                self.last_cursor.0,
-                                                self.last_cursor.1,
-                                            )?;
-                                            let st = self.modifiers.state();
-                                            let bytes = self.terms[i].engine.mouse_mode.encode(
-                                                &crate::vt::MouseReport {
-                                                    button: crate::vt::MouseButton::Left,
-                                                    col,
-                                                    row,
-                                                    shift: false,
-                                                    alt: st.alt_key(),
-                                                    ctrl: st.control_key(),
-                                                    release: false,
-                                                    motion: false,
-                                                    dragging: false,
-                                                },
-                                            )?;
-                                            Some((*id, *surface, bytes))
-                                        })
-                                }
-                            } else {
-                                None
-                            };
-                        if let Some((id, surface, bytes)) = forward_press {
-                            self.write_to_surface(surface, &bytes);
-                            self.selected = Some(id);
-                            self.focused_term = Some(surface);
-                            self.term_focus = true;
-                            self.forwarding = Some(ForwardMouse {
-                                surface,
-                                button: crate::vt::MouseButton::Left,
-                            });
-                            return;
-                        }
-                        if space_pan {
-                            // Space-drag pans even when grabbed on a node:
-                            // full-bleed startup leaves no empty canvas for
-                            // a plain pan-grab, and middle-drag is not
-                            // discoverable. Selection/focus stay untouched.
-                            self.drag = DragState::Pan {
-                                ax: self.last_cursor.0,
-                                ay: self.last_cursor.1,
-                            };
-                            return;
-                        }
-                        if self.modifiers.state().shift_key() {
-                            if let Some((id, Some(surface), mode, _, _)) = &hit {
-                                if mode.as_str() == "terminal" {
-                                    if let Some(idx) =
-                                        self.terms.iter().position(|t| t.surface == *surface)
-                                    {
-                                        if let Some(cell) = self.mouse_cell_for(
-                                            idx,
-                                            self.last_cursor.0,
-                                            self.last_cursor.1,
-                                        ) {
-                                            self.selecting =
-                                                Some((*surface, *id, (cell.0, cell.1)));
-                                            self.selection = None;
-                                            self.selected = Some(*id);
-                                            self.focused_term = Some(*surface);
-                                            self.term_focus = true;
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        match hit {
-                            Some((id, surface, mode, nx, ny)) => {
-                                self.selected = Some(id);
-                                match (surface, mode.as_str()) {
-                                    (Some(surface), "terminal")
-                                        if self.terms.iter().any(|s| s.surface == surface) =>
-                                    {
-                                        self.focused_term = Some(surface);
-                                        self.term_focus = true;
-                                    }
-                                    _ => {}
-                                }
-                                self.drag = DragState::Move {
-                                    node: id,
-                                    dx: nx - wx,
-                                    dy: ny - wy,
-                                };
-                            }
-                            None => {
-                                self.selected = None;
-                                self.term_focus = false;
-                                self.drag = DragState::Pan {
-                                    ax: self.last_cursor.0,
-                                    ay: self.last_cursor.1,
-                                };
-                            }
-                        }
-                    }
-                }
-                (ElementState::Released, MouseButton::Left) => {
-                    // End child mouse ownership with a release report.
-                    if let Some(fwd) = self.forwarding {
-                        let pending = self
-                            .terms
-                            .iter()
-                            .position(|s| s.surface == fwd.surface)
-                            .and_then(|i| {
-                                let (col, row) =
-                                    self.mouse_cell_for(i, self.last_cursor.0, self.last_cursor.1)?;
-                                let st = self.modifiers.state();
-                                self.terms[i]
-                                    .engine
-                                    .mouse_mode
-                                    .encode(&crate::vt::MouseReport {
-                                        button: fwd.button,
-                                        col,
-                                        row,
-                                        shift: st.shift_key(),
-                                        alt: st.alt_key(),
-                                        ctrl: st.control_key(),
-                                        release: true,
-                                        motion: false,
-                                        dragging: false,
-                                    })
-                            });
-                        if let Some(bytes) = pending {
-                            self.write_to_surface(fwd.surface, &bytes);
-                        }
-                        self.forwarding = None;
-                    }
-                    if let Some((surface, _node, a)) = self.selecting.take() {
-                        if let Some(sel) = self.selection {
-                            let text = self
-                                .terms
-                                .iter()
-                                .find(|t| t.surface == surface)
-                                .map(|t| t.engine.term.selected_text(a, sel.3))
-                                .unwrap_or_default();
-                            if !text.is_empty() {
-                                if let Ok(mut cb) = arboard::Clipboard::new() {
-                                    let _ = cb.set_text(text.clone());
-                                }
-                                if let Ok(mut cb) = arboard::Clipboard::new() {
-                                    use arboard::{LinuxClipboardKind, SetExtLinux};
-                                    let _ =
-                                        cb.set().clipboard(LinuxClipboardKind::Primary).text(text);
-                                }
-                            }
-                        }
-                    }
-                    self.drag = DragState::None;
-                    self.drag_guides.clear();
-                }
-                (ElementState::Released, MouseButton::Middle) => {
-                    if self.middle_down.take().is_some() {
-                        // Middle-click (no drag): paste primary at the
-                        // cursor session, if any.
+                    (ElementState::Pressed, MouseButton::Left) => {
+                        // Copy hit data into owned values before mutating self.
                         let cam = self.app.state.workspace.camera().clone();
                         let (wx, wy) = (
                             cam.x + self.last_cursor.0 / cam.zoom,
                             cam.y + self.last_cursor.1 / cam.zoom,
                         );
-                        if let Some(surface) = self
-                            .hit_node(wx, wy)
-                            .and_then(|n| n.surface_id())
-                            .filter(|s| self.terms.iter().any(|t| t.surface == *s))
-                        {
-                            self.paste_clipboard_into(surface, true);
+                        // Popup menu click handling
+                        if self.popup_open {
+                            let item_h = 28.0f64;
+                            let popup_w = 300.0f64; // approximate, matches render_popup
+                            let popup_h = self.popup_items.len() as f64 * item_h + 8.0;
+                            let (px, py) = self.popup_position;
+                            if wx >= px && wx <= px + popup_w && wy >= py && wy <= py + popup_h {
+                                // Click inside popup - execute item command
+                                let idx = ((wy - py - 4.0) / item_h) as usize;
+                                let command =
+                                    self.popup_items.get(idx).map(|item| item.command.clone());
+                                if let Some(cmd) = command {
+                                    self.run_palette_command(&cmd);
+                                }
+                                self.popup_open = false;
+                                return;
+                            } else {
+                                // Click outside popup - close it
+                                self.popup_open = false;
+                            }
                         }
-                    } else {
+                        if self.menu.is_some() {
+                            let (mx, my) = (wx, wy);
+                            let (mmx, mmy, mitems, _) = self
+                                .menu
+                                .as_ref()
+                                .map(|m| (m.x, m.y, m.items.clone(), m.index))
+                                .unwrap();
+                            let mw = 300.0f64;
+                            let ih = 24.0f64;
+                            let mh = mitems.len() as f64 * ih + 20.0;
+                            self.menu = None;
+                            if mx >= mmx
+                                && mx <= mmx + mw
+                                && my >= mmy
+                                && my <= mmy + mh
+                                && my >= mmy + 10.0
+                            {
+                                let idx = ((my - mmy - 10.0) / ih) as usize;
+                                if let Some(item) = mitems.get(idx) {
+                                    if item.enabled
+                                        && !matches!(
+                                            item.kind,
+                                            crate::input::ContextMenuItemKind::Separator
+                                        )
+                                    {
+                                        if let crate::input::ContextMenuItemKind::Command {
+                                            command,
+                                            ..
+                                        } = &item.kind
+                                        {
+                                            self.run_palette_command(command);
+                                        }
+                                    }
+                                }
+                                return;
+                            }
+                        }
+                        if let Some(sel) = self.selected.first().copied() {
+                            if let Some(n) = self.app.state.workspace.get_node(sel) {
+                                let (mbx, mby, mbs) =
+                                    menu_button_rect(n.transform.x, n.transform.y, cam.zoom);
+                                if wx >= mbx && wx <= mbx + mbs && wy >= mby && wy <= mby + mbs {
+                                    self.open_menu(n.transform.x, n.transform.y, Some(sel));
+                                    return;
+                                }
+                            }
+                        }
+                        // Selected node's close button wins over everything.
+                        if let Some(sel) = self.selected.first().copied() {
+                            if let Some(n) = self.app.state.workspace.get_node(sel) {
+                                let (cx, cy, cs, _) = close_button_rect(
+                                    n.transform.x,
+                                    n.transform.y,
+                                    n.size.0,
+                                    cam.zoom,
+                                );
+                                if wx >= cx && wx <= cx + cs && wy >= cy && wy <= cy + cs {
+                                    self.close_selected();
+                                    return;
+                                }
+                            }
+                        }
+                        let handle_hit = match self.selected.first().copied() {
+                            Some(sel) => self
+                                .app
+                                .state
+                                .workspace
+                                .get_node(sel)
+                                .map(|n| {
+                                    crate::arrange::resize_handle_hit(
+                                        n.transform.x,
+                                        n.transform.y,
+                                        n.size.0.max(1.0),
+                                        n.size.1.max(1.0),
+                                        cam.x,
+                                        cam.y,
+                                        cam.zoom,
+                                        self.last_cursor.0,
+                                        self.last_cursor.1,
+                                        10.0,
+                                    )
+                                })
+                                .unwrap_or(false),
+                            None => false,
+                        };
+                        if handle_hit {
+                            if let Some(sel) = self.selected.first().copied() {
+                                self.drag = DragState::Resize { node: sel };
+                            }
+                        } else {
+                            let hit = self.hit_node(wx, wy).map(|n| {
+                                (
+                                    n.id,
+                                    n.surface_id(),
+                                    n.input.mode.clone(),
+                                    n.transform.x,
+                                    n.transform.y,
+                                )
+                            });
+                            // Child mouse forwarding (xterm 1000+): an unshifted
+                            // press on a reporting terminal goes to its PTY
+                            // instead of starting a Move-drag. Shift forces host
+                            // behavior; Alt forces a host move-drag (spec §5.1);
+                            // space forces a host pan (see below). The resize
+                            // handle (checked above) always wins.
+                            let mst = self.modifiers.state();
+                            let space_pan = self.space_down && !self.term_focus;
+                            let forward_press: Option<(crate::NodeId, SurfaceId, Vec<u8>)> =
+                                if mst.shift_key() || mst.alt_key() || space_pan {
+                                    None
+                                } else if let Some((id, Some(surface), mode, _, _)) = &hit {
+                                    if mode.as_str() != "terminal" {
+                                        None
+                                    } else {
+                                        self.terms
+                                            .iter()
+                                            .position(|s| s.surface == *surface)
+                                            .and_then(|i| {
+                                                let (col, row) = self.mouse_cell_for(
+                                                    i,
+                                                    self.last_cursor.0,
+                                                    self.last_cursor.1,
+                                                )?;
+                                                let st = self.modifiers.state();
+                                                let bytes = self.terms[i]
+                                                    .engine
+                                                    .mouse_mode
+                                                    .encode(&crate::vt::MouseReport {
+                                                        button: crate::vt::MouseButton::Left,
+                                                        col,
+                                                        row,
+                                                        shift: false,
+                                                        alt: st.alt_key(),
+                                                        ctrl: st.control_key(),
+                                                        release: false,
+                                                        motion: false,
+                                                        dragging: false,
+                                                    })?;
+                                                Some((*id, *surface, bytes))
+                                            })
+                                    }
+                                } else {
+                                    None
+                                };
+                            if let Some((id, surface, bytes)) = forward_press {
+                                self.write_to_surface(surface, &bytes);
+                                self.selected = vec![id];
+                                self.focused_term = Some(surface);
+                                self.term_focus = true;
+                                self.forwarding = Some(ForwardMouse {
+                                    surface,
+                                    button: crate::vt::MouseButton::Left,
+                                });
+                                return;
+                            }
+                            if space_pan {
+                                // Space-drag pans even when grabbed on a node:
+                                // full-bleed startup leaves no empty canvas for
+                                // a plain pan-grab, and middle-drag is not
+                                // discoverable. Selection/focus stay untouched.
+                                self.drag = DragState::Pan {
+                                    ax: self.last_cursor.0,
+                                    ay: self.last_cursor.1,
+                                };
+                                return;
+                            }
+                            if self.modifiers.state().shift_key() {
+                                if let Some((id, Some(surface), mode, _, _)) = &hit {
+                                    if mode.as_str() == "terminal" {
+                                        if let Some(idx) =
+                                            self.terms.iter().position(|t| t.surface == *surface)
+                                        {
+                                            if let Some(cell) = self.mouse_cell_for(
+                                                idx,
+                                                self.last_cursor.0,
+                                                self.last_cursor.1,
+                                            ) {
+                                                self.selecting =
+                                                    Some((*surface, *id, (cell.0, cell.1)));
+                                                self.selection = None;
+                                                self.selected = vec![*id];
+                                                self.focused_term = Some(*surface);
+                                                self.term_focus = true;
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            match hit {
+                                Some((id, surface, mode, _nx, _ny)) => {
+                                    let shift = self.modifiers.state().shift_key();
+                                    if shift && self.selected.contains(&id) {
+                                        // Shift+click on already selected: remove from selection
+                                        self.selected.retain(|&x| x != id);
+                                    } else if shift {
+                                        // Shift+click: add to selection
+                                        self.selected.push(id);
+                                    } else {
+                                        // Normal click: replace selection
+                                        self.selected = vec![id];
+                                    }
+                                    // Primary selection (first) gets keyboard focus if terminal
+                                    if let Some(primary_id) = self.selected.first().copied() {
+                                        if let Some(_node) =
+                                            self.app.state.workspace.get_node(primary_id)
+                                        {
+                                            match (surface, mode.as_str()) {
+                                                (Some(surface), "terminal")
+                                                    if self
+                                                        .terms
+                                                        .iter()
+                                                        .any(|s| s.surface == surface) =>
+                                                {
+                                                    self.focused_term = Some(surface);
+                                                    self.term_focus = true;
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    // For drag, use primary selection
+                                    if let Some(primary_id) = self.selected.first().copied() {
+                                        if let Some(node) =
+                                            self.app.state.workspace.get_node(primary_id)
+                                        {
+                                            self.drag = DragState::Move {
+                                                node: primary_id,
+                                                dx: node.transform.x - wx,
+                                                dy: node.transform.y - wy,
+                                            };
+                                        }
+                                    }
+                                }
+                                None => {
+                                    if !self.modifiers.state().shift_key() {
+                                        self.selected.clear();
+                                        self.term_focus = false;
+                                        self.drag = DragState::Pan {
+                                            ax: self.last_cursor.0,
+                                            ay: self.last_cursor.1,
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    (ElementState::Released, MouseButton::Left) => {
+                        // End child mouse ownership with a release report.
+                        if let Some(fwd) = self.forwarding {
+                            let pending = self
+                                .terms
+                                .iter()
+                                .position(|s| s.surface == fwd.surface)
+                                .and_then(|i| {
+                                    let (col, row) = self.mouse_cell_for(
+                                        i,
+                                        self.last_cursor.0,
+                                        self.last_cursor.1,
+                                    )?;
+                                    let st = self.modifiers.state();
+                                    self.terms[i].engine.mouse_mode.encode(
+                                        &crate::vt::MouseReport {
+                                            button: fwd.button,
+                                            col,
+                                            row,
+                                            shift: st.shift_key(),
+                                            alt: st.alt_key(),
+                                            ctrl: st.control_key(),
+                                            release: true,
+                                            motion: false,
+                                            dragging: false,
+                                        },
+                                    )
+                                });
+                            if let Some(bytes) = pending {
+                                self.write_to_surface(fwd.surface, &bytes);
+                            }
+                            self.forwarding = None;
+                        }
+                        if let Some((surface, _node, a)) = self.selecting.take() {
+                            if let Some(sel) = self.selection {
+                                let text = self
+                                    .terms
+                                    .iter()
+                                    .find(|t| t.surface == surface)
+                                    .map(|t| t.engine.term.selected_text(a, sel.3))
+                                    .unwrap_or_default();
+                                if !text.is_empty() {
+                                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                                        let _ = cb.set_text(text.clone());
+                                    }
+                                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                                        use arboard::{LinuxClipboardKind, SetExtLinux};
+                                        let _ = cb
+                                            .set()
+                                            .clipboard(LinuxClipboardKind::Primary)
+                                            .text(text);
+                                    }
+                                }
+                            }
+                        }
+                        // Apply snap-on-release for move drag
+                        if let DragState::Move { node, .. } = self.drag {
+                            if let Some(snap) = self.last_snap.take() {
+                                if let Some(n) = self.app.state.workspace.get_node_mut(node) {
+                                    n.transform.x = snap.x;
+                                    n.transform.y = snap.y;
+                                }
+                            }
+                            // Multi-select drag reorder: bring all selected nodes to front
+                            // maintaining their relative z-order
+                            if self.selected.len() > 1 {
+                                let selected_ids = self.selected.clone();
+                                for id in selected_ids {
+                                    self.app.state.workspace.bring_to_front(id);
+                                }
+                            }
+                        }
                         self.drag = DragState::None;
                         self.drag_guides.clear();
                     }
+                    (ElementState::Released, MouseButton::Middle) => {
+                        if self.middle_down.take().is_some() {
+                            // Middle-click (no drag): paste primary at the
+                            // cursor session, if any.
+                            let cam = self.app.state.workspace.camera().clone();
+                            let (wx, wy) = (
+                                cam.x + self.last_cursor.0 / cam.zoom,
+                                cam.y + self.last_cursor.1 / cam.zoom,
+                            );
+                            if let Some(surface) = self
+                                .hit_node(wx, wy)
+                                .and_then(|n| n.surface_id())
+                                .filter(|s| self.terms.iter().any(|t| t.surface == *s))
+                            {
+                                self.paste_clipboard_into(surface, true);
+                            }
+                        } else {
+                            self.drag = DragState::None;
+                            self.drag_guides.clear();
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }},
+            }
             WindowEvent::KeyboardInput {
                 event,
                 is_synthetic: _,
                 ..
             } => {
-                // Update HUD activity on any key press
-                self.hud_last_activity = std::time::Instant::now();
-                self.hud_visible = true;
                 // Space doubles as a pan modifier (space-drag pans even
                 // over a node). Track it on press AND release, before the
                 // release early-return: typing still works because the
@@ -3511,8 +4059,17 @@ impl ApplicationHandler for CanvasState {
                         Key::Named(NamedKey::Enter) => {
                             if let Some(m) = self.menu.take() {
                                 if let Some(item) = m.items.get(m.index) {
-                                    if item.enabled && !matches!(item.kind, crate::input::ContextMenuItemKind::Separator) {
-                                        if let crate::input::ContextMenuItemKind::Command { command, .. } = &item.kind {
+                                    if item.enabled
+                                        && !matches!(
+                                            item.kind,
+                                            crate::input::ContextMenuItemKind::Separator
+                                        )
+                                    {
+                                        if let crate::input::ContextMenuItemKind::Command {
+                                            command,
+                                            ..
+                                        } = &item.kind
+                                        {
                                             self.run_palette_command(command);
                                         }
                                     }
@@ -3525,7 +4082,12 @@ impl ApplicationHandler for CanvasState {
                                 let mut new_index = m.index.saturating_sub(1);
                                 while new_index > 0 {
                                     if let Some(item) = m.items.get(new_index) {
-                                        if item.enabled && !matches!(item.kind, crate::input::ContextMenuItemKind::Separator) {
+                                        if item.enabled
+                                            && !matches!(
+                                                item.kind,
+                                                crate::input::ContextMenuItemKind::Separator
+                                            )
+                                        {
                                             break;
                                         }
                                     }
@@ -3540,7 +4102,12 @@ impl ApplicationHandler for CanvasState {
                                 let mut new_index = (m.index + 1).min(n);
                                 while new_index < n {
                                     if let Some(item) = m.items.get(new_index) {
-                                        if item.enabled && !matches!(item.kind, crate::input::ContextMenuItemKind::Separator) {
+                                        if item.enabled
+                                            && !matches!(
+                                                item.kind,
+                                                crate::input::ContextMenuItemKind::Separator
+                                            )
+                                        {
                                             break;
                                         }
                                     }
@@ -3608,9 +4175,15 @@ impl ApplicationHandler for CanvasState {
                             self.search_input_active = false;
                             // Perform the search
                             if let Some(surface) = self.focused_term {
-                                if let Some(idx) = self.terms.iter().position(|t| t.surface == surface) {
+                                if let Some(idx) =
+                                    self.terms.iter().position(|t| t.surface == surface)
+                                {
                                     let term = &self.terms[idx].engine.term;
-                                    let matches = term.search(&self.search_query, self.search_case_sensitive, self.search_regex);
+                                    let matches = term.search(
+                                        &self.search_query,
+                                        self.search_case_sensitive,
+                                        self.search_regex,
+                                    );
                                     self.search_matches = matches;
                                     self.search_current_match = 0;
                                     if !self.search_matches.is_empty() {
@@ -3618,9 +4191,15 @@ impl ApplicationHandler for CanvasState {
                                         self.terms[idx].engine.term.cursor_row = row;
                                         self.terms[idx].engine.term.cursor_col = col;
                                         self.terms[idx].engine.term.reset_scroll();
-                                        self.notify(format!("found {} matches (F3/Shift+F3 to navigate)", self.search_matches.len()));
+                                        self.notify(format!(
+                                            "found {} matches (F3/Shift+F3 to navigate)",
+                                            self.search_matches.len()
+                                        ));
                                     } else {
-                                        self.notify(format!("no matches for '{}'", self.search_query));
+                                        self.notify(format!(
+                                            "no matches for '{}'",
+                                            self.search_query
+                                        ));
                                     }
                                 }
                             }
@@ -3642,12 +4221,14 @@ impl ApplicationHandler for CanvasState {
                     }
                     return;
                 }
-                if self.help_open {
+                if self.help_open || self.popup_open {
                     use winit::keyboard::{Key, NamedKey};
                     match &event.logical_key {
-                        Key::Named(NamedKey::Escape)
-                        | Key::Named(NamedKey::Enter)
-                        | Key::Named(NamedKey::F1) => {
+                        Key::Named(NamedKey::Escape) => {
+                            self.help_open = false;
+                            self.popup_open = false;
+                        }
+                        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::F1) => {
                             self.help_open = false;
                         }
                         Key::Character(c) if c == "?" => {
@@ -3874,12 +4455,13 @@ impl ApplicationHandler for CanvasState {
                     MouseScrollDelta::PixelDelta(p) => p.y / 40.0,
                 };
                 let st = self.modifiers.state();
+                let zoom_speed = self.app.state.config.camera.wheel_zoom_speed.max(0.1);
                 if st.control_key() {
-                    self.zoom_at_cursor(1.15f64.powf(lines));
+                    self.zoom_at_cursor(1.15f64.powf(lines * zoom_speed));
                 } else if st.shift_key() {
                     if let Some(id) = self.focused_term {
                         if let Some(sess) = self.terms.iter_mut().find(|t| t.surface == id) {
-                            sess.engine.term.scroll(-lines.round() as i32 * 3);
+                            sess.engine.term.scroll(lines.round() as i32 * 3);
                         }
                     }
                 } else {
@@ -3925,10 +4507,11 @@ impl ApplicationHandler for CanvasState {
                                 let surface = self.terms[i].surface;
                                 self.write_to_surface(surface, &bytes);
                             }
-                            None => self.terms[i].engine.term.scroll(-lines.round() as i32 * 3),
+                            None => self.terms[i].engine.term.scroll(lines.round() as i32 * 3),
                         }
                     } else {
-                        self.zoom_at_cursor(1.15f64.powf(lines));
+                        let zoom_speed = self.app.state.config.camera.wheel_zoom_speed.max(0.1);
+                        self.zoom_at_cursor(1.15f64.powf(lines * zoom_speed));
                     }
                 }
             }
@@ -4270,13 +4853,13 @@ mod tests {
         let mut st = CanvasState::new(App::new(crate::config::Config::new()));
         st.spawn_terminal_node(80, 24, (0.0, 0.0)).unwrap();
         let node = st.terms[0].node;
-        st.selected = Some(node);
+        st.selected = vec![node];
         assert!(st.close_selected());
         assert_eq!(st.terms.len(), 0);
         assert!(st.app.state.workspace.get_node(node).is_none());
         st.reopen_closed();
         assert_eq!(st.terms.len(), 1);
-        assert_eq!(st.selected, Some(node));
+        assert_eq!(st.selected, vec![node]);
         assert!(st.app.state.workspace.get_node(node).is_some());
         // Empty stack is a no-op with feedback, not a panic.
         st.closed_stack.clear();
@@ -4330,7 +4913,7 @@ mod tests {
         st.spawn_terminal_node(80, 24, (0.0, 0.0)).unwrap();
         assert_eq!(st.terms.len(), 1);
         let node = st.terms[0].node;
-        st.selected = Some(node);
+        st.selected = vec![node];
         assert_eq!(
             (
                 st.terms[0].engine.term.grid.cols,
@@ -4354,7 +4937,7 @@ mod tests {
         assert!(st.close_selected());
         assert!(st.terms.is_empty());
         assert!(st.app.state.workspace.get_node(node).is_none());
-        assert_eq!(st.selected, None);
+        assert!(st.selected.is_empty());
         assert_eq!(st.focused_term, None);
         assert!(!st.close_selected());
         assert!(!st.resize_terminal_grid(node, 80, 24));

@@ -140,21 +140,23 @@ impl CliArgs {
     /// Print help message
     pub fn print_help() {
         println!("fracterm - A spatial workspace of live text surfaces");
-        println!("");
+        println!();
         println!("USAGE:");
         println!("    fracterm [OPTIONS]");
-        println!("");
+        println!();
         println!("OPTIONS:");
         println!("    -h, --help           Print help information");
         println!("    -V, --version        Print version information");
         println!("    --print-config       Print the effective configuration (resolved from TS config + profile)");
-        println!("    --doctor             Run diagnostics (OpenGL, fonts, JS engine, plugins, layout)");
+        println!(
+            "    --doctor             Run diagnostics (OpenGL, fonts, JS engine, plugins, layout)"
+        );
         println!("    --config <PATH>      Path to fracterm.config.ts (default: ~/.config/fracterm/fracterm.config.ts)");
         println!("    --profile <NAME>     Apply a profile (big-text, ssh, logs, presentation, high-contrast)");
         println!("    -v, --verbose        Enable verbose logging");
         println!("    --plugin <PATH>      Load a plugin at startup");
         println!("    --layout <PATH>      Load a layout file at startup");
-        println!("");
+        println!();
         println!("CONFIGURATION:");
         println!("    TypeScript-first config at ~/.config/fracterm/fracterm.config.ts");
         println!("    Example:");
@@ -162,7 +164,7 @@ impl CliArgs {
         println!("            font: {{ family: \"JetBrains Mono\", size: 14, ligatures: true }}");
         println!("            theme: {{ background: \"#0b0d12\", foreground: \"#dfe3ee\" }}");
         println!("        }});");
-        println!("");
+        println!();
         println!("KEYBINDINGS (workspace mode):");
         println!("    n          New terminal");
         println!("    N          Spawn varied terminal");
@@ -183,13 +185,13 @@ impl CliArgs {
         println!("    ?/F1       Toggle help overlay");
         println!("    Tab        Cycle node selection");
         println!("    Arrow keys Nudge selected node");
-        println!("");
+        println!();
         println!("ENVIRONMENT:");
         println!("    XDG_CONFIG_HOME    Config directory (default: ~/.config)");
         println!("    XDG_DATA_HOME      Data directory (default: ~/.local/share)");
         println!("    XDG_CACHE_HOME     Cache directory (default: ~/.cache)");
         println!("    FRACTERM_CONFIG    Override config file path");
-        println!("");
+        println!();
         println!("For more information, see https://github.com/fracterm/fracterm");
     }
 
@@ -225,13 +227,16 @@ impl CliArgs {
             config
         };
 
-        println!("{}", serde_json::to_string_pretty(&config).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&config).unwrap_or_default()
+        );
     }
 
     /// Run diagnostics
     pub fn run_doctor(&self) {
         println!("fracterm doctor - running diagnostics...");
-        println!("");
+        println!();
 
         // Check OpenGL
         println!("[1/5] OpenGL support...");
@@ -256,7 +261,7 @@ impl CliArgs {
         println!("[5/5] Layout schema...");
         println!("    Layout version 2 supported");
 
-        println!("");
+        println!();
         println!("All checks passed (runtime checks require display).");
     }
 }

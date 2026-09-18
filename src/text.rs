@@ -269,7 +269,7 @@ impl Atlas {
         gl.tex_parameter_i32(
             glow::TEXTURE_2D,
             glow::TEXTURE_MAG_FILTER,
-            glow::LINEAR as i32,
+            glow::NEAREST as i32,
         );
         gl.tex_parameter_i32(
             glow::TEXTURE_2D,
@@ -310,15 +310,16 @@ impl Atlas {
         }
         let (mut px, mut py, mut shelf_h) = self.cursor;
         let (w, h) = (bitmap.width.max(1), bitmap.height.max(1));
-        // Row-advance when the current shelf is full.
-        if px + w + 1 > self.size {
+        // Row-advance when the current shelf is full. Leave 2px padding
+        // between glyphs to prevent linear-filter bleeding at high zoom.
+        if px + w + 2 > self.size {
             px = 0;
-            py += shelf_h + 1;
+            py += shelf_h + 2;
             shelf_h = 0;
         }
         // Out of vertical space: in production this grows to a second page;
         // for now evict and restart (damage tracking rebuilds lazily).
-        if py + h + 1 > self.size {
+        if py + h + 2 > self.size {
             self.placements.clear();
             px = 0;
             py = 0;
@@ -342,7 +343,7 @@ impl Atlas {
 
         let placement = (px, py, w, h);
         self.placements.insert(key, placement);
-        px += w + 1;
+        px += w + 2;
         shelf_h = shelf_h.max(h);
         self.cursor = (px, py, shelf_h);
         placement
@@ -899,7 +900,15 @@ mod tests {
     fn test_fallback_resolves_missing_glyph() {
         let mut fonts = FontSystem::new().expect("freetype init");
         let ids = fonts
-            .load_family_stack(&["monospace", "DejaVu Sans Mono", "Noto Sans Symbols"])
+            .load_family_stack(&[
+                "JetBrains Mono",
+                "Monospace",
+                "DejaVu Sans Mono",
+                "Noto Sans Mono",
+                "Fira Code",
+                "Noto Sans Symbols",
+                "monospace",
+            ])
             .expect("stack");
         let primary = ids[0];
         // Plain ASCII comes from the primary face.

@@ -662,11 +662,11 @@ pub fn builtin_commands() -> Vec<BuiltinCommand> {
             description: "Cycle node background tint: ink → moss → indigo → maroon",
         },
         BuiltinCommand {
-            id: "hud.toggle",
-            title: "Toggle HUD",
+            id: "popup.toggle",
+            title: "Toggle Popup Menu",
             category: "View",
-            key: "",
-            description: "Toggle the auto-hiding HUD visibility",
+            key: "Ctrl+Shift+P",
+            description: "Toggle the context popup menu (professional, minimal, unobtrusive)",
         },
         BuiltinCommand {
             id: "terminal.reopen",
@@ -730,6 +730,13 @@ pub fn builtin_commands() -> Vec<BuiltinCommand> {
             category: "Profile",
             key: "",
             description: "Apply the high-contrast profile (accessibility)",
+        },
+        BuiltinCommand {
+            id: "profile.createFromCurrent",
+            title: "Create Profile from Current Terminal",
+            category: "Profile",
+            key: "",
+            description: "Create a new profile from the selected terminal's current settings (font, theme, etc.)",
         },
         BuiltinCommand {
             id: "reading.enter",

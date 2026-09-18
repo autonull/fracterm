@@ -418,15 +418,95 @@ pub fn snap_to_edges(moving: &Node, others: &[&Node], threshold: f64) -> SnapRes
         // Check edge alignments
         let alignments = [
             // (target_x, target_y, distance, guide_line)
-            (mx, oy, (my - oy).abs(), GuideLine { orientation: GuideOrientation::Horizontal, position: oy, node_id: other.id, edge: Edge::Top }),
-            (mx, oy + oh, (my - (oy + oh)).abs(), GuideLine { orientation: GuideOrientation::Horizontal, position: oy + oh, node_id: other.id, edge: Edge::Bottom }),
-            (mx, oy - mh, (my - (oy - mh)).abs(), GuideLine { orientation: GuideOrientation::Horizontal, position: oy - mh, node_id: other.id, edge: Edge::Top }),
-            (ox, my, (mx - ox).abs(), GuideLine { orientation: GuideOrientation::Vertical, position: ox, node_id: other.id, edge: Edge::Left }),
-            (ox + ow, my, (mx - (ox + ow)).abs(), GuideLine { orientation: GuideOrientation::Vertical, position: ox + ow, node_id: other.id, edge: Edge::Right }),
-            (ox - mw, my, (mx - (ox - mw)).abs(), GuideLine { orientation: GuideOrientation::Vertical, position: ox - mw, node_id: other.id, edge: Edge::Left }),
+            (
+                mx,
+                oy,
+                (my - oy).abs(),
+                GuideLine {
+                    orientation: GuideOrientation::Horizontal,
+                    position: oy,
+                    node_id: other.id,
+                    edge: Edge::Top,
+                },
+            ),
+            (
+                mx,
+                oy + oh,
+                (my - (oy + oh)).abs(),
+                GuideLine {
+                    orientation: GuideOrientation::Horizontal,
+                    position: oy + oh,
+                    node_id: other.id,
+                    edge: Edge::Bottom,
+                },
+            ),
+            (
+                mx,
+                oy - mh,
+                (my - (oy - mh)).abs(),
+                GuideLine {
+                    orientation: GuideOrientation::Horizontal,
+                    position: oy - mh,
+                    node_id: other.id,
+                    edge: Edge::Top,
+                },
+            ),
+            (
+                ox,
+                my,
+                (mx - ox).abs(),
+                GuideLine {
+                    orientation: GuideOrientation::Vertical,
+                    position: ox,
+                    node_id: other.id,
+                    edge: Edge::Left,
+                },
+            ),
+            (
+                ox + ow,
+                my,
+                (mx - (ox + ow)).abs(),
+                GuideLine {
+                    orientation: GuideOrientation::Vertical,
+                    position: ox + ow,
+                    node_id: other.id,
+                    edge: Edge::Right,
+                },
+            ),
+            (
+                ox - mw,
+                my,
+                (mx - (ox - mw)).abs(),
+                GuideLine {
+                    orientation: GuideOrientation::Vertical,
+                    position: ox - mw,
+                    node_id: other.id,
+                    edge: Edge::Left,
+                },
+            ),
             // Center alignments
-            (other_center_x - mw / 2.0, my, (moving_center_x - other_center_x).abs(), GuideLine { orientation: GuideOrientation::Vertical, position: other_center_x, node_id: other.id, edge: Edge::CenterX }),
-            (mx, other_center_y - mh / 2.0, (moving_center_y - other_center_y).abs(), GuideLine { orientation: GuideOrientation::Horizontal, position: other_center_y, node_id: other.id, edge: Edge::CenterY }),
+            (
+                other_center_x - mw / 2.0,
+                my,
+                (moving_center_x - other_center_x).abs(),
+                GuideLine {
+                    orientation: GuideOrientation::Vertical,
+                    position: other_center_x,
+                    node_id: other.id,
+                    edge: Edge::CenterX,
+                },
+            ),
+            (
+                mx,
+                other_center_y - mh / 2.0,
+                (moving_center_y - other_center_y).abs(),
+                GuideLine {
+                    orientation: GuideOrientation::Horizontal,
+                    position: other_center_y,
+                    node_id: other.id,
+                    edge: Edge::CenterY,
+                },
+            ),
         ];
 
         for (cx, cy, d, guide) in alignments {
@@ -440,15 +520,18 @@ pub fn snap_to_edges(moving: &Node, others: &[&Node], threshold: f64) -> SnapRes
             }
         }
 
-        if !guides.is_empty() {
-            if best.as_ref().map(|b| min_distance < b.distance).unwrap_or(true) {
-                best = Some(SnapResult {
-                    x: snapped_x,
-                    y: snapped_y,
-                    distance: min_distance,
-                    guides,
-                });
-            }
+        if !guides.is_empty()
+            && best
+                .as_ref()
+                .map(|b| min_distance < b.distance)
+                .unwrap_or(true)
+        {
+            best = Some(SnapResult {
+                x: snapped_x,
+                y: snapped_y,
+                distance: min_distance,
+                guides,
+            });
         }
     }
 
@@ -458,6 +541,123 @@ pub fn snap_to_edges(moving: &Node, others: &[&Node], threshold: f64) -> SnapRes
         distance: f64::INFINITY,
         guides: Vec::new(),
     })
+}
+
+/// Snap a resizing node's bottom-right corner to other nodes' edges within `threshold`.
+/// Returns snapped size and guide lines for visual feedback.
+pub fn snap_resize_corner(moving: &mut Node, others: &[&Node], threshold: f64) -> SnapResult {
+    let (mw, mh) = (moving.size.0, moving.size.1);
+    let (mx, my) = (moving.transform.x, moving.transform.y);
+    let corner_x = mx + mw;
+    let corner_y = my + mh;
+
+    let mut best: Option<SnapResult> = None;
+
+    for other in others {
+        if other.id == moving.id {
+            continue;
+        }
+        let (ox, oy) = (other.transform.x, other.transform.y);
+        let (ow, oh) = other.size;
+        let other_right = ox + ow;
+        let other_bottom = oy + oh;
+
+        let mut guides = Vec::new();
+        let mut snapped_w = mw;
+        let mut snapped_h = mh;
+        let mut min_distance = f64::INFINITY;
+
+        // Check corner alignments (right edge to other's right, bottom edge to other's bottom)
+        let alignments = [
+            // Snap right edge to other's right edge
+            (
+                other_right - mx,
+                mh,
+                (corner_x - other_right).abs(),
+                GuideLine {
+                    orientation: GuideOrientation::Vertical,
+                    position: other_right,
+                    node_id: other.id,
+                    edge: Edge::Right,
+                },
+            ),
+            // Snap right edge to other's left edge
+            (
+                ox - mx,
+                mh,
+                (corner_x - ox).abs(),
+                GuideLine {
+                    orientation: GuideOrientation::Vertical,
+                    position: ox,
+                    node_id: other.id,
+                    edge: Edge::Left,
+                },
+            ),
+            // Snap bottom edge to other's bottom edge
+            (
+                mw,
+                other_bottom - my,
+                (corner_y - other_bottom).abs(),
+                GuideLine {
+                    orientation: GuideOrientation::Horizontal,
+                    position: other_bottom,
+                    node_id: other.id,
+                    edge: Edge::Bottom,
+                },
+            ),
+            // Snap bottom edge to other's top edge
+            (
+                mw,
+                oy - my,
+                (corner_y - oy).abs(),
+                GuideLine {
+                    orientation: GuideOrientation::Horizontal,
+                    position: oy,
+                    node_id: other.id,
+                    edge: Edge::Top,
+                },
+            ),
+        ];
+
+        for (nw, nh, d, guide) in alignments {
+            if nw >= 2.0 && nh >= 2.0 && d <= threshold {
+                guides.push(guide);
+                if d < min_distance {
+                    min_distance = d;
+                    snapped_w = nw;
+                    snapped_h = nh;
+                }
+            }
+        }
+
+        if !guides.is_empty()
+            && best
+                .as_ref()
+                .map(|b| min_distance < b.distance)
+                .unwrap_or(true)
+        {
+            best = Some(SnapResult {
+                x: mx,
+                y: my,
+                distance: min_distance,
+                guides,
+            });
+            // Apply the snapped size to the moving node for the next iteration
+            moving.size = (snapped_w, snapped_h);
+        }
+    }
+
+    if let Some(res) = best {
+        moving.size = (moving.size.0, moving.size.1); // Keep position, size already updated in loop
+        res
+    } else {
+        SnapResult {
+            x: mx,
+            y: my,
+            distance: f64::INFINITY,
+            guides: Vec::new(),
+        }
+    }
 }
 
 pub fn cascade_from(nodes: &[&Node], step: f64) -> Vec<(NodeId, f64, f64)> {

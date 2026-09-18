@@ -475,15 +475,33 @@ impl InputManager {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ContextMenuItemKind {
     /// Simple command action
-    Command { command: String, args: HashMap<String, CommandValue> },
+    Command {
+        command: String,
+        args: HashMap<String, CommandValue>,
+    },
     /// Toggle boolean setting
-    Toggle { get: String, set: String, label_on: String, label_off: String },
+    Toggle {
+        get: String,
+        set: String,
+        label_on: String,
+        label_off: String,
+    },
     /// Slider for numeric value
-    Slider { get: String, set: String, min: f64, max: f64, step: f64 },
+    Slider {
+        get: String,
+        set: String,
+        min: f64,
+        max: f64,
+        step: f64,
+    },
     /// Color picker
     ColorPicker { get: String, set: String },
     /// Select from options
-    Select { get: String, set: String, options: Vec<(String, String)> },
+    Select {
+        get: String,
+        set: String,
+        options: Vec<(String, String)>,
+    },
     /// Submenu
     Submenu { items: Vec<ContextMenuItem> },
     /// Separator
@@ -516,17 +534,32 @@ impl ContextMenuItem {
         }
     }
 
-    pub fn command_with_args(id: &str, label: &str, command: &str, args: HashMap<String, CommandValue>) -> Self {
+    pub fn command_with_args(
+        id: &str,
+        label: &str,
+        command: &str,
+        args: HashMap<String, CommandValue>,
+    ) -> Self {
         Self {
             id: id.to_string(),
             label: label.to_string(),
-            kind: ContextMenuItemKind::Command { command: command.to_string(), args },
+            kind: ContextMenuItemKind::Command {
+                command: command.to_string(),
+                args,
+            },
             enabled: true,
             icon: None,
         }
     }
 
-    pub fn toggle(id: &str, label: &str, get_cmd: &str, set_cmd: &str, label_on: &str, label_off: &str) -> Self {
+    pub fn toggle(
+        id: &str,
+        label: &str,
+        get_cmd: &str,
+        set_cmd: &str,
+        label_on: &str,
+        label_off: &str,
+    ) -> Self {
         Self {
             id: id.to_string(),
             label: label.to_string(),
@@ -541,11 +574,25 @@ impl ContextMenuItem {
         }
     }
 
-    pub fn slider(id: &str, label: &str, get_cmd: &str, set_cmd: &str, min: f64, max: f64, step: f64) -> Self {
+    pub fn slider(
+        id: &str,
+        label: &str,
+        get_cmd: &str,
+        set_cmd: &str,
+        min: f64,
+        max: f64,
+        step: f64,
+    ) -> Self {
         Self {
             id: id.to_string(),
             label: label.to_string(),
-            kind: ContextMenuItemKind::Slider { get: get_cmd.to_string(), set: set_cmd.to_string(), min, max, step },
+            kind: ContextMenuItemKind::Slider {
+                get: get_cmd.to_string(),
+                set: set_cmd.to_string(),
+                min,
+                max,
+                step,
+            },
             enabled: true,
             icon: None,
         }
@@ -555,17 +602,30 @@ impl ContextMenuItem {
         Self {
             id: id.to_string(),
             label: label.to_string(),
-            kind: ContextMenuItemKind::ColorPicker { get: get_cmd.to_string(), set: set_cmd.to_string() },
+            kind: ContextMenuItemKind::ColorPicker {
+                get: get_cmd.to_string(),
+                set: set_cmd.to_string(),
+            },
             enabled: true,
             icon: None,
         }
     }
 
-    pub fn select(id: &str, label: &str, get_cmd: &str, set_cmd: &str, options: Vec<(String, String)>) -> Self {
+    pub fn select(
+        id: &str,
+        label: &str,
+        get_cmd: &str,
+        set_cmd: &str,
+        options: Vec<(String, String)>,
+    ) -> Self {
         Self {
             id: id.to_string(),
             label: label.to_string(),
-            kind: ContextMenuItemKind::Select { get: get_cmd.to_string(), set: set_cmd.to_string(), options },
+            kind: ContextMenuItemKind::Select {
+                get: get_cmd.to_string(),
+                set: set_cmd.to_string(),
+                options,
+            },
             enabled: true,
             icon: None,
         }
@@ -595,7 +655,10 @@ impl ContextMenuItem {
         Self {
             id: id.to_string(),
             label: label.to_string(),
-            kind: ContextMenuItemKind::Info { label: label.to_string(), value: value.to_string() },
+            kind: ContextMenuItemKind::Info {
+                label: label.to_string(),
+                value: value.to_string(),
+            },
             enabled: false,
             icon: None,
         }
@@ -622,43 +685,124 @@ impl ContextMenuBuilder {
             ContextMenuItem::info("title", "Title", "Terminal"),
             ContextMenuItem::separator(),
             // Profile submenu
-            ContextMenuItem::submenu("profile", "Profile", vec![
-                ContextMenuItem::command("profile.default", "Default", "profile.default"),
-                ContextMenuItem::command("profile.big-text", "Big Text", "profile.big-text"),
-                ContextMenuItem::command("profile.ssh", "SSH", "profile.ssh"),
-                ContextMenuItem::command("profile.logs", "Logs", "profile.logs"),
-                ContextMenuItem::command("profile.presentation", "Presentation", "profile.presentation"),
-                ContextMenuItem::command("profile.high-contrast", "High Contrast", "profile.high-contrast"),
-            ]),
+            ContextMenuItem::submenu(
+                "profile",
+                "Profile",
+                vec![
+                    ContextMenuItem::command("profile.default", "Default", "profile.default"),
+                    ContextMenuItem::command("profile.big-text", "Big Text", "profile.big-text"),
+                    ContextMenuItem::command("profile.ssh", "SSH", "profile.ssh"),
+                    ContextMenuItem::command("profile.logs", "Logs", "profile.logs"),
+                    ContextMenuItem::command(
+                        "profile.presentation",
+                        "Presentation",
+                        "profile.presentation",
+                    ),
+                    ContextMenuItem::command(
+                        "profile.high-contrast",
+                        "High Contrast",
+                        "profile.high-contrast",
+                    ),
+                ],
+            ),
             // Opacity slider
-            ContextMenuItem::slider("opacity", "Opacity", "node.getOpacity", "node.setOpacity", 0.5, 1.0, 0.05),
+            ContextMenuItem::slider(
+                "opacity",
+                "Opacity",
+                "node.getOpacity",
+                "node.setOpacity",
+                0.5,
+                1.0,
+                0.05,
+            ),
             // Style/tint selector
-            ContextMenuItem::select("tint", "Style", "node.getTint", "node.setTint", vec![
-                ("ink".to_string(), "Ink".to_string()),
-                ("moss".to_string(), "Moss".to_string()),
-                ("indigo".to_string(), "Indigo".to_string()),
-                ("maroon".to_string(), "Maroon".to_string()),
-            ]),
+            ContextMenuItem::select(
+                "tint",
+                "Style",
+                "node.getTint",
+                "node.setTint",
+                vec![
+                    ("ink".to_string(), "Ink".to_string()),
+                    ("moss".to_string(), "Moss".to_string()),
+                    ("indigo".to_string(), "Indigo".to_string()),
+                    ("maroon".to_string(), "Maroon".to_string()),
+                ],
+            ),
             // Font scale slider
-            ContextMenuItem::slider("font_scale", "Font Scale", "node.getFontScale", "node.setFontScale", 0.7, 2.5, 0.1),
+            ContextMenuItem::slider(
+                "font_scale",
+                "Font Scale",
+                "node.getFontScale",
+                "node.setFontScale",
+                0.7,
+                2.5,
+                0.1,
+            ),
             // Input mode
-            ContextMenuItem::select("input_mode", "Input Mode", "node.getInputMode", "node.setInputMode", vec![
-                ("terminal".to_string(), "Terminal".to_string()),
-                ("workspace".to_string(), "Workspace".to_string()),
-            ]),
+            ContextMenuItem::select(
+                "input_mode",
+                "Input Mode",
+                "node.getInputMode",
+                "node.setInputMode",
+                vec![
+                    ("terminal".to_string(), "Terminal".to_string()),
+                    ("workspace".to_string(), "Workspace".to_string()),
+                ],
+            ),
             ContextMenuItem::separator(),
             // Background blur toggle
-            ContextMenuItem::toggle("bg_blur", "Background Blur", "node.getBgBlur", "node.setBgBlur", "On", "Off"),
+            ContextMenuItem::toggle(
+                "bg_blur",
+                "Background Blur",
+                "node.getBgBlur",
+                "node.setBgBlur",
+                "On",
+                "Off",
+            ),
             // Border color picker
-            ContextMenuItem::color_picker("border_color", "Border Color", "node.getBorderColor", "node.setBorderColor"),
+            ContextMenuItem::color_picker(
+                "border_color",
+                "Border Color",
+                "node.getBorderColor",
+                "node.setBorderColor",
+            ),
             // Always on top toggle
-            ContextMenuItem::toggle("always_on_top", "Always on Top", "node.getAlwaysOnTop", "node.setAlwaysOnTop", "On", "Off"),
+            ContextMenuItem::toggle(
+                "always_on_top",
+                "Always on Top",
+                "node.getAlwaysOnTop",
+                "node.setAlwaysOnTop",
+                "On",
+                "Off",
+            ),
             ContextMenuItem::separator(),
             // Terminal-specific
-            ContextMenuItem::slider("scrollback", "Scrollback (lines)", "terminal.getScrollback", "terminal.setScrollback", 1000.0, 100000.0, 1000.0),
-            ContextMenuItem::toggle("reflow", "Reflow Text", "terminal.getReflow", "terminal.setReflow", "On", "Off"),
+            ContextMenuItem::slider(
+                "scrollback",
+                "Scrollback (lines)",
+                "terminal.getScrollback",
+                "terminal.setScrollback",
+                1000.0,
+                100000.0,
+                1000.0,
+            ),
+            ContextMenuItem::toggle(
+                "reflow",
+                "Reflow Text",
+                "terminal.getReflow",
+                "terminal.setReflow",
+                "On",
+                "Off",
+            ),
             ContextMenuItem::info("mouse_mode", "Mouse Mode", "Auto"),
-            ContextMenuItem::toggle("copy_on_select", "Copy on Select", "terminal.getCopyOnSelect", "terminal.setCopyOnSelect", "On", "Off"),
+            ContextMenuItem::toggle(
+                "copy_on_select",
+                "Copy on Select",
+                "terminal.getCopyOnSelect",
+                "terminal.setCopyOnSelect",
+                "On",
+                "Off",
+            ),
             ContextMenuItem::separator(),
             ContextMenuItem::command("save_default", "Save as Default", "node.saveAsDefault"),
             ContextMenuItem::command("close", "Close", "terminal.close"),
@@ -671,9 +815,23 @@ impl ContextMenuBuilder {
             ContextMenuItem::info("title", "Title", "Projection"),
             ContextMenuItem::separator(),
             // Live/Snapshot toggle
-            ContextMenuItem::toggle("live_mode", "Live View", "projection.getLive", "projection.setLive", "Live", "Snapshot"),
+            ContextMenuItem::toggle(
+                "live_mode",
+                "Live View",
+                "projection.getLive",
+                "projection.setLive",
+                "Live",
+                "Snapshot",
+            ),
             // Follow source
-            ContextMenuItem::toggle("follow", "Follow Source", "projection.getFollow", "projection.setFollow", "On", "Off"),
+            ContextMenuItem::toggle(
+                "follow",
+                "Follow Source",
+                "projection.getFollow",
+                "projection.setFollow",
+                "On",
+                "Off",
+            ),
             // Edit filter
             ContextMenuItem::command("edit_filter", "Edit Filter", "projection.editFilter"),
             // Detach
@@ -682,14 +840,36 @@ impl ContextMenuBuilder {
             // Reading mode
             ContextMenuItem::command("reading", "Reading Mode", "reading.enter"),
             // Opacity/style/font scale (shared with terminals)
-            ContextMenuItem::slider("opacity", "Opacity", "node.getOpacity", "node.setOpacity", 0.5, 1.0, 0.05),
-            ContextMenuItem::select("tint", "Style", "node.getTint", "node.setTint", vec![
-                ("ink".to_string(), "Ink".to_string()),
-                ("moss".to_string(), "Moss".to_string()),
-                ("indigo".to_string(), "Indigo".to_string()),
-                ("maroon".to_string(), "Maroon".to_string()),
-            ]),
-            ContextMenuItem::slider("font_scale", "Font Scale", "node.getFontScale", "node.setFontScale", 0.7, 2.5, 0.1),
+            ContextMenuItem::slider(
+                "opacity",
+                "Opacity",
+                "node.getOpacity",
+                "node.setOpacity",
+                0.5,
+                1.0,
+                0.05,
+            ),
+            ContextMenuItem::select(
+                "tint",
+                "Style",
+                "node.getTint",
+                "node.setTint",
+                vec![
+                    ("ink".to_string(), "Ink".to_string()),
+                    ("moss".to_string(), "Moss".to_string()),
+                    ("indigo".to_string(), "Indigo".to_string()),
+                    ("maroon".to_string(), "Maroon".to_string()),
+                ],
+            ),
+            ContextMenuItem::slider(
+                "font_scale",
+                "Font Scale",
+                "node.getFontScale",
+                "node.setFontScale",
+                0.7,
+                2.5,
+                0.1,
+            ),
             ContextMenuItem::separator(),
             ContextMenuItem::command("close", "Close", "projection.close"),
         ]
@@ -700,8 +880,20 @@ impl ContextMenuBuilder {
         vec![
             ContextMenuItem::info("title", "Title", "Widget"),
             ContextMenuItem::separator(),
-            ContextMenuItem::command("plugin_settings", "Plugin Settings", "widget.pluginSettings"),
-            ContextMenuItem::slider("update_interval", "Update Interval (ms)", "widget.getUpdateInterval", "widget.setUpdateInterval", 100.0, 60000.0, 100.0),
+            ContextMenuItem::command(
+                "plugin_settings",
+                "Plugin Settings",
+                "widget.pluginSettings",
+            ),
+            ContextMenuItem::slider(
+                "update_interval",
+                "Update Interval (ms)",
+                "widget.getUpdateInterval",
+                "widget.setUpdateInterval",
+                100.0,
+                60000.0,
+                100.0,
+            ),
             ContextMenuItem::separator(),
             ContextMenuItem::submenu("actions", "Widget Actions", vec![]), // Populated by plugin
             ContextMenuItem::command("close", "Close", "widget.close"),
@@ -714,10 +906,18 @@ impl ContextMenuBuilder {
             ContextMenuItem::command("copy", "Copy", "clipboard.copy"),
             ContextMenuItem::command("pin_live", "Pin as Live View", "view.pinLive"),
             ContextMenuItem::command("pin_snapshot", "Pin as Snapshot", "view.pinSnapshot"),
-            ContextMenuItem::command("zoom_selection", "Zoom to Selection", "camera.zoomToSelection"),
+            ContextMenuItem::command(
+                "zoom_selection",
+                "Zoom to Selection",
+                "camera.zoomToSelection",
+            ),
             ContextMenuItem::separator(),
             ContextMenuItem::command("read_selection", "Read Selection", "reading.enterSelection"),
-            ContextMenuItem::command("filter_selection", "Filter Selection", "view.filterSelection"),
+            ContextMenuItem::command(
+                "filter_selection",
+                "Filter Selection",
+                "view.filterSelection",
+            ),
             ContextMenuItem::command("search_selection", "Search Selection", "search.selection"),
         ]
     }

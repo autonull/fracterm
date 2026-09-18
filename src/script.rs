@@ -80,8 +80,8 @@ fn manifest_permissions_allows(
 /// `queueMicrotask`, `structuredClone` (JSON round-trip), `TextEncoder` /
 /// `TextDecoder` (UTF-8), `URL` / `URLSearchParams` (RFC 3986 subset),
 /// `crypto.randomUUID` (Math.random-based v4), `AbortController` /
-/// `AbortSignal`. The host event loop drains timers via `poll_timers`;
-/// wiring that into the frame loop is still pending (TODO P6).
+/// `AbortSignal`, and `fetch` (host-mediated, permission-gated).
+/// The host event loop drains timers via `poll_timers`.
 const WEB_POLYFILL_JS: &str = r#"
 (function(g) {
     if (g.__fracterm_web_installed) return;
@@ -198,6 +198,15 @@ const WEB_POLYFILL_JS: &str = r#"
             if (this.signal.onabort) this.signal.onabort();
         };
     }
+    // fetch polyfill - delegates to host-mediated implementation via fracterm.fetch
+    if (!g.fetch) {
+        g.fetch = function(url, options) {
+            if (g.fracterm && g.fracterm.fetch) {
+                return g.fracterm.fetch(url, options);
+            }
+            return Promise.reject(new Error("fetch not available: host API not installed"));
+        };
+    }
 })(globalThis);
 "#;
 
@@ -239,6 +248,14 @@ impl QuickJsScriptHost {
         // registry yet at install time.)
         let can_register_commands =
             manifest_permissions_allows(manifest, "commands.register", None);
+        let can_fetch = manifest_permissions_allows(manifest, "network", None);
+        let can_storage = manifest_permissions_allows(manifest, "storage", None);
+        let can_clipboard = manifest_permissions_allows(manifest, "clipboard", None);
+        let can_terminal = manifest_permissions_allows(manifest, "terminal.read", None)
+            || manifest_permissions_allows(manifest, "terminal.write", None);
+        let can_fs = manifest_permissions_allows(manifest, "fs.read", None)
+            || manifest_permissions_allows(manifest, "fs.write", None);
+        let can_process = manifest_permissions_allows(manifest, "process.spawn", None);
         let tag_err = tag.clone();
         let tag_log = tag.clone();
         use rquickjs::function::Func;
@@ -266,13 +283,15 @@ impl QuickJsScriptHost {
         }
 
         // Web-compat globals (README §14): timers, structuredClone,
-        // TextEncoder/Decoder, URL, crypto.randomUUID, AbortController.
+        // TextEncoder/Decoder, URL, crypto.randomUUID, AbortController, fetch.
         let _: () = ctx
             .eval(WEB_POLYFILL_JS.as_bytes())
             .map_err(|e| e.to_string())?;
 
         // fracterm host API surface.
         let host = rquickjs::Object::new(ctx.clone()).map_err(|e| e.to_string())?;
+
+        // commands API
         let commands = rquickjs::Object::new(ctx.clone()).map_err(|e| e.to_string())?;
         commands
             .set(
@@ -294,6 +313,175 @@ impl QuickJsScriptHost {
             )
             .map_err(|e| e.to_string())?;
         host.set("commands", commands).map_err(|e| e.to_string())?;
+
+        // fetch API (host-mediated, permission-gated)
+        if can_fetch {
+            let ctx_fetch = ctx.clone();
+            let fetch_fn = Func::from(
+                move |url: String,
+                      _options: Option<rquickjs::Object<'js>>|
+                      -> rquickjs::Result<rquickjs::Promise<'js>> {
+                    eprintln!("[host] fetch requested: {url}");
+                    // Return a rejected promise for now - full implementation requires async host communication
+                    let (promise, _resolve, reject) = rquickjs::Promise::new(&ctx_fetch)?;
+                    reject.call::<_, ()>((
+                        "fetch not fully implemented: requires async host communication",
+                    ))?;
+                    Ok(promise)
+                },
+            );
+            host.set("fetch", fetch_fn).map_err(|e| e.to_string())?;
+        }
+
+        // storage API (host-mediated, permission-gated)
+        if can_storage {
+            let tag_storage = tag.clone();
+            let storage = rquickjs::Object::new(ctx.clone()).map_err(|e| e.to_string())?;
+            let ctx_get = ctx.clone();
+            let get_fn = Func::from(
+                move |key: String| -> rquickjs::Result<rquickjs::Value<'js>> {
+                    eprintln!("[host] storage.get: {key}");
+                    // Placeholder - returns undefined
+                    Ok(rquickjs::Value::new_undefined(ctx_get.clone()))
+                },
+            );
+            let set_fn = Func::from(
+                move |key: String, _value: rquickjs::Value<'js>| -> rquickjs::Result<()> {
+                    eprintln!("[host] storage.set: {key}");
+                    Ok(())
+                },
+            );
+            let remove_fn = Func::from(move |key: String| -> rquickjs::Result<()> {
+                eprintln!("[host] storage.remove: {key}");
+                Ok(())
+            });
+            let clear_fn = Func::from(move || -> rquickjs::Result<()> {
+                eprintln!("[host] storage.clear");
+                Ok(())
+            });
+            storage.set("get", get_fn).map_err(|e| e.to_string())?;
+            storage.set("set", set_fn).map_err(|e| e.to_string())?;
+            storage
+                .set("remove", remove_fn)
+                .map_err(|e| e.to_string())?;
+            storage.set("clear", clear_fn).map_err(|e| e.to_string())?;
+            host.set("storage", storage).map_err(|e| e.to_string())?;
+        }
+
+        // clipboard API (host-mediated, permission-gated)
+        if can_clipboard {
+            let clipboard = rquickjs::Object::new(ctx.clone()).map_err(|e| e.to_string())?;
+            let ctx_read = ctx.clone();
+            let read_text_fn = Func::from(move || -> rquickjs::Result<rquickjs::Promise<'js>> {
+                eprintln!("[host] clipboard.readText");
+                let (promise, _resolve, reject) = rquickjs::Promise::new(&ctx_read)?;
+                reject.call::<_, ()>(("clipboard.readText not fully implemented",))?;
+                Ok(promise)
+            });
+            let ctx_write = ctx.clone();
+            let write_text_fn = Func::from(
+                move |text: String| -> rquickjs::Result<rquickjs::Promise<'js>> {
+                    eprintln!("[host] clipboard.writeText: {text}");
+                    let (promise, _resolve, reject) = rquickjs::Promise::new(&ctx_write)?;
+                    reject.call::<_, ()>(("clipboard.writeText not fully implemented",))?;
+                    Ok(promise)
+                },
+            );
+            clipboard
+                .set("readText", read_text_fn)
+                .map_err(|e| e.to_string())?;
+            clipboard
+                .set("writeText", write_text_fn)
+                .map_err(|e| e.to_string())?;
+            host.set("clipboard", clipboard)
+                .map_err(|e| e.to_string())?;
+        }
+
+        // terminal API (host-mediated, permission-gated)
+        if can_terminal {
+            let terminal = rquickjs::Object::new(ctx.clone()).map_err(|e| e.to_string())?;
+            let ctx_read = ctx.clone();
+            let read_fn = Func::from(
+                move |surface_id: String| -> rquickjs::Result<rquickjs::Promise<'js>> {
+                    eprintln!("[host] terminal.read: {surface_id}");
+                    let (promise, _resolve, reject) = rquickjs::Promise::new(&ctx_read)?;
+                    reject.call::<_, ()>(("terminal.read not fully implemented",))?;
+                    Ok(promise)
+                },
+            );
+            let ctx_write = ctx.clone();
+            let write_fn = Func::from(
+                move |surface_id: String,
+                      data: String|
+                      -> rquickjs::Result<rquickjs::Promise<'js>> {
+                    eprintln!("[host] terminal.write: {surface_id} <- {data}");
+                    let (promise, _resolve, reject) = rquickjs::Promise::new(&ctx_write)?;
+                    reject.call::<_, ()>(("terminal.write not fully implemented",))?;
+                    Ok(promise)
+                },
+            );
+            terminal.set("read", read_fn).map_err(|e| e.to_string())?;
+            terminal.set("write", write_fn).map_err(|e| e.to_string())?;
+            host.set("terminal", terminal).map_err(|e| e.to_string())?;
+        }
+
+        // filesystem API (host-mediated, permission-gated)
+        if can_fs {
+            let fs = rquickjs::Object::new(ctx.clone()).map_err(|e| e.to_string())?;
+            let ctx_read = ctx.clone();
+            let read_file_fn = Func::from(
+                move |path: String| -> rquickjs::Result<rquickjs::Promise<'js>> {
+                    eprintln!("[host] fs.readFile: {path}");
+                    let (promise, _resolve, reject) = rquickjs::Promise::new(&ctx_read)?;
+                    reject.call::<_, ()>(("fs.readFile not fully implemented",))?;
+                    Ok(promise)
+                },
+            );
+            let ctx_write = ctx.clone();
+            let write_file_fn = Func::from(
+                move |path: String, _data: String| -> rquickjs::Result<rquickjs::Promise<'js>> {
+                    eprintln!("[host] fs.writeFile: {path}");
+                    let (promise, _resolve, reject) = rquickjs::Promise::new(&ctx_write)?;
+                    reject.call::<_, ()>(("fs.writeFile not fully implemented",))?;
+                    Ok(promise)
+                },
+            );
+            let ctx_list = ctx.clone();
+            let list_dir_fn = Func::from(
+                move |path: String| -> rquickjs::Result<rquickjs::Promise<'js>> {
+                    eprintln!("[host] fs.listDir: {path}");
+                    let (promise, _resolve, reject) = rquickjs::Promise::new(&ctx_list)?;
+                    reject.call::<_, ()>(("fs.listDir not fully implemented",))?;
+                    Ok(promise)
+                },
+            );
+            fs.set("readFile", read_file_fn)
+                .map_err(|e| e.to_string())?;
+            fs.set("writeFile", write_file_fn)
+                .map_err(|e| e.to_string())?;
+            fs.set("listDir", list_dir_fn).map_err(|e| e.to_string())?;
+            host.set("fs", fs).map_err(|e| e.to_string())?;
+        }
+
+        // process API (host-mediated, permission-gated)
+        if can_process {
+            let process = rquickjs::Object::new(ctx.clone()).map_err(|e| e.to_string())?;
+            let ctx_spawn = ctx.clone();
+            let spawn_fn = Func::from(
+                move |command: String,
+                      args: rquickjs::Array<'js>|
+                      -> rquickjs::Result<rquickjs::Promise<'js>> {
+                    let args_vec: Vec<String> = args.iter().filter_map(|v| v.ok()).collect();
+                    eprintln!("[host] process.spawn: {command} {:?}", args_vec);
+                    let (promise, _resolve, reject) = rquickjs::Promise::new(&ctx_spawn)?;
+                    reject.call::<_, ()>(("process.spawn not fully implemented",))?;
+                    Ok(promise)
+                },
+            );
+            process.set("spawn", spawn_fn).map_err(|e| e.to_string())?;
+            host.set("process", process).map_err(|e| e.to_string())?;
+        }
+
         ctx.globals()
             .set("console", console)
             .map_err(|e| e.to_string())?;
